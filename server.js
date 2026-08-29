@@ -1177,6 +1177,17 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
     return existing;
   }
 
+  // A device is limited to one active playback job. Release its previous
+  // movie/channel before starting another one so navigation does not hit the
+  // idle cleanup window and return MEDIA_CAPACITY_FULL.
+  if (identity.deviceId) {
+    for (const [otherKey, otherJob] of mediaJobs.entries()) {
+      if (otherKey !== key && otherJob.persistent && otherJob.deviceId === identity.deviceId) {
+        await mediaJobs.remove(otherKey, 'replaced-device-playback');
+      }
+    }
+  }
+
   // Xtream accounts commonly allow only one live connection. Stop the prior
   // channel immediately when another channel is opened; otherwise the
   // provider responds with a tiny valid-but-completely-black placeholder.
