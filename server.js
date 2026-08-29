@@ -656,7 +656,8 @@ async function capturePreview(inputUrl, position, key, identity) {
     key,
     mode: choosePlaybackStrategy({ purpose: 'preview' }) === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux',
     persistent: false,
-    ...identity,
+    // Preview captures must not consume the device's one active playback slot.
+    ...identity, userId: '', deviceId: '',
   }, async () => {
     const args = [
       '-hide_banner', '-loglevel', 'error',
