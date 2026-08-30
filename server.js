@@ -1416,11 +1416,11 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinish
   return false;
 }
 
-async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false, fastPreview = false) {
-  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, forceFullTranscode, fastPreview));
+async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
+  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, forceFullTranscode));
 }
 
-async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false, fastPreview = false) {
+async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
   const seekableVod = kind === 'movie' || kind === 'series';
   const startSeconds = seekableVod ? hlsStartSeconds(requestedStart) : 0;
   const key = rokuHlsKey(source._id, kind, id, extension, startSeconds);
@@ -1466,23 +1466,20 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
 
   const inputUrl = await sourceProviderUrl(source, kind, id, extension);
   const probeKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
-  // Live previews favor startup latency: begin with stream copy immediately.
-  // Full playback reuses this same keyed job, while failed remux startup still
-  // falls through to the compatibility transcode below.
-  const sourceMetadata = forceFullTranscode || fastPreview ? {} : await providerCodecMetadata(probeKey, inputUrl);
+  const sourceMetadata = forceFullTranscode ? {} : await providerCodecMetadata(probeKey, inputUrl);
   const decision = forceFullTranscode
     ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Compatibility fallback after stream-copy failure' }
     : determineHlsStrategy(sourceMetadata);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
-    key, mode, fastPreview, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
+    key, mode, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
   }, async () => {
     const directory = path.join(rokuHlsRoot, key);
     await fs.mkdir(directory, { recursive: true });
     const manifest = path.join(directory, 'master.m3u8');
-    const playlistProfile = hlsPlaylistProfile({ fastPreview });
+    const playlistProfile = hlsPlaylistProfile();
     const args = ['-hide_banner', '-loglevel', 'error'];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
     args.push(
@@ -1490,12 +1487,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // freeze the first short manifest, while EVENT retains an unbounded history.
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
-                  ...hlsInputArgs({ fastPreview }), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
+                  ...hlsInputArgs(), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
     '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision), '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
                   '-hls_time', String(playlistProfile.segmentSeconds), '-hls_list_size', String(playlistProfile.listSize), '-hls_delete_threshold', '6',
-                  '-hls_flags', hlsMuxerFlags({ fastPreview }), '-flush_packets', '1',
+                  '-hls_flags', hlsMuxerFlags(), '-flush_packets', '1',
     '-hls_segment_filename', path.join(directory, 'segment-%06d.ts'), manifest,
     );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -1585,14 +1582,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     }
     // Native HLS failures use the stable independent-segment pipeline. The
     // aggressive split-by-time preview experiment produced Roku -3/-5 errors.
-    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, false, false);
-    let playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
+    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, false);
+    let playlistProfile = hlsPlaylistProfile();
     let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     if (!manifestReady && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying full compatibility transcode`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
-      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true, false);
-      playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true);
+      playlistProfile = hlsPlaylistProfile();
       manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     }
     if (!manifestReady) {
@@ -1620,6 +1617,54 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
     if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: error.message });
+  }
+});
+
+app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req, res) => {
+  const controller = new AbortController();
+  const abortUpstream = () => controller.abort(new Error('Native HLS client disconnected'));
+  res.once('close', abortUpstream);
+  let releaseDirectStream;
+  try {
+    const identity = mediaIdentity(req);
+    const session = nativeHlsSession(req, identity);
+    const upstreamUrl = session?.resources.get(req.params.resourceId);
+    if (!session || !upstreamUrl) return res.sendStatus(404);
+    if (session.userId && session.userId !== mediaOwner(req)) return res.sendStatus(404);
+    releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
+    const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Stream/1.0' };
+    if (req.headers.range) headers.range = req.headers.range;
+    const upstream = await fetch(upstreamUrl, {
+      headers,
+      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12_000)]),
+    });
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.sendStatus(upstream.status || 502);
+    }
+    const contentType = upstream.headers.get('content-type') || '';
+    if (isHlsManifest(contentType, upstreamUrl)) {
+      const manifest = await upstream.text();
+      const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+      res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+      res.setHeader('Cache-Control', 'no-store');
+      return res.send(rewritten);
+    }
+    for (const name of ['content-length', 'content-range', 'content-type', 'etag', 'last-modified', 'accept-ranges']) {
+      const value = upstream.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.status(upstream.status);
+    if (!upstream.body) return res.end();
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch (error) {
+    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) {
+      res.status(error.name === 'AbortError' ? 499 : 502).json({ error: error.message });
+    }
+  } finally {
+    releaseDirectStream?.();
+    res.off('close', abortUpstream);
   }
 });
 

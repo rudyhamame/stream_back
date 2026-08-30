@@ -16,23 +16,16 @@ test('keeps range-capable proxy playback on the direct path', () => {
   assert.equal(choosePlaybackStrategy({ purpose: 'direct-proxy' }), PlaybackStrategy.DIRECT);
 });
 
-test('uses short initial channel-preview segments without changing normal playback timing', () => {
-  assert.deepEqual(hlsPlaylistProfile({ fastPreview: true }), {
-    segmentSeconds: 1,
-    initialSegmentSeconds: 0.5,
-    listSize: 3,
-    startupSegments: 3,
-  });
+test('keeps FFmpeg fallback on independent, Roku-safe HLS segments', () => {
   assert.deepEqual(hlsPlaylistProfile(), {
     segmentSeconds: 2,
     initialSegmentSeconds: 0,
     listSize: 30,
     startupSegments: 1,
   });
-  assert.equal(hlsInputArgs({ fastPreview: true }).includes('-re'), false);
   assert.deepEqual(hlsInputArgs(), ['-re']);
-  assert.match(hlsMuxerFlags({ fastPreview: true }), /split_by_time/);
   assert.match(hlsMuxerFlags(), /independent_segments/);
+  assert.equal(hlsMuxerFlags().includes('split_by_time'), false);
 });
 
 test('uses remux for compatibility HLS and transcode only for previews', () => {
