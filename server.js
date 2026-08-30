@@ -15,7 +15,7 @@ import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProvi
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
-import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsSegmentSeconds, strategyUsesEncoding } from './playback-strategy.js';
+import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
@@ -1339,13 +1339,14 @@ function hlsStartSeconds(value) {
   return Math.min(7 * 24 * 60 * 60, Math.max(0, parsed));
 }
 
-async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false) {
+async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false, requiredSegments = 1) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (signal?.aborted) throw signal.reason || new Error('Manifest request cancelled');
     try {
-      const stat = await fs.stat(filename);
-      if (stat.size > 0) return true;
+      const manifest = await fs.readFile(filename, 'utf8');
+      const segmentCount = manifest.split('\n').filter(line => /^segment-\d{6}\.ts$/.test(line.trim())).length;
+      if (segmentCount >= requiredSegments) return true;
     } catch { /* ffmpeg has not produced the first segment yet */ }
     if (isFinished()) return false;
     await new Promise(resolve => setTimeout(resolve, 75));
@@ -1419,7 +1420,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const directory = path.join(rokuHlsRoot, key);
     await fs.mkdir(directory, { recursive: true });
     const manifest = path.join(directory, 'master.m3u8');
-    const segmentSeconds = hlsSegmentSeconds({ fastPreview });
+    const playlistProfile = hlsPlaylistProfile({ fastPreview });
     const args = ['-hide_banner', '-loglevel', 'error'];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
     args.push(
@@ -1429,7 +1430,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs({ fastPreview }), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
     '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision), '-sn', '-dn',
-                  '-f', 'hls', '-hls_time', String(segmentSeconds), '-hls_list_size', '30', '-hls_delete_threshold', '6',
+                  '-f', 'hls',
+                  ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
+                  '-hls_time', String(playlistProfile.segmentSeconds), '-hls_list_size', String(playlistProfile.listSize), '-hls_delete_threshold', '6',
                   '-hls_flags', hlsMuxerFlags({ fastPreview }), '-flush_packets', '1',
     '-hls_segment_filename', path.join(directory, 'segment-%06d.ts'), manifest,
     );
@@ -1502,12 +1505,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const identity = mediaIdentity(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} preview=${fastPreview}`);
     let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, false, fastPreview);
-    let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true);
+    let playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
+    let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     if (!manifestReady && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying full compatibility transcode`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true, fastPreview);
-      manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true);
+      playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
+      manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     }
     if (!manifestReady) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest timeout detail=${job.error.trim().slice(-240) || 'none'}`);
