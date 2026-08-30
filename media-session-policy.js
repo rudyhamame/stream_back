@@ -8,6 +8,18 @@ export function hlsSessionKey(sourceId, kind, id, extension, startSeconds = 0) {
     .slice(0, 24);
 }
 
+export function hlsChildRequestQuery(query = {}, startSeconds = 0) {
+  const params = new URLSearchParams();
+  const deviceToken = String(query.deviceToken || '').trim();
+  if (deviceToken) params.set('deviceToken', deviceToken);
+  const streamTicket = String(query.streamTicket || '').trim();
+  if (streamTicket) params.set('streamTicket', streamTicket);
+  const extension = String(query.ext || '').trim();
+  if (extension) params.set('ext', extension);
+  if (startSeconds > 0) params.set('start', String(startSeconds));
+  return params;
+}
+
 export function samePlaybackViewer(job, identity) {
   if (!job || !identity) return false;
   if (identity.deviceId) return job.deviceId === identity.deviceId;

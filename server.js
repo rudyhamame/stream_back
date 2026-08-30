@@ -14,7 +14,7 @@ import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamMovie
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
-import { KeyedSerialExecutor, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
+import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -1514,12 +1514,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     // each segment URL so the authenticated /api/xtream middleware accepts
     // the subsequent video requests instead of returning a JSON 401 body.
     let manifestText = await fs.readFile(job.manifest, 'utf8');
-    const segmentQuery = new URLSearchParams();
-    const deviceToken = String(req.query.deviceToken || '').trim();
-    if (deviceToken) segmentQuery.set('deviceToken', deviceToken);
-    const streamTicket = String(req.query.streamTicket || '').trim();
-    if (streamTicket) segmentQuery.set('streamTicket', streamTicket);
-    if (startSeconds > 0) segmentQuery.set('start', String(startSeconds));
+    const segmentQuery = hlsChildRequestQuery(req.query, startSeconds);
     if ([...segmentQuery].length > 0) {
       const query = segmentQuery.toString();
       manifestText = manifestText.split('\n').map(line => (
