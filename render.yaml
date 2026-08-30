@@ -7,7 +7,9 @@ services:
     runtime: docker
     plan: free
     autoDeploy: true
-    healthCheckPath: /api/health
+    # Deployment liveness must not wait for MongoDB. /api/health remains the
+    # dependency-aware diagnostic endpoint used by clients and operators.
+    healthCheckPath: /api/live
     envVars:
       - key: NODE_ENV
         value: production

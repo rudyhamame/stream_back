@@ -5,6 +5,7 @@ import { isStreamingRoute } from '../streaming-route-policy.js';
 test('allows only health and media delivery GET surfaces', () => {
   const allowed = [
     '/api/health',
+    '/api/live',
     '/api/roku/auth-health?deviceToken=redacted',
     '/api/playback/preview?sourceId=source-1&kind=channel&id=42',
     '/internal/media-health',

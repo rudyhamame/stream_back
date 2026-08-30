@@ -556,6 +556,11 @@ app.post('/api/account/password', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+app.get('/api/live', (_, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.json({ ok: true, role: 'streaming', uptime: Math.floor(process.uptime()) });
+});
+
 app.get('/api/health', async (_, res) => {
   try {
     const xtreamSources = await getXtreamSources();
