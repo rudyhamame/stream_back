@@ -17,6 +17,7 @@ import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
@@ -816,8 +817,7 @@ async function capturePreview(inputUrl, position, key, identity, live = false, p
   }, async () => {
     const args = ['-hide_banner', '-loglevel', 'error'];
     if (!live) args.push('-ss', String(Math.max(0, position)));
-    const width = playerFrame ? 1280 : 520;
-    const height = playerFrame ? 720 : 293;
+    const { width, height } = previewFrameSize({ playerFrame });
     args.push(
       '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
