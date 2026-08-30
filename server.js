@@ -728,6 +728,10 @@ async function capturePreview(inputUrl, position, key, identity) {
     key,
     mode: choosePlaybackStrategy({ purpose: 'preview' }) === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux',
     persistent: false,
+    // This is a bounded one-frame extraction, not sustained video
+    // transcoding. Permit it beside an active HLS remux while still enforcing
+    // hard-memory, total-job, queue, and transcode-count limits.
+    allowUnderLoad: true,
     // Preview captures must not consume the device's one active playback slot.
     ...identity, userId: '', deviceId: '',
   }, async () => {
