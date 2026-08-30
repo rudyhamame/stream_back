@@ -68,6 +68,19 @@ function appendTail(current, chunk, maxBytes = 8_000) {
   return `${current}${chunk}`.slice(-maxBytes);
 }
 
+function redactSensitiveUrl(value) {
+  const text = String(value || '');
+  try {
+    const parsed = new URL(text);
+    for (const key of ['deviceToken', 'token', 'access_token']) {
+      if (parsed.searchParams.has(key)) parsed.searchParams.set(key, '[redacted]');
+    }
+    return parsed.toString();
+  } catch {
+    return text.replace(/([?&](?:deviceToken|token|access_token)=)[^&\s]*/gi, '$1[redacted]');
+  }
+}
+
 function capacityResponse(res, error) {
   if (!(error instanceof MediaCapacityError)) return false;
   res.setHeader('Retry-After', String(error.retryAfterSeconds));
@@ -774,7 +787,7 @@ app.put('/api/playback/roku/save', async (req, res) => {
       completed: completedValue === 'true' || completedValue === '1',
     };
     const item = await savePlayback(payload);
-    console.log(`[Roku playback] saved ${itemId} at ${item.position}s`);
+    console.log(`[Roku playback] saved ${redactSensitiveUrl(itemId)} at ${item.position}s`);
     res.json({ item });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -1264,15 +1277,21 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
       const registered = mediaJobs.get(key);
       if (registered) registered.error = created.error;
     });
+    const ffmpegStartedAt = Date.now();
     child.on('close', code => {
       created.finished = true;
       const registered = mediaJobs.get(key);
       if (registered) registered.finished = true;
       const safeError = created.error.replaceAll(inputUrl, '[provider URL]');
+      const runtimeSeconds = Math.max(0, Math.round((Date.now() - ffmpegStartedAt) / 1000));
+      const detail = safeError.trim().slice(-240);
+      const message = `[Media HLS] ${kind}:${id} ffmpeg exited code=${code ?? 'null'} runtime=${runtimeSeconds}s${detail ? ` detail=${detail}` : ''}`;
       if (code !== 0 && code !== null) {
-        console.warn(`[Media HLS] ${kind}:${id} exited ${code}: ${safeError.trim().slice(-240)}`);
+        console.warn(message);
         const active = mediaJobs.get(key);
         if (active?.child === child) mediaJobs.remove(key, 'ffmpeg-error').catch(() => {});
+      } else {
+        console.log(message);
       }
     });
     return created;
@@ -1308,8 +1327,10 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const identity = mediaIdentity(req);
+    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'}`);
     const job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity);
     if (!await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal)) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest timeout detail=${job.error.trim().slice(-240) || 'none'}`);
       return res.status(504).json({ error: job.error.trim().slice(-240) || 'HLS manifest is still being prepared' });
     }
     mediaJobs.touch(job, identity.viewerId);
@@ -1330,28 +1351,43 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         /^segment-\d{6}\.ts$/.test(line.trim()) ? `${line}?${query}` : line
       )).join('\n');
     }
+    const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
+    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'}`);
     res.send(manifestText);
   } catch (error) {
+    console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
     if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: error.message });
   }
 });
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
   try {
-    if (!/^segment-\d{6}\.ts$/.test(req.params.segment)) return res.sendStatus(404);
+    if (!/^segment-\d{6}\.ts$/.test(req.params.segment)) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} invalid segment=${req.params.segment}`);
+      return res.sendStatus(404);
+    }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const key = rokuHlsKey(req.params.sourceId, req.params.kind, req.params.id, req.query.ext, startSeconds);
     const job = mediaJobs.get(key);
-    if (!job) return res.sendStatus(404);
-    if (job.userId && job.userId !== requestOwner(req)) return res.sendStatus(404);
+    if (!job) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} segment missing job segment=${req.params.segment} start=${startSeconds}s`);
+      return res.sendStatus(404);
+    }
+    if (job.userId && job.userId !== requestOwner(req)) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} segment owner mismatch segment=${req.params.segment}`);
+      return res.sendStatus(404);
+    }
     mediaJobs.touch(job, mediaIdentity(req).viewerId);
     const filename = path.join(job.directory, req.params.segment);
     await fs.access(filename);
     res.setHeader('Content-Type', 'video/mp2t');
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(filename);
-  } catch { res.sendStatus(404); }
+  } catch (error) {
+    console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} segment unavailable segment=${req.params.segment}: ${error.code || error.message}`);
+    res.sendStatus(404);
+  }
 });
 
 app.get('/api/xtream/roku/:sourceId/:kind/:id', async (req, res) => {
