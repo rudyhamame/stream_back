@@ -14,6 +14,7 @@ import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamMovie
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
+import { hlsResourceId, isHlsManifest, rewriteHlsManifest } from './hls-native-proxy.js';
 import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -59,6 +60,9 @@ const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
 const mediaSourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
+const nativeHlsSessions = new Map();
+const nativeHlsSessionTtlMs = 60_000;
+const nativeHlsSessionMaxEntries = 16;
 let previewCacheBytes = 0;
 let shuttingDown = false;
 let mediaRequestSequence = 0;
@@ -593,6 +597,7 @@ async function mediaHealthSnapshot() {
       m3uRequestsInFlight: m3uCacheStats().inFlight,
       previews: previewCache.size,
       previewMB: Number((previewCacheBytes / 1024 / 1024).toFixed(1)),
+      nativeHlsSessions: nativeHlsSessions.size,
       catalogRequestsInFlight: xtreamItemsInFlight.size,
     },
   };
@@ -606,7 +611,7 @@ app.get('/internal/media-health', async (req, res) => {
 
 app.use('/api/xtream', (req, res, next) => {
   if (req.path === '/logo') return next();
-  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts)$/);
+  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|resource\/[a-f0-9]{24})$/);
   if (hls && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
   const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
   if (direct && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
@@ -1339,6 +1344,63 @@ function hlsStartSeconds(value) {
   return Math.min(7 * 24 * 60 * 60, Math.max(0, parsed));
 }
 
+function evictNativeHlsSessions(now = Date.now()) {
+  for (const [key, session] of nativeHlsSessions) if (session.expiresAt <= now) nativeHlsSessions.delete(key);
+  while (nativeHlsSessions.size > nativeHlsSessionMaxEntries) nativeHlsSessions.delete(nativeHlsSessions.keys().next().value);
+}
+
+function nativeHlsSession(req, identity, create = false) {
+  evictNativeHlsSessions();
+  const key = rokuHlsKey(req.params.sourceId, 'channel', req.params.id, req.query.ext, 0);
+  let session = nativeHlsSessions.get(key);
+  if (session && session.userId && session.userId !== identity.userId) session = null;
+  if (!session && create) {
+    session = { key, userId: identity.userId, viewerId: identity.viewerId, resources: new Map(), expiresAt: Date.now() + nativeHlsSessionTtlMs };
+    nativeHlsSessions.set(key, session);
+    evictNativeHlsSessions();
+  }
+  if (session) {
+    session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
+    nativeHlsSessions.delete(key);
+    nativeHlsSessions.set(key, session);
+  }
+  return session;
+}
+
+function nativeHlsResourcePath(req, session, upstreamUrl) {
+  const id = hlsResourceId(upstreamUrl);
+  session.resources.delete(id);
+  session.resources.set(id, upstreamUrl);
+  while (session.resources.size > 512) session.resources.delete(session.resources.keys().next().value);
+  const query = hlsChildRequestQuery(req.query, 0).toString();
+  const base = `/api/xtream/hls/${encodeURIComponent(req.params.sourceId)}/channel/${encodeURIComponent(req.params.id)}/resource/${id}`;
+  return query ? `${base}?${query}` : base;
+}
+
+async function fetchNativeHlsManifest(upstreamUrl, signal) {
+  const response = await fetch(upstreamUrl, {
+    headers: { 'user-agent': 'RH-Stream/1.0' },
+    signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+  });
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`Native HLS manifest returned HTTP ${response.status}`);
+  }
+  const manifest = await response.text();
+  if (!isHlsManifest(response.headers.get('content-type'), upstreamUrl, manifest)) throw new Error('Provider did not return an HLS manifest');
+  return manifest;
+}
+
+async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
+  const manifest = await fetchNativeHlsManifest(upstreamUrl, signal);
+  const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+  session.rootUrl = upstreamUrl;
+  session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
+  res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(rewritten);
+}
+
 async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false, requiredSegments = 1) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
@@ -1482,6 +1544,7 @@ setInterval(async () => {
   mediaHousekeepingRunning = true;
   try {
   const pressure = memoryPressure(mediaLimits);
+  evictNativeHlsSessions();
   if (pressure.soft) { evictXtreamCache(Date.now(), true); evictM3uCache(Date.now(), true); evictPreviewCache(Date.now(), true); }
   await mediaJobs.sweep({ aggressive: pressure.hard });
   await Promise.allSettled([...mediaJobs.values()].filter(job => job.persistent).map(enforceHlsFileBound));
@@ -1504,13 +1567,31 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
     const identity = mediaIdentity(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} preview=${fastPreview}`);
-    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, false, fastPreview);
+    if (req.params.kind === 'channel') {
+      const existingNativeSession = nativeHlsSession(req, identity);
+      if (fastPreview || existingNativeSession) {
+        const session = existingNativeSession || nativeHlsSession(req, identity, true);
+        try {
+          const upstreamUrl = session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
+          await serveNativeHlsManifest(req, res, upstreamUrl, session, requestAbort.signal);
+          console.log(`[Native HLS] channel:${req.params.id} manifest ready preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
+          return;
+        } catch (error) {
+          nativeHlsSessions.delete(session.key);
+          if (res.headersSent || res.destroyed) return;
+          console.warn(`[Native HLS] channel:${req.params.id} unavailable; using compatibility remux: ${error.message}`);
+        }
+      }
+    }
+    // Native HLS failures use the stable independent-segment pipeline. The
+    // aggressive split-by-time preview experiment produced Roku -3/-5 errors.
+    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, false, false);
     let playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
     let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     if (!manifestReady && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying full compatibility transcode`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
-      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true, fastPreview);
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true, false);
       playlistProfile = hlsPlaylistProfile({ fastPreview: job.fastPreview === true });
       manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     }
