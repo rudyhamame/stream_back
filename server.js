@@ -894,8 +894,8 @@ app.get('/api/roku/weather-locations/search', async (req, res) => {
 
 app.get('/api/roku/dashboard', async (req, res) => {
   try {
-    const locations = [1, 2].map(slot => ({
-      id: `slot${slot}`,
+    const locations = [1].map(slot => ({
+      id: 'slot1',
       label: String(req.query[`label${slot}`] || '').trim(),
       latitude: Number(req.query[`latitude${slot}`]),
       longitude: Number(req.query[`longitude${slot}`]),
