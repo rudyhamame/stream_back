@@ -806,7 +806,7 @@ function parseXtreamPlaybackItem(itemId) {
   };
 }
 
-async function capturePreview(inputUrl, position, key, identity, live = false) {
+async function capturePreview(inputUrl, position, key, identity, live = false, playerFrame = false) {
   const { job } = await mediaJobs.getOrCreate({
     key,
     mode: choosePlaybackStrategy({ purpose: 'preview' }) === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux',
@@ -816,10 +816,12 @@ async function capturePreview(inputUrl, position, key, identity, live = false) {
   }, async () => {
     const args = ['-hide_banner', '-loglevel', 'error'];
     if (!live) args.push('-ss', String(Math.max(0, position)));
+    const width = playerFrame ? 1280 : 520;
+    const height = playerFrame ? 720 : 293;
     args.push(
       '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
-      '-vf', 'scale=520:293:force_original_aspect_ratio=decrease,pad=520:293:(ow-iw)/2:(oh-ih)/2:black',
+      '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
       '-q:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
     );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -872,14 +874,15 @@ app.get('/api/playback/preview', async (req, res) => {
     const source = await getXtreamSource(target.sourceId, requestOwner(req));
     if (!source) return res.sendStatus(404);
     const live = target.kind === 'channel';
+    const playerFrame = !live && String(req.query?.player || '') === '1';
     const position = live ? 0 : Math.max(0, Math.floor(Number(req.query?.position ?? playback?.position) || 0));
     const cachePosition = live ? Math.floor(Date.now() / 30_000) : position;
-    const cacheKey = `${target.sourceId}:${target.kind}:${target.id}:${target.extension}:${cachePosition}`;
+    const cacheKey = `${target.sourceId}:${target.kind}:${target.id}:${target.extension}:${cachePosition}:${playerFrame ? 'player' : 'card'}`;
     evictPreviewCache();
     let frame = previewCache.get(cacheKey)?.frame;
     if (!frame) {
       previewJobKey = `preview:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
-      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, mediaIdentity(req), live);
+      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, mediaIdentity(req), live, playerFrame);
       cachePreview(cacheKey, frame, live ? 30_000 : previewCacheTtlMs);
     }
     res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': live ? 'private, max-age=30' : 'private, max-age=86400', 'Content-Length': String(frame.length) });
