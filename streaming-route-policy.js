@@ -10,6 +10,7 @@ const STREAMING_PATH_PATTERNS = [
   /^\/api\/xtream\/play\/[^/]+\/(?:channel|movie|series)\/[^/]+$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/master\.m3u8$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/segment-\d{6}\.ts$/,
+  /^\/api\/xtream\/hls\/[^/]+\/channel\/[^/]+\/resource\/[a-f0-9]{24}$/,
 ];
 
 export function isStreamingRoute(method, pathname) {

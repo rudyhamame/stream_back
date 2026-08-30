@@ -10,6 +10,7 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/xtream/play/source-1/channel/42',
     '/api/xtream/hls/source-1/movie/42/master.m3u8',
     '/api/xtream/hls/source-1/series/episode-3/segment-000001.ts',
+    '/api/xtream/hls/source-1/channel/42/resource/0123456789abcdef01234567',
   ];
   for (const path of allowed) assert.equal(isStreamingRoute('GET', path), true, path);
 });
@@ -45,5 +46,6 @@ test('blocks mutations even when the path resembles streaming', () => {
 test('rejects prefix and traversal lookalikes', () => {
   assert.equal(isStreamingRoute('GET', '/api/xtream/play/source/channel/42/extra'), false);
   assert.equal(isStreamingRoute('GET', '/api/xtream/hls/source/channel/42/not-a-segment.ts'), false);
+  assert.equal(isStreamingRoute('GET', '/api/xtream/hls/source/channel/42/resource/not-a-valid-id'), false);
   assert.equal(isStreamingRoute('GET', '/api/xtream/sources/../play/source/channel/42'), false);
 });
