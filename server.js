@@ -20,8 +20,7 @@ import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getL
 
 const app = express();
 const port = process.env.PORT || 8787;
-let dashboardCache = { expires: 0, data: null };
-const dashboardTimeZones = { toronto: 'America/Toronto', latakia: 'Asia/Damascus' };
+const dashboardCache = new Map();
 const previewCache = new Map();
 const arabicText = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/;
 const rokuText = (value) => arabicText.test(String(value || '')) ? shapeArabicForRoku(value) : String(value || '');
@@ -199,7 +198,7 @@ function cityIsoMinute(timeZone) {
 function freshDashboardTimes(data) {
   return { ...data, cities: (data?.cities || []).map(city => ({
     ...city,
-    time: cityIsoMinute(dashboardTimeZones[city.id] || 'UTC'),
+    time: cityIsoMinute(city.timezone || 'UTC'),
   })) };
 }
 
@@ -870,15 +869,41 @@ app.put('/api/playback', async (req, res) => {
     res.json({ item: await savePlayback({ itemId, ...req.body }) });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
-app.get('/api/roku/dashboard', async (_, res) => {
+app.get('/api/roku/weather-locations/search', async (req, res) => {
   try {
-    // Weather is cached, but clock values must be generated for every request
-    // so the minute display never remains frozen for the cache lifetime.
-    if (dashboardCache.expires > Date.now()) return res.json(freshDashboardTimes(dashboardCache.data));
-    const locations = [
-      { id: 'toronto', label: 'TORONTO, CANADA', latitude: 43.6532, longitude: -79.3832, timezone: 'America/Toronto' },
-      { id: 'latakia', label: 'LATAKIA, SYRIA', latitude: 35.5317, longitude: 35.7917, timezone: 'Asia/Damascus' },
-    ];
+    const name = String(req.query.q || '').trim();
+    if (name.length < 2) return res.status(400).json({ error: 'Enter at least two characters' });
+    const language = String(req.query.language || 'en').toLowerCase() === 'ar' ? 'ar' : 'en';
+    const query = new URLSearchParams({ name, count: '100', language, format: 'json' });
+    const response = await fetch(`https://geocoding-api.open-meteo.com/v1/search?${query}`, { signal: AbortSignal.timeout(8_000) });
+    if (!response.ok) throw new Error(`Geocoding HTTP ${response.status}`);
+    const payload = await response.json();
+    const locations = (payload.results || []).map(location => ({
+      id: location.id,
+      name: location.name,
+      country: location.country || '',
+      admin1: location.admin1 || '',
+      latitude: location.latitude,
+      longitude: location.longitude,
+      timezone: location.timezone || 'auto',
+      label: [location.name, location.admin1, location.country].filter(Boolean).join(', '),
+    }));
+    res.json({ locations });
+  } catch (error) { res.status(502).json({ error: error.message }); }
+});
+
+app.get('/api/roku/dashboard', async (req, res) => {
+  try {
+    const locations = [1, 2].map(slot => ({
+      id: `slot${slot}`,
+      label: String(req.query[`label${slot}`] || '').trim(),
+      latitude: Number(req.query[`latitude${slot}`]),
+      longitude: Number(req.query[`longitude${slot}`]),
+      timezone: String(req.query[`timezone${slot}`] || 'auto'),
+    })).filter(location => location.label && Number.isFinite(location.latitude) && Number.isFinite(location.longitude));
+    const cacheKey = JSON.stringify(locations);
+    const cached = dashboardCache.get(cacheKey);
+    if (cached?.expires > Date.now()) return res.json(freshDashboardTimes(cached.data));
     const cities = await Promise.all(locations.map(async (location) => {
       const query = new URLSearchParams({
         latitude: location.latitude, longitude: location.longitude,
@@ -887,10 +912,11 @@ app.get('/api/roku/dashboard', async (_, res) => {
       const response = await fetch(`https://api.open-meteo.com/v1/forecast?${query}`, { signal: AbortSignal.timeout(8_000) });
       if (!response.ok) throw new Error(`Weather HTTP ${response.status}`);
       const data = await response.json();
-      return { id: location.id, label: location.label, time: data.current?.time || '', temperature: data.current?.temperature_2m, weatherCode: data.current?.weather_code };
+      return { id: location.id, label: location.label, timezone: location.timezone, time: data.current?.time || '', temperature: data.current?.temperature_2m, weatherCode: data.current?.weather_code };
     }));
-    dashboardCache = { expires: Date.now() + 120_000, data: { backend: 'online', cities } };
-    res.json(freshDashboardTimes(dashboardCache.data));
+    const entry = { expires: Date.now() + 120_000, data: { backend: 'online', cities } };
+    dashboardCache.set(cacheKey, entry);
+    res.json(freshDashboardTimes(entry.data));
   } catch (error) { res.status(502).json({ backend: 'online', error: error.message }); }
 });
 function parsePlaylistInput(body, existing = null) {
