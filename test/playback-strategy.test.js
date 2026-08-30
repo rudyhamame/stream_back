@@ -6,11 +6,18 @@ import {
   choosePlaybackStrategy,
   determineHlsStrategy,
   hlsCodecArgs,
+  hlsSegmentSeconds,
   strategyUsesEncoding,
 } from '../playback-strategy.js';
 
 test('keeps range-capable proxy playback on the direct path', () => {
   assert.equal(choosePlaybackStrategy({ purpose: 'direct-proxy' }), PlaybackStrategy.DIRECT);
+});
+
+test('uses short initial channel-preview segments without changing normal playback timing', () => {
+  assert.equal(hlsSegmentSeconds({ fastPreview: true }), 1);
+  assert.equal(hlsSegmentSeconds({ fastPreview: false }), 2);
+  assert.equal(hlsSegmentSeconds(), 2);
 });
 
 test('uses remux for compatibility HLS and transcode only for previews', () => {

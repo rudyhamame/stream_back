@@ -51,6 +51,10 @@ export function strategyUsesEncoding(decision) {
   return decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
 }
 
+export function hlsSegmentSeconds({ fastPreview = false } = {}) {
+  return fastPreview ? 1 : 2;
+}
+
 export function choosePlaybackStrategy({ purpose } = {}) {
   if (purpose === 'direct-proxy') return PlaybackStrategy.DIRECT;
   if (purpose === 'preview') return PlaybackStrategy.TRANSCODE;
