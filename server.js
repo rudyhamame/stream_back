@@ -13,7 +13,9 @@ import { createXtreamSource, deleteXtreamSource, getAllXtreamSources, getXtreamS
 import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamMovieInfo, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
-import { PlaybackStrategy, choosePlaybackStrategy } from './playback-strategy.js';
+import { DirectStreamLimiter } from './direct-stream-limiter.js';
+import { KeyedSerialExecutor, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
+import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
@@ -47,9 +49,17 @@ const previewCacheMaxEntries = Math.max(2, Number.parseInt(process.env.PREVIEW_C
 const previewCacheMaxBytes = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_MB || '12', 10) || 12) * 1024 * 1024;
 const previewCacheTtlMs = Math.max(60_000, Number.parseInt(process.env.PREVIEW_CACHE_TTL_MS || '3600000', 10) || 3_600_000);
 const mediaStreamIdleTimeoutMs = Math.max(10_000, Number.parseInt(process.env.MEDIA_STREAM_IDLE_TIMEOUT_MS || '45000', 10) || 45_000);
+const codecProbeTtlMs = Math.max(60_000, Number.parseInt(process.env.CODEC_PROBE_TTL_MS || '21600000', 10) || 21_600_000);
+const codecProbeMaxEntries = Math.max(16, Number.parseInt(process.env.CODEC_PROBE_MAX_ENTRIES || '256', 10) || 256);
+const maxCodecProbes = Math.max(1, Number.parseInt(process.env.MAX_CODEC_PROBES || '2', 10) || 2);
+const maxActiveDirectStreams = Math.max(1, Number.parseInt(process.env.MAX_ACTIVE_DIRECT_STREAMS || '8', 10) || 8);
+const maxDirectStreamsPerSource = Math.max(1, Number.parseInt(process.env.MAX_DIRECT_STREAMS_PER_SOURCE || '4', 10) || 4);
 const streamTicketSecret = process.env.DEVICE_AUTH_SECRET || 'local-development-secret-change-before-production';
+const codecProbeCache = new Map();
+const codecProbesInFlight = new Map();
+const mediaSourceLocks = new KeyedSerialExecutor();
+const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
 let previewCacheBytes = 0;
-let activeDirectStreams = 0;
 let shuttingDown = false;
 let mediaRequestSequence = 0;
 
@@ -82,6 +92,71 @@ function mediaIdentity(req) {
 
 function appendTail(current, chunk, maxBytes = 8_000) {
   return `${current}${chunk}`.slice(-maxBytes);
+}
+
+function evictCodecProbeCache(now = Date.now()) {
+  for (const [key, entry] of codecProbeCache) if (entry.expiresAt <= now) codecProbeCache.delete(key);
+  while (codecProbeCache.size > codecProbeMaxEntries) codecProbeCache.delete(codecProbeCache.keys().next().value);
+}
+
+async function inspectProviderCodecs(inputUrl) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('ffprobe', [
+      '-v', 'error', '-rw_timeout', '12000000',
+      '-probesize', '1048576', '-analyzeduration', '3000000',
+      '-show_entries', 'stream=codec_type,codec_name', '-of', 'json', inputUrl,
+    ], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    let errorOutput = '';
+    let settled = false;
+    const finish = (error, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      if (error) reject(error); else resolve(value);
+    };
+    const timeout = setTimeout(() => {
+      child.kill('SIGKILL');
+      finish(new Error('Codec probe timed out'));
+    }, 15_000);
+    timeout.unref?.();
+    child.stdout.on('data', chunk => { output = appendTail(output, chunk, 64 * 1024); });
+    child.stderr.on('data', chunk => { errorOutput = appendTail(errorOutput, chunk); });
+    child.once('error', error => finish(error));
+    child.once('close', code => {
+      if (code !== 0) return finish(new Error(errorOutput.trim() || `ffprobe exited with ${code}`));
+      try {
+        const streams = JSON.parse(output).streams || [];
+        finish(null, {
+          videoCodec: String(streams.find(stream => stream.codec_type === 'video')?.codec_name || ''),
+          audioCodec: String(streams.find(stream => stream.codec_type === 'audio')?.codec_name || ''),
+        });
+      } catch { finish(new Error('Codec probe returned invalid metadata')); }
+    });
+  });
+}
+
+async function providerCodecMetadata(cacheKey, inputUrl) {
+  evictCodecProbeCache();
+  const cached = codecProbeCache.get(cacheKey);
+  if (cached?.expiresAt > Date.now()) return cached.metadata;
+  if (codecProbesInFlight.has(cacheKey)) return codecProbesInFlight.get(cacheKey);
+  if (codecProbesInFlight.size >= maxCodecProbes) return {};
+
+  const pending = inspectProviderCodecs(inputUrl)
+    .then(metadata => {
+      codecProbeCache.delete(cacheKey);
+      codecProbeCache.set(cacheKey, { metadata, expiresAt: Date.now() + codecProbeTtlMs });
+      evictCodecProbeCache();
+      return metadata;
+    })
+    .catch(error => {
+      console.warn(`[Media probe] ${cacheKey} unavailable: ${error.message}`);
+      return {};
+    });
+  codecProbesInFlight.set(cacheKey, pending);
+  try { return await pending; }
+  finally { codecProbesInFlight.delete(cacheKey); }
 }
 
 function redactSensitiveUrl(value) {
@@ -506,7 +581,7 @@ async function mediaHealthSnapshot() {
     freeSystemMemoryMB: Number((os.freemem() / 1024 / 1024).toFixed(1)),
     loadAverage: os.loadavg().map(value => Number(value.toFixed(2))),
     cpuCount: os.availableParallelism?.() || os.cpus().length,
-    activeDirectStreams,
+    activeDirectStreams: directStreamLimiter.activeCount,
     activeRemuxJobs: counts.remux,
     activeTranscodes: counts.transcode,
     queuedJobs: counts.queued,
@@ -1207,6 +1282,7 @@ app.post('/api/xtream/sources/:id/archive/:key/restore', async (req, res) => {
 
 app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
   const controller = new AbortController();
+  let releaseDirectStream;
   const connectionTimer = setTimeout(() => controller.abort(new Error('Provider connection timed out')), 15_000);
   connectionTimer.unref?.();
   const abortUpstream = () => controller.abort(new Error('Downstream client disconnected'));
@@ -1218,6 +1294,7 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
+    releaseDirectStream = directStreamLimiter.acquire(source._id);
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
     headers['user-agent'] = req.headers['user-agent'] || 'RH-Stream/1.0';
@@ -1238,7 +1315,6 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     res.setHeader('Accept-Ranges', 'bytes');
     res.status(upstream.status);
     if (!upstream.body) return res.end();
-    activeDirectStreams += 1;
     let idleTimer;
     const resetIdleTimer = () => {
       clearTimeout(idleTimer);
@@ -1248,27 +1324,22 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const idleWatchdog = new Transform({ transform(chunk, _encoding, callback) { resetIdleTimer(); callback(null, chunk); } });
     resetIdleTimer();
     try { await pipeline(Readable.fromWeb(upstream.body), idleWatchdog, res); }
-    finally { clearTimeout(idleTimer); activeDirectStreams = Math.max(0, activeDirectStreams - 1); }
+    finally { clearTimeout(idleTimer); }
   } catch (error) {
-    if (!res.headersSent && !res.destroyed) res.status(error.name === 'AbortError' ? 499 : 502).json({ error: error.message });
+    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(error.name === 'AbortError' ? 499 : 502).json({ error: error.message });
   } finally {
+    releaseDirectStream?.();
     clearTimeout(connectionTimer);
     res.off('close', abortUpstream);
   }
 });
-
-function rokuHlsKey(sourceId, kind, id, extension, startSeconds = 0) {
-  // Segment URLs in an HLS manifest do not retain the manifest query string,
-  // so every seek offset must be carried onto segment URLs and job identity.
-  return createHash('sha256').update(`${sourceId}:${kind}:${id}:${startSeconds}`).digest('hex').slice(0, 24);
-}
 
 function hlsStartSeconds(value) {
   const parsed = Math.floor(Number(value) || 0);
   return Math.min(7 * 24 * 60 * 60, Math.max(0, parsed));
 }
 
-async function waitForHlsManifest(filename, timeoutMs = 15_000, signal) {
+async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false) {
   const started = Date.now();
   while (Date.now() - started < timeoutMs) {
     if (signal?.aborted) throw signal.reason || new Error('Manifest request cancelled');
@@ -1276,12 +1347,17 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal) {
       const stat = await fs.stat(filename);
       if (stat.size > 0) return true;
     } catch { /* ffmpeg has not produced the first segment yet */ }
+    if (isFinished()) return false;
     await new Promise(resolve => setTimeout(resolve, 180));
   }
   return false;
 }
 
-async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}) {
+async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
+  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, forceFullTranscode));
+}
+
+async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
   const seekableVod = kind === 'movie' || kind === 'series';
   const startSeconds = seekableVod ? hlsStartSeconds(requestedStart) : 0;
   const key = rokuHlsKey(source._id, kind, id, extension, startSeconds);
@@ -1311,7 +1387,7 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
   // provider responds with a tiny valid-but-completely-black placeholder.
   if (kind === 'channel') {
     for (const [otherKey, otherJob] of mediaJobs.entries()) {
-      if (otherKey === key || !otherJob.persistent || otherJob.kind !== 'channel' || otherJob.sourceId !== String(source._id)) continue;
+      if (otherKey === key || !otherJob.persistent || otherJob.kind !== 'channel' || otherJob.sourceId !== String(source._id) || !samePlaybackViewer(otherJob, identity)) continue;
       await mediaJobs.remove(otherKey, 'replaced-channel');
     }
   }
@@ -1320,18 +1396,23 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
   // alive wastes Render CPU/disk and can exceed a provider's connection cap.
   if (seekableVod) {
     for (const [otherKey, otherJob] of mediaJobs.entries()) {
-      if (otherKey === key || !otherJob.persistent || otherJob.kind !== kind || otherJob.sourceId !== String(source._id) || otherJob.mediaId !== String(id)) continue;
+      if (otherKey === key || !otherJob.persistent || otherJob.kind !== kind || otherJob.sourceId !== String(source._id) || otherJob.mediaId !== String(id) || !samePlaybackViewer(otherJob, identity)) continue;
       await mediaJobs.remove(otherKey, 'replaced-seek');
     }
   }
 
-  const strategy = choosePlaybackStrategy({ purpose: 'roku-hls', extension });
-  const mode = strategy === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux';
+  const inputUrl = await sourceProviderUrl(source, kind, id, extension);
+  const probeKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
+  const sourceMetadata = forceFullTranscode ? {} : await providerCodecMetadata(probeKey, inputUrl);
+  const decision = forceFullTranscode
+    ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Compatibility fallback after stream-copy failure' }
+    : determineHlsStrategy(sourceMetadata);
+  const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
-    key, mode, persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
+    key, mode, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
+    persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
   }, async () => {
-    const inputUrl = await sourceProviderUrl(source, kind, id, extension);
     const directory = path.join(rokuHlsRoot, key);
     await fs.mkdir(directory, { recursive: true });
     const manifest = path.join(directory, 'master.m3u8');
@@ -1342,7 +1423,7 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
     // freeze the first short manifest, while EVENT retains an unbounded history.
     // Keep ffmpeg near playback speed so it cannot run far ahead of Roku.
                   '-re', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
-    '-map', '0:v:0?', '-map', '0:a:0?', '-c', 'copy', '-sn', '-dn',
+    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision), '-sn', '-dn',
                   '-f', 'hls', '-hls_time', '2', '-hls_list_size', '30', '-hls_delete_threshold', '6',
                   '-hls_flags', 'independent_segments+temp_file+delete_segments',
     '-hls_segment_filename', path.join(directory, 'segment-%06d.ts'), manifest,
@@ -1413,8 +1494,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const identity = mediaIdentity(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'}`);
-    const job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity);
-    if (!await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal)) {
+    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity);
+    let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true);
+    if (!manifestReady && job.finished && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} failed before its first segment; retrying full compatibility transcode`);
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true);
+      manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true);
+    }
+    if (!manifestReady) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest timeout detail=${job.error.trim().slice(-240) || 'none'}`);
       return res.status(504).json({ error: job.error.trim().slice(-240) || 'HLS manifest is still being prepared' });
     }

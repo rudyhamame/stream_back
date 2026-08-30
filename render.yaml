@@ -1,4 +1,7 @@
 services:
+  # Canonical Roku Streamer deployment. The separately configured Library
+  # Streamer (rh-stream-backend-tbm7.onrender.com) deploys this same codebase
+  # with its own process and resource limits.
   - type: web
     name: rh-stream-backend
     runtime: docker
@@ -28,6 +31,10 @@ services:
         sync: false
       - key: MAX_ACTIVE_TRANSCODES
         value: "1"
+      - key: MAX_ACTIVE_DIRECT_STREAMS
+        value: "8"
+      - key: MAX_DIRECT_STREAMS_PER_SOURCE
+        value: "4"
       - key: MAX_ACTIVE_REMUX_JOBS
         value: "2"
       - key: MAX_TOTAL_FFMPEG_JOBS
@@ -66,5 +73,11 @@ services:
         value: "2"
       - key: XTREAM_MAX_IN_FLIGHT
         value: "12"
+      - key: MAX_CODEC_PROBES
+        value: "2"
+      - key: CODEC_PROBE_MAX_ENTRIES
+        value: "256"
+      - key: CODEC_PROBE_TTL_MS
+        value: "21600000"
       - key: DEBUG_MEDIA_LOGGING
         value: "false"

@@ -1,6 +1,12 @@
-# RH Roku Streamer backend
+# RH Streamer backend
 
-Dedicated media data plane for the Roku channel. Its public surface is
+Dedicated media data plane shared by two isolated Render deployments:
+
+- `rh-stream-backend-tbm7.onrender.com` serves the Library frontend.
+- `rh-stream-backend.onrender.com` serves Roku devices.
+
+Each deployment runs its own FFmpeg jobs, capacity limits, HLS files, and
+provider connections. Its public surface is
 deny-by-default and accepts only read-only health, direct playback, and HLS
 delivery requests. Account, device, catalog, category, favorites, weather, and
 playback-history calls deliberately return `404`; those belong to
