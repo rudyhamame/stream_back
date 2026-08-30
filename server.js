@@ -1567,11 +1567,13 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
+    const nativeHlsDisabled = String(req.query.native || '') === '0';
     const identity = mediaIdentity(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} preview=${fastPreview}`);
     if (req.params.kind === 'channel') {
       const existingNativeSession = nativeHlsSession(req, identity);
-      if (fastPreview || existingNativeSession) {
+      if (nativeHlsDisabled && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
+      if (!nativeHlsDisabled && (fastPreview || existingNativeSession)) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
           const upstreamUrl = session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
