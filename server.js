@@ -524,6 +524,8 @@ app.use('/api/xtream', (req, res, next) => {
   if (req.path === '/logo') return next();
   const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts)$/);
   if (hls && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
+  const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
+  if (direct && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
   if (!requestOwner(req)) {
     if (req.path.startsWith('/hls/')) {
       console.warn(`[Media HLS] authorization rejected path=${req.path} token=${req.query.deviceToken ? 'present-invalid' : 'missing'}`);
