@@ -15,7 +15,7 @@ import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProvi
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
-import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsSegmentSeconds, strategyUsesEncoding } from './playback-strategy.js';
+import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsSegmentSeconds, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
@@ -1425,11 +1425,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     args.push(
     // Keep a live, rolling manifest. Do not mark it VOD or EVENT: VOD made Roku
     // freeze the first short manifest, while EVENT retains an unbounded history.
-    // Keep ffmpeg near playback speed so it cannot run far ahead of Roku.
-                  '-re', '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
+    // Normal playback stays near playback speed. Preview startup is allowed to
+    // catch up immediately and uses a bounded low-latency input analysis.
+                  ...hlsInputArgs({ fastPreview }), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
     '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision), '-sn', '-dn',
                   '-f', 'hls', '-hls_time', String(segmentSeconds), '-hls_list_size', '30', '-hls_delete_threshold', '6',
-                  '-hls_flags', 'independent_segments+temp_file+delete_segments',
+                  '-hls_flags', hlsMuxerFlags({ fastPreview }), '-flush_packets', '1',
     '-hls_segment_filename', path.join(directory, 'segment-%06d.ts'), manifest,
     );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -1485,6 +1486,7 @@ setInterval(async () => {
 }, 5_000).unref();
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
+  const manifestRequestStartedAt = Date.now();
   const requestAbort = new AbortController();
   res.once('close', () => requestAbort.abort(new Error('Manifest client disconnected')));
   try {
@@ -1527,7 +1529,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       )).join('\n');
     }
     const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
-    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'}`);
+    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);

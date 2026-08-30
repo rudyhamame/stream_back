@@ -55,6 +55,24 @@ export function hlsSegmentSeconds({ fastPreview = false } = {}) {
   return fastPreview ? 1 : 2;
 }
 
+export function hlsInputArgs({ fastPreview = false } = {}) {
+  if (!fastPreview) return ['-re'];
+  return [
+    '-fflags', 'nobuffer',
+    '-probesize', '262144',
+    '-analyzeduration', '750000',
+  ];
+}
+
+export function hlsMuxerFlags({ fastPreview = false } = {}) {
+  // Live previews must not wait for a provider's potentially long GOP before
+  // publishing their first segment. The first upstream HLS segment starts on
+  // a keyframe; split_by_time then keeps subsequent preview segments short.
+  return fastPreview
+    ? 'split_by_time+temp_file+delete_segments'
+    : 'independent_segments+temp_file+delete_segments';
+}
+
 export function choosePlaybackStrategy({ purpose } = {}) {
   if (purpose === 'direct-proxy') return PlaybackStrategy.DIRECT;
   if (purpose === 'preview') return PlaybackStrategy.TRANSCODE;

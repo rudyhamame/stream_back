@@ -6,6 +6,8 @@ import {
   choosePlaybackStrategy,
   determineHlsStrategy,
   hlsCodecArgs,
+  hlsInputArgs,
+  hlsMuxerFlags,
   hlsSegmentSeconds,
   strategyUsesEncoding,
 } from '../playback-strategy.js';
@@ -18,6 +20,10 @@ test('uses short initial channel-preview segments without changing normal playba
   assert.equal(hlsSegmentSeconds({ fastPreview: true }), 1);
   assert.equal(hlsSegmentSeconds({ fastPreview: false }), 2);
   assert.equal(hlsSegmentSeconds(), 2);
+  assert.equal(hlsInputArgs({ fastPreview: true }).includes('-re'), false);
+  assert.deepEqual(hlsInputArgs(), ['-re']);
+  assert.match(hlsMuxerFlags({ fastPreview: true }), /split_by_time/);
+  assert.match(hlsMuxerFlags(), /independent_segments/);
 });
 
 test('uses remux for compatibility HLS and transcode only for previews', () => {
