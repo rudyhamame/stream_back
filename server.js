@@ -16,7 +16,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { PlaybackStrategy, choosePlaybackStrategy } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
-import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
+import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getDeviceWeatherLocations, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, saveDeviceWeatherLocations, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 
 const app = express();
 const port = process.env.PORT || 8787;
@@ -195,10 +195,26 @@ function cityIsoMinute(timeZone) {
   return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
 }
 
+function cityClock(timeZone) {
+  const values = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23',
+  }).formatToParts(new Date()).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
+  const year = Number(values.year);
+  const month = Number(values.month);
+  const day = Number(values.day);
+  return {
+    year, month, day,
+    hour: Number(values.hour), minute: Number(values.minute), second: Number(values.second),
+    weekday: new Date(Date.UTC(year, month - 1, day)).getUTCDay(),
+  };
+}
+
 function freshDashboardTimes(data) {
   return { ...data, cities: (data?.cities || []).map(city => ({
     ...city,
     time: cityIsoMinute(city.timezone || 'UTC'),
+    clock: cityClock(city.timezone || 'UTC'),
   })) };
 }
 
@@ -871,6 +887,7 @@ app.put('/api/playback', async (req, res) => {
 });
 app.get('/api/roku/weather-locations/search', async (req, res) => {
   try {
+    if (!requestOwner(req)) return res.status(401).json({ error: 'Sign in to search weather locations' });
     const name = String(req.query.q || '').trim();
     if (name.length < 2) return res.status(400).json({ error: 'Enter at least two characters' });
     const language = String(req.query.language || 'en').toLowerCase() === 'ar' ? 'ar' : 'en';
@@ -892,15 +909,31 @@ app.get('/api/roku/weather-locations/search', async (req, res) => {
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 
+app.get('/api/account/weather-locations', async (req, res) => {
+  try {
+    const ownerId = requestOwner(req);
+    if (!ownerId) return res.status(401).json({ error: 'Sign in to manage weather locations' });
+    res.json({ locations: await getDeviceWeatherLocations(ownerId) });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
+app.put('/api/account/weather-locations', async (req, res) => {
+  try {
+    const ownerId = requestOwner(req);
+    if (!ownerId) return res.status(401).json({ error: 'Sign in to manage weather locations' });
+    const result = await saveDeviceWeatherLocations(ownerId, req.body?.locations);
+    if (result.error) return res.status(result.error.includes('not found') ? 404 : 400).json(result);
+    dashboardCache.clear();
+    res.json(result);
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.get('/api/roku/dashboard', async (req, res) => {
   try {
-    const locations = [1, 2].map(slot => ({
-      id: `slot${slot}`,
-      label: String(req.query[`label${slot}`] || '').trim(),
-      latitude: Number(req.query[`latitude${slot}`]),
-      longitude: Number(req.query[`longitude${slot}`]),
-      timezone: String(req.query[`timezone${slot}`] || 'auto'),
-    })).filter(location => location.label && Number.isFinite(location.latitude) && Number.isFinite(location.longitude));
+    const ownerId = requestOwner(req);
+    if (!ownerId) return res.status(401).json({ error: 'Valid device authorization is required' });
+    const savedLocations = await getDeviceWeatherLocations(ownerId);
+    const locations = savedLocations.map((location, index) => location ? ({ ...location, id: `slot${index + 1}` }) : null).filter(Boolean);
     const cacheKey = JSON.stringify(locations);
     const cached = dashboardCache.get(cacheKey);
     if (cached?.expires > Date.now()) return res.json(freshDashboardTimes(cached.data));
