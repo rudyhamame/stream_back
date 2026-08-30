@@ -6,6 +6,7 @@ test('allows only health and media delivery GET surfaces', () => {
   const allowed = [
     '/api/health',
     '/api/roku/auth-health?deviceToken=redacted',
+    '/api/playback/preview?sourceId=source-1&kind=channel&id=42',
     '/internal/media-health',
     '/api/xtream/play/source-1/channel/42',
     '/api/xtream/hls/source-1/movie/42/master.m3u8',

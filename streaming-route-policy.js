@@ -3,6 +3,7 @@ const READ_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 const EXACT_STREAMING_PATHS = new Set([
   '/api/health',
   '/api/roku/auth-health',
+  '/api/playback/preview',
   '/internal/media-health',
 ]);
 

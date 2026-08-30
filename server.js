@@ -221,11 +221,11 @@ function evictPreviewCache(now = Date.now(), aggressive = false) {
   }
 }
 
-function cachePreview(key, frame) {
+function cachePreview(key, frame, ttlMs = previewCacheTtlMs) {
   const prior = previewCache.get(key);
   if (prior) previewCacheBytes -= prior.bytes;
   previewCache.delete(key);
-  previewCache.set(key, { frame, bytes: frame.length, expires: Date.now() + previewCacheTtlMs });
+  previewCache.set(key, { frame, bytes: frame.length, expires: Date.now() + ttlMs });
   previewCacheBytes += frame.length;
   evictPreviewCache();
 }
@@ -806,7 +806,7 @@ function parseXtreamPlaybackItem(itemId) {
   };
 }
 
-async function capturePreview(inputUrl, position, key, identity) {
+async function capturePreview(inputUrl, position, key, identity, live = false) {
   const { job } = await mediaJobs.getOrCreate({
     key,
     mode: choosePlaybackStrategy({ purpose: 'preview' }) === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux',
@@ -814,19 +814,20 @@ async function capturePreview(inputUrl, position, key, identity) {
     // Preview captures must not consume the device's one active playback slot.
     ...identity, userId: '', deviceId: '',
   }, async () => {
-    const args = [
-      '-hide_banner', '-loglevel', 'error',
-      '-ss', String(Math.max(0, position)), '-i', inputUrl,
+    const args = ['-hide_banner', '-loglevel', 'error'];
+    if (!live) args.push('-ss', String(Math.max(0, position)));
+    args.push(
+      '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
-      '-vf', 'scale=640:-2:force_original_aspect_ratio=decrease',
+      '-vf', 'scale=520:293:force_original_aspect_ratio=decrease,pad=520:293:(ow-iw)/2:(oh-ih)/2:black',
       '-q:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
-    ];
+    );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const created = { child, error: '', stop: () => terminateChild(child) };
     created.result = new Promise((resolve, reject) => {
       const chunks = [];
       let total = 0;
-      const timeout = setTimeout(() => child.kill('SIGKILL'), 25_000);
+      const timeout = setTimeout(() => child.kill('SIGKILL'), live ? 8_000 : 25_000);
       timeout.unref?.();
       child.stdout.on('data', chunk => {
         total += chunk.length;
@@ -858,7 +859,7 @@ app.get('/api/playback/preview', async (req, res) => {
     const requestedKind = String(req.query?.kind || '');
     const requestedId = String(req.query?.id || '');
     let playback = null;
-    let target = requestedSourceId && ['movie', 'series'].includes(requestedKind) && requestedId
+    let target = requestedSourceId && ['channel', 'movie', 'series'].includes(requestedKind) && requestedId
       ? { sourceId: requestedSourceId, kind: requestedKind, id: requestedId, extension: String(req.query?.ext || 'mp4') }
       : null;
     if (!target) {
@@ -870,20 +871,22 @@ app.get('/api/playback/preview', async (req, res) => {
     if (!target) return res.status(404).json({ error: 'Preview is unavailable for this item' });
     const source = await getXtreamSource(target.sourceId, requestOwner(req));
     if (!source) return res.sendStatus(404);
-    const position = Math.max(0, Math.floor(Number(req.query?.position ?? playback?.position) || 0));
-    const cacheKey = `${target.sourceId}:${target.kind}:${target.id}:${target.extension}:${position}`;
+    const live = target.kind === 'channel';
+    const position = live ? 0 : Math.max(0, Math.floor(Number(req.query?.position ?? playback?.position) || 0));
+    const cachePosition = live ? Math.floor(Date.now() / 30_000) : position;
+    const cacheKey = `${target.sourceId}:${target.kind}:${target.id}:${target.extension}:${cachePosition}`;
     evictPreviewCache();
     let frame = previewCache.get(cacheKey)?.frame;
     if (!frame) {
       previewJobKey = `preview:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
-      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, mediaIdentity(req));
-      cachePreview(cacheKey, frame);
+      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, mediaIdentity(req), live);
+      cachePreview(cacheKey, frame, live ? 30_000 : previewCacheTtlMs);
     }
-    res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=86400', 'Content-Length': String(frame.length) });
+    res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': live ? 'private, max-age=30' : 'private, max-age=86400', 'Content-Length': String(frame.length) });
     res.end(frame);
   } catch (error) {
     console.warn(`[Playback preview] ${error.message}`);
-    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: 'Could not capture the saved playback frame' });
+    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: 'Could not capture the playback frame' });
   } finally { res.off('close', cancelPreview); }
 });
 app.get('/api/favorites', async (_, res) => {
