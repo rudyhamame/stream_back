@@ -20,6 +20,10 @@ services:
         value: xtream_sources
       - key: MONGODB_FAVORITES_COLLECTION
         value: favorites
+      # Must be exactly the same value as rh-library-backend. The Library
+      # signs Roku device tokens and the Streamer verifies them before HLS.
+      - key: DEVICE_AUTH_SECRET
+        sync: false
       - key: INTERNAL_DIAGNOSTICS_TOKEN
         sync: false
       - key: MAX_ACTIVE_TRANSCODES

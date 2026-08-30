@@ -491,7 +491,12 @@ app.get('/internal/media-health', async (req, res) => {
 
 app.use('/api/xtream', (req, res, next) => {
   if (req.path === '/logo') return next();
-  if (!requestOwner(req)) return res.status(401).json({ error: 'Pair this browser with a Roku device first' });
+  if (!requestOwner(req)) {
+    if (req.path.startsWith('/hls/')) {
+      console.warn(`[Media HLS] authorization rejected path=${req.path} token=${req.query.deviceToken ? 'present-invalid' : 'missing'}`);
+    }
+    return res.status(401).json({ error: 'Pair this browser with a Roku device first' });
+  }
   next();
 });
 
