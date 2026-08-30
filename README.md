@@ -1,8 +1,14 @@
-# RH Stream backend
+# RH Roku Streamer backend
 
-Xtream and M3U API for the RH Stream frontend and Roku channel. It provides
-playlist source management, explicit Roku catalog selection, direct media
-proxying, MongoDB playback history, and MongoDB favorites.
+Dedicated media data plane for the Roku channel. Its public surface is
+deny-by-default and accepts only read-only health, direct playback, and HLS
+delivery requests. Account, device, catalog, category, favorites, weather, and
+playback-history calls deliberately return `404`; those belong to
+`library_backend`.
+
+The Streamer and Library services share the provider data and
+`DEVICE_AUTH_SECRET` required to authorize playback, but they do not share a
+public API role. Run `npm test` to verify the route boundary.
 
 ## Local development
 

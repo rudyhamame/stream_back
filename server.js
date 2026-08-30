@@ -17,8 +17,12 @@ import { PlaybackStrategy, choosePlaybackStrategy } from './playback-strategy.js
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
+import { enforceStreamingOnly } from './streaming-route-policy.js';
 
 const app = express();
+// This deployment is a media data plane. Deny every route that is not needed
+// to authenticate or deliver a stream before any legacy handler can run.
+app.use(enforceStreamingOnly);
 const port = process.env.PORT || 8787;
 const dashboardCache = new Map();
 const previewCache = new Map();
