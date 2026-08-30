@@ -33,6 +33,8 @@ services:
         sync: false
       - key: MAX_ACTIVE_TRANSCODES
         value: "1"
+      - key: MAX_ACTIVE_SNAPSHOTS
+        value: "1"
       - key: MAX_ACTIVE_DIRECT_STREAMS
         value: "8"
       - key: MAX_DIRECT_STREAMS_PER_SOURCE

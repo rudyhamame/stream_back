@@ -4,6 +4,7 @@ import { MediaCapacityError, MediaJobManager } from '../media-job-manager.js';
 
 const limits = {
   maxTranscodes: 1,
+  maxSnapshots: 1,
   maxRemuxJobs: 2,
   maxTotalJobs: 2,
   maxJobsPerUser: 2,
@@ -63,6 +64,20 @@ test('counts starting jobs against per-device limits', async () => {
   );
   release();
   await first;
+  await manager.shutdown();
+});
+
+test('allows one short snapshot during high CPU without opening a second snapshot slot', async () => {
+  const manager = new MediaJobManager({ limits, pressure: () => ({ soft: false, hard: false, cpuHigh: true }) });
+  await manager.getOrCreate({ key: 'snapshot-one', mode: 'snapshot' }, async () => ({ stop() {} }));
+  await assert.rejects(
+    manager.getOrCreate({ key: 'snapshot-two', mode: 'snapshot' }, async () => ({ stop() {} })),
+    /snapshot capacity/i,
+  );
+  await assert.rejects(
+    manager.getOrCreate({ key: 'long-transcode', mode: 'transcode' }, async () => ({ stop() {} })),
+    /transcoding is temporarily unavailable/i,
+  );
   await manager.shutdown();
 });
 

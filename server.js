@@ -815,7 +815,9 @@ function parseXtreamPlaybackItem(itemId) {
 async function capturePreview(inputUrl, position, key, identity, live = false, playerFrame = false) {
   const { job } = await mediaJobs.getOrCreate({
     key,
-    mode: choosePlaybackStrategy({ purpose: 'preview' }) === PlaybackStrategy.TRANSCODE ? 'transcode' : 'remux',
+    // A one-frame JPEG is short-lived and has its own concurrency limit. Do
+    // not reject it merely because Render's host load blocks long transcodes.
+    mode: 'snapshot',
     persistent: false,
     // Preview captures must not consume the device's one active playback slot.
     ...identity, userId: '', deviceId: '',

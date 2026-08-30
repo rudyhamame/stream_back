@@ -31,6 +31,7 @@ export function defaultMediaLimits(env = process.env) {
   const totalDefault = lowMemory || cpuCount <= 1 ? 2 : Math.min(4, cpuCount);
   return {
     maxTranscodes: positiveInt(env.MAX_ACTIVE_TRANSCODES, 1),
+    maxSnapshots: positiveInt(env.MAX_ACTIVE_SNAPSHOTS, 1),
     maxRemuxJobs: positiveInt(env.MAX_ACTIVE_REMUX_JOBS, totalDefault),
     maxTotalJobs: positiveInt(env.MAX_TOTAL_FFMPEG_JOBS, totalDefault),
     maxJobsPerUser: positiveInt(env.MAX_JOBS_PER_USER, totalDefault),
@@ -80,11 +81,13 @@ export class MediaJobManager {
   counts() {
     let remux = 0;
     let transcode = 0;
+    let snapshot = 0;
     for (const job of this.jobs.values()) {
       if (job.mode === 'transcode') transcode += 1;
       else if (job.mode === 'remux') remux += 1;
+      else if (job.mode === 'snapshot') snapshot += 1;
     }
-    return { total: this.jobs.size, remux, transcode, queued: this.starting.size };
+    return { total: this.jobs.size, remux, transcode, snapshot, queued: this.starting.size };
   }
 
   assertCapacity({ mode, userId = '', deviceId = '' }) {
@@ -96,6 +99,7 @@ export class MediaJobManager {
     const starting = [...this.startingSpecs.values()];
     if (counts.total + counts.queued >= this.limits.maxTotalJobs) throw new MediaCapacityError('Media capacity is currently full');
     if (mode === 'transcode' && counts.transcode + starting.filter(spec => spec.mode === 'transcode').length >= this.limits.maxTranscodes) throw new MediaCapacityError('Transcoding capacity is currently full');
+    if (mode === 'snapshot' && counts.snapshot + starting.filter(spec => spec.mode === 'snapshot').length >= this.limits.maxSnapshots) throw new MediaCapacityError('Snapshot capacity is currently full');
     if (mode === 'remux' && counts.remux + starting.filter(spec => spec.mode === 'remux').length >= this.limits.maxRemuxJobs) throw new MediaCapacityError('Remux capacity is currently full');
     if (this.starting.size >= this.limits.maxStartupQueue) throw new MediaCapacityError('Media startup queue is full');
     if (userId) {
