@@ -1496,8 +1496,9 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'}`);
     let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity);
     let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true);
-    if (!manifestReady && job.finished && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
-      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} failed before its first segment; retrying full compatibility transcode`);
+    if (!manifestReady && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
+      console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying full compatibility transcode`);
+      await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, true);
       manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true);
     }
