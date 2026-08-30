@@ -19,3 +19,27 @@ export function rewriteHlsManifest(manifest, upstreamUrl, localUriForUrl) {
     return line.replace(/URI="([^"]+)"/g, (_match, uri) => `URI="${rewriteUrl(uri)}"`);
   }).join('\n');
 }
+
+export function hasHlsVariants(manifest) {
+  return /^#EXT-X-STREAM-INF:/m.test(String(manifest));
+}
+
+export function normalizeHlsMasterForRoku(manifest, fallbackBandwidth = 2_500_000) {
+  return String(manifest).split('\n').map(line => {
+    if (!line.startsWith('#EXT-X-STREAM-INF:')) return line;
+    const match = line.match(/(?:^|,)BANDWIDTH=(\d+)/i);
+    if (match && Number(match[1]) > 0) return line;
+    if (match) return line.replace(/BANDWIDTH=\d+/i, `BANDWIDTH=${fallbackBandwidth}`);
+    return `${line},BANDWIDTH=${fallbackBandwidth}`;
+  }).join('\n');
+}
+
+export function rokuSingleVariantMaster(mediaPlaylistUri, bandwidth = 2_500_000) {
+  return [
+    '#EXTM3U',
+    '#EXT-X-VERSION:3',
+    `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},AVERAGE-BANDWIDTH=${Math.floor(bandwidth * 0.8)}`,
+    mediaPlaylistUri,
+    '',
+  ].join('\n');
+}

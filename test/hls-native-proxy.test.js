@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { hlsResourceId, isHlsManifest, rewriteHlsManifest } from '../hls-native-proxy.js';
+import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from '../hls-native-proxy.js';
 
 test('rewrites variants, segments, encryption keys, and media URIs without exposing provider URLs', () => {
   const resources = new Map();
@@ -29,4 +29,15 @@ test('recognizes HLS from MIME type, URL, or manifest signature', () => {
   assert.equal(isHlsManifest('', 'https://x/live.m3u8?token=1'), true);
   assert.equal(isHlsManifest('text/plain', 'https://x/live', '#EXTM3U\n'), true);
   assert.equal(isHlsManifest('video/mp2t', 'https://x/segment.ts'), false);
+});
+
+test('gives Roku a positive bitrate for malformed and single-variant playlists', () => {
+  const malformed = '#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=0,CODECS="avc1.4d401f"\nvideo.m3u8\n';
+  const normalized = normalizeHlsMasterForRoku(malformed);
+  assert.match(normalized, /BANDWIDTH=2500000/);
+  assert.equal(hasHlsVariants(normalized), true);
+  const wrapped = rokuSingleVariantMaster('/resource/abc');
+  assert.match(wrapped, /#EXT-X-STREAM-INF:BANDWIDTH=2500000,AVERAGE-BANDWIDTH=2000000/);
+  assert.equal(wrapped.includes('/resource/abc'), true);
+  assert.equal(hasHlsVariants('#EXTM3U\n#EXTINF:2,\none.ts\n'), false);
 });

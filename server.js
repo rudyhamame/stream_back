@@ -14,7 +14,7 @@ import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamMovie
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
-import { hlsResourceId, isHlsManifest, rewriteHlsManifest } from './hls-native-proxy.js';
+import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -1393,12 +1393,17 @@ async function fetchNativeHlsManifest(upstreamUrl, signal) {
 
 async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   const manifest = await fetchNativeHlsManifest(upstreamUrl, signal);
-  const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
   session.rootUrl = upstreamUrl;
   session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.setHeader('Cache-Control', 'no-store');
-  res.send(rewritten);
+  if (!hasHlsVariants(manifest)) {
+    const mediaPlaylistUri = nativeHlsResourcePath(req, session, upstreamUrl);
+    res.send(rokuSingleVariantMaster(mediaPlaylistUri));
+    return;
+  }
+  const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+  res.send(normalizeHlsMasterForRoku(rewritten));
 }
 
 async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false, requiredSegments = 1) {
