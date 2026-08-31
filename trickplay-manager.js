@@ -92,7 +92,7 @@ function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, tim
     const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
     if (/^https?:\/\//i.test(inputUrl)) args.push('-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5');
     args.push(
-      '-i', inputUrl, '-map', '0:v:0', '-an', '-sn', '-dn', '-threads', '1',
+      '-skip_frame', 'nokey', '-i', inputUrl, '-map', '0:v:0', '-an', '-sn', '-dn', '-threads', '1',
       '-vf', filter, '-q:v', '5', '-start_number', '0', framePattern,
     );
     const child = spawnProcess('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -321,7 +321,7 @@ export class TrickPlayManager {
     if (count > 0) this.serving.set(key, count); else this.serving.delete(key);
   }
 
-  suspendForPlayback(milliseconds = 60_000) {
+  suspendForPlayback(milliseconds = 5_000) {
     this.suspendedUntil = Math.max(this.suspendedUntil, this.now() + milliseconds);
     for (const controller of this.controllers.values()) controller.abort();
   }

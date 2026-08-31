@@ -50,9 +50,13 @@ const mediaLimits = defaultMediaLimits();
 const debugMediaLogging = String(process.env.DEBUG_MEDIA_LOGGING || 'false').toLowerCase() === 'true';
 const mediaJobs = new MediaJobManager({ limits: mediaLimits, debug: debugMediaLogging });
 const trickPlay = new TrickPlayManager({
-  // Background decoding starts only after every playback FFmpeg session is
-  // idle. A new playback request therefore always wins CPU and provider use.
-  canRun: () => mediaJobs.counts().total === 0 && !memoryPressure(mediaLimits).soft && !memoryPressure(mediaLimits).cpuHigh,
+  // A stream-copy remux is cheap enough to coexist with one single-threaded
+  // thumbnail scan. Encoding playback and direct provider streams retain
+  // priority and keep trick-play queued.
+  canRun: () => {
+    const pressure = memoryPressure(mediaLimits);
+    return mediaJobs.counts().transcode === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft && !pressure.cpuHigh;
+  },
 });
 const hlsMaxSegments = Math.max(12, Number.parseInt(process.env.HLS_MAX_SEGMENTS || '36', 10) || 36);
 const previewCacheMaxEntries = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_ENTRIES || '12', 10) || 12);
