@@ -796,7 +796,9 @@ app.get('/api/roku/series/detail', async (req, res) => {
 });
 
 async function buildXtreamMoviesPayload({ limit, selected } = {}) {
-  let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+  // Catalog rails traverse in library insertion order. Keep Home's separate
+  // "recently added" bootstrap newest-first, but never reverse rail pages.
+  let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
   if (Number.isFinite(limit) && limit > 0) movies = movies.slice(0, limit);
   // Browsing must never wait for get_vod_info. Saved metadata is enough for
   // the card; detailed provider metadata can be fetched only when needed.
@@ -824,7 +826,7 @@ app.get('/api/roku/movies', async (req, res) => {
     pageInfo.offset = pageInfo.page * pageInfo.limit;
     const selected = (await getRokuSelectedItems('movie', requestOwner(req)))
       .slice()
-      .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+      .sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
     const sourcePage = selected.slice(pageInfo.offset, pageInfo.offset + pageInfo.limit);
     const items = await buildXtreamMoviesPayload({ selected: sourcePage });
     res.json({
@@ -1869,7 +1871,7 @@ app.get('/api/xtream/roku/:sourceId/:kind/:id', async (req, res) => {
   }
 });
 async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected } = {}) {
-  let selected = suppliedSelected || (await getAllXtreamItems('series')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+  let selected = (suppliedSelected || await getAllXtreamItems('series')).slice().sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
   if (Number.isFinite(limit) && limit > 0) selected = selected.slice(0, limit);
   let cursor = 0;
   const groups = new Array(selected.length);
@@ -1938,7 +1940,7 @@ app.get('/api/roku/series', async (req, res) => {
     const pageInfo = rokuPage(req, rokuSeriesPageLimit);
     const selected = (await getRokuSelectedItems('series', requestOwner(req)))
       .filter(item => !category || item.category === category)
-      .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+      .sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
     const page = rokuPagePayload(selected, pageInfo);
     const items = page.items.map(item => ({
       id: `series-search:${item.sourceId}:${item.id}`,
