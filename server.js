@@ -49,18 +49,6 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://rh-stream-frontend.onre
 const mediaLimits = defaultMediaLimits();
 const debugMediaLogging = String(process.env.DEBUG_MEDIA_LOGGING || 'false').toLowerCase() === 'true';
 const mediaJobs = new MediaJobManager({ limits: mediaLimits, debug: debugMediaLogging });
-const trickPlay = new TrickPlayManager({
-  // A stream-copy remux is cheap enough to coexist with one single-threaded
-  // thumbnail scan. Encoding playback and direct provider streams retain
-  // priority and keep trick-play queued.
-  canRun: () => {
-    const pressure = memoryPressure(mediaLimits);
-    // A one-thread keyframe scan is bounded and may run under ordinary host
-    // load. Blocking on loadavg left every cold BIF permanently queued on
-    // shared Render hosts; memory pressure and encoding playback still win.
-    return mediaJobs.counts().transcode === 0 && !pressure.soft;
-  },
-});
 const hlsMaxSegments = Math.max(12, Number.parseInt(process.env.HLS_MAX_SEGMENTS || '36', 10) || 36);
 const previewCacheMaxEntries = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_ENTRIES || '12', 10) || 12);
 const previewCacheMaxBytes = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_MB || '12', 10) || 12) * 1024 * 1024;
@@ -76,6 +64,17 @@ const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
 const mediaSourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
+const trickPlay = new TrickPlayManager({
+  // Xtream subscriptions frequently permit only one provider connection.
+  // A thumbnail scan must never compete with direct MP4 or compatibility HLS
+  // playback, even when that playback is only a low-CPU stream-copy remux.
+  // Cached BIF files remain independently servable while video is active.
+  canRun: () => {
+    const pressure = memoryPressure(mediaLimits);
+    const media = mediaJobs.counts();
+    return media.total === 0 && media.queued === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft;
+  },
+});
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
 const nativeHlsSessionMaxEntries = 16;
@@ -1337,12 +1336,13 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const source = await getXtreamSource(req.params.sourceId, mediaOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
-    // Range-preserving MP4 playback can coexist with a bounded, single-thread
-    // BIF scan. Do not abort a cold preview every time Roku opens or reopens a
-    // byte range; encoding playback still preempts trick-play elsewhere.
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
+    // Close any thumbnail provider connection before Roku opens the MP4. This
+    // handoff is awaited because one-stream providers otherwise let playback
+    // start briefly and then terminate it when FFmpeg's BIF scan reconnects.
+    await trickPlay.suspendForPlayback();
     releaseDirectStream = directStreamLimiter.acquire(source._id);
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
@@ -1483,12 +1483,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     }
   }
 
-  if (startSeconds > 0) {
-    // Absolute seeking has priority over cold-cache thumbnail generation.
-    // Wait for that provider connection to close before replacing the HLS
-    // stream; otherwise Roku receives a short manifest and freezes at 13%.
-    await trickPlay.suspendForPlayback(20_000);
-  }
+  // Every new playback job, including a stream-copy remux at offset zero,
+  // owns the provider connection. Wait for a cold BIF scan to close first.
+  await trickPlay.suspendForPlayback();
 
   // A device is limited to one active playback job. Release its previous
   // movie/channel before starting another one so navigation does not hit the
@@ -1531,10 +1528,6 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       : determineHlsStrategy({});
   console.log(`[Media HLS] ${kind}:${id} strategy=${decision.strategy} reason=${decision.reason}`);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
-  // A single-threaded BIF keyframe scan is cheap enough to coexist with a
-  // stream-copy remux. Only encoding playback should preempt thumbnail work;
-  // suspending on every rolling-manifest request starved BIF generation.
-  if (mode === 'transcode') await trickPlay.suspendForPlayback();
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
