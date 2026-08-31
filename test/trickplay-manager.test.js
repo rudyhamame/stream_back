@@ -81,11 +81,12 @@ test('active playback preempts generation and leaves the asset safely queued', a
   let release;
   const runner = ({ signal }) => new Promise((resolve, reject) => {
     release = resolve;
-    signal.addEventListener('abort', () => {
+    const abort = () => {
       const error = new Error('preempted');
       error.name = 'AbortError';
       reject(error);
-    }, { once: true });
+    };
+    if (signal.aborted) abort(); else signal.addEventListener('abort', abort, { once: true });
   });
   const manager = new TrickPlayManager({ root, canRun: () => true, runner });
   const spec = { sourceId: 'source-1', contentType: 'movie', contentId: '100', duration: 60, inputUrl: 'https://provider.invalid/movie' };
