@@ -828,7 +828,7 @@ async function capturePreview(inputUrl, position, key, identity, live = false, p
     args.push(
       '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
-      '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
+      '-vf', `select='gte(n,2)',scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
       '-pix_fmt', 'yuvj420p', '-q:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
     );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
