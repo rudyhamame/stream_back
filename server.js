@@ -22,6 +22,7 @@ import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
+import { TrickPlayManager } from './trickplay-manager.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -48,6 +49,11 @@ const frontendUrl = process.env.FRONTEND_URL || 'https://rh-stream-frontend.onre
 const mediaLimits = defaultMediaLimits();
 const debugMediaLogging = String(process.env.DEBUG_MEDIA_LOGGING || 'false').toLowerCase() === 'true';
 const mediaJobs = new MediaJobManager({ limits: mediaLimits, debug: debugMediaLogging });
+const trickPlay = new TrickPlayManager({
+  // Background decoding starts only after every playback FFmpeg session is
+  // idle. A new playback request therefore always wins CPU and provider use.
+  canRun: () => mediaJobs.counts().total === 0 && !memoryPressure(mediaLimits).soft && !memoryPressure(mediaLimits).cpuHigh,
+});
 const hlsMaxSegments = Math.max(12, Number.parseInt(process.env.HLS_MAX_SEGMENTS || '36', 10) || 36);
 const previewCacheMaxEntries = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_ENTRIES || '12', 10) || 12);
 const previewCacheMaxBytes = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_MB || '12', 10) || 12) * 1024 * 1024;
@@ -608,6 +614,8 @@ async function mediaHealthSnapshot() {
       previewMB: Number((previewCacheBytes / 1024 / 1024).toFixed(1)),
       nativeHlsSessions: nativeHlsSessions.size,
       catalogRequestsInFlight: xtreamItemsInFlight.size,
+      trickPlayQueued: trickPlay.queue.length,
+      trickPlayGenerating: trickPlay.active.size,
     },
   };
 }
@@ -616,6 +624,35 @@ app.get('/internal/media-health', async (req, res) => {
   if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
   res.set('Cache-Control', 'no-store');
   res.json(await mediaHealthSnapshot());
+});
+
+app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (req, res) => {
+  try {
+    if (!['movie', 'episode'].includes(req.params.contentType)) return res.sendStatus(400);
+    const ownerId = requestOwner(req);
+    if (!ownerId) return res.status(401).json({ error: 'Valid Roku device authorization is required' });
+    const source = await getXtreamSource(req.params.sourceId, ownerId);
+    if (!source) return res.sendStatus(404);
+    const asset = await trickPlay.readyFile(req.params);
+    if (asset.status !== 'ready') {
+      res.set('Cache-Control', 'no-store');
+      return res.status(asset.status === 'missing' ? 404 : 202).json({ status: asset.status });
+    }
+    trickPlay.beginServe(asset.paths.key);
+    let released = false;
+    const release = () => { if (!released) { released = true; trickPlay.endServe(asset.paths.key); } };
+    res.once('finish', release);
+    res.once('close', release);
+    res.type('application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=86400');
+    res.set('X-Content-Type-Options', 'nosniff');
+    res.sendFile(asset.file, error => {
+      release();
+      if (error && !res.headersSent) res.sendStatus(error.code === 'ENOENT' ? 404 : 500);
+    });
+  } catch (error) {
+    if (!res.headersSent) res.status(/Invalid /.test(error.message) ? 400 : 500).json({ error: error.message });
+  }
 });
 
 app.use('/api/xtream', (req, res, next) => {
@@ -1606,6 +1643,17 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     }
     const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
+    if (seekableVod && startSeconds === 0) {
+      const duration = Math.max(0, Number(req.query.duration) || 0);
+      if (duration > 0) {
+        const contentType = req.params.kind === 'series' ? 'episode' : 'movie';
+        const inputUrl = await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext);
+        trickPlay.ensure({
+          sourceId: source._id, contentType, contentId: req.params.id, extension: req.query.ext,
+          duration, inputUrl,
+        }).catch(error => console.warn(`[TrickPlay] queue failed ${contentType}=${req.params.id} reason=${error.message}`));
+      }
+    }
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
@@ -1895,6 +1943,11 @@ app.get('/api/roku/channels', async (req, res) => {
 // directories behind for the lifetime of the container.
 await fs.rm(rokuHlsRoot, { recursive: true, force: true });
 await fs.mkdir(rokuHlsRoot, { recursive: true });
+await trickPlay.initialize();
+
+setInterval(() => {
+  trickPlay.cleanup().catch(error => console.warn(`[TrickPlay] cleanup failed reason=${error.message}`));
+}, 60 * 60 * 1000).unref();
 
 const resourceLogIntervalMs = Math.max(60_000, Number.parseInt(process.env.MEDIA_RESOURCE_LOG_INTERVAL_MS || '300000', 10) || 300_000);
 setInterval(async () => {
@@ -1915,7 +1968,7 @@ async function shutdown(signal) {
   const closeServer = new Promise(resolve => server.close(resolve));
   const forceTimer = setTimeout(() => process.exit(1), 10_000);
   forceTimer.unref?.();
-  await Promise.allSettled([closeServer, mediaJobs.shutdown()]);
+  await Promise.allSettled([closeServer, mediaJobs.shutdown(), trickPlay.shutdown()]);
   await fs.rm(rokuHlsRoot, { recursive: true, force: true }).catch(error => console.warn(`[Media] HLS cleanup failed: ${error.message}`));
   clearTimeout(forceTimer);
   process.exit(0);

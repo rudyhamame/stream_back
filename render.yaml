@@ -69,6 +69,18 @@ services:
         value: "12"
       - key: PREVIEW_CACHE_TTL_MS
         value: "3600000"
+      - key: TRICKPLAY_INTERVAL_SECONDS
+        value: "10"
+      - key: TRICKPLAY_MAX_CONCURRENT_JOBS
+        value: "1"
+      - key: TRICKPLAY_PROCESS_TIMEOUT_MS
+        value: "2700000"
+      - key: TRICKPLAY_RETRY_MS
+        value: "21600000"
+      - key: TRICKPLAY_CACHE_TTL_DAYS
+        value: "30"
+      - key: TRICKPLAY_CACHE_MAX_BYTES
+        value: "5368709120"
       - key: M3U_CACHE_MAX_ENTRIES
         value: "2"
       - key: M3U_MAX_MB

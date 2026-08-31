@@ -47,6 +47,17 @@ MEDIA_TEST_PLAYBACK_PATH='/api/xtream/hls/.../master.m3u8' \
 npm run test:media-leak
 ```
 
+## Roku trick play
+
+Seek thumbnails are generated lazily as persistent BIF v0 assets under
+`TRICKPLAY_CACHE_ROOT` (default: the host temporary filesystem). Generation is
+single-process by default, starts only while playback FFmpeg jobs are idle,
+and never blocks VOD startup. Configure `TRICKPLAY_INTERVAL_SECONDS`,
+`TRICKPLAY_MAX_CONCURRENT_JOBS`, `TRICKPLAY_PROCESS_TIMEOUT_MS`,
+`TRICKPLAY_RETRY_MS`, `TRICKPLAY_CACHE_TTL_DAYS`, and
+`TRICKPLAY_CACHE_MAX_BYTES`. Set `TRICKPLAY_CACHE_ROOT` to a mounted persistent
+disk path if assets must survive host replacement or deployment.
+
 ## Render
 
 The repository includes `render.yaml` and a Dockerfile. Configure
