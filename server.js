@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { shapeArabicForRoku } from './arabic-shaper.js';
 import { createXtreamSource, deleteXtreamSource, getAllXtreamSources, getXtreamSource, getXtreamSources, publicXtreamSource, updateXtreamSelection, updateXtreamSource } from './xtream-store.js';
-import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamMovieInfo, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
+import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
@@ -39,7 +39,9 @@ const rokuText = (value) => arabicText.test(String(value || '')) ? shapeArabicFo
 // intentional on Render's 256 MB instance; Roku loads further pages only when
 // the user reaches the end of the current series list.
 const rokuInitialSeriesLimit = Math.min(4, Math.max(1, Number.parseInt(process.env.ROKU_INITIAL_SERIES_LIMIT || '4', 10)));
+const rokuSeriesPageLimit = Math.min(30, Math.max(6, Number.parseInt(process.env.ROKU_SERIES_PAGE_LIMIT || '12', 10)));
 const rokuMoviePageLimit = 10;
+const rokuChannelPageLimit = Math.min(50, Math.max(10, Number.parseInt(process.env.ROKU_CHANNEL_PAGE_LIMIT || '20', 10)));
 const xtreamItemsInFlight = new Map();
 const rokuHlsRoot = path.join(os.tmpdir(), 'rh-stream-hls');
 const frontendUrl = process.env.FRONTEND_URL || 'https://rh-stream-frontend.onrender.com';
@@ -390,20 +392,14 @@ async function getRokuSelectedItems(kind, ownerId = null) {
   // downloading and expanding a provider's whole catalog on the TV.
   if (!ownerId) return [];
   const sources = await getAllXtreamSources(ownerId);
-  const groups = await Promise.all(sources.map(async source => {
-    let categoryNames = new Map();
-    try {
-      categoryNames = new Map((await getSourceCategories(source, kind)).map(category => [String(category.id), category.name]));
-    } catch (error) {
-      console.warn(`[Xtream] Could not refresh ${kind} categories for Roku: ${error.message}`);
-    }
-    return (Array.isArray(source.enabledItems) ? source.enabledItems : [])
+  // Category names are persisted with each selected item. Do not contact the
+  // provider just to render a saved Roku library page; that made every page
+  // wait for one category request per source.
+  const groups = sources.map(source =>
+    (Array.isArray(source.enabledItems) ? source.enabledItems : [])
       .filter(item => item?.kind === kind)
-      .map(item => selectedXtreamItem(source, {
-        ...item,
-        category: categoryNames.get(String(item.categoryId || '')) || item.category,
-      }));
-  }));
+      .map(item => selectedXtreamItem(source, item))
+  );
   return groups.flat();
 }
 
@@ -737,28 +733,13 @@ app.get('/api/roku/series/detail', async (req, res) => {
 async function buildXtreamMoviesPayload({ limit, selected } = {}) {
   let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
   if (Number.isFinite(limit) && limit > 0) movies = movies.slice(0, limit);
-  // Many Xtream VOD catalogs omit duration from get_vod_streams. Ask for
-  // detailed metadata only for the small, explicitly-selected Roku library.
-  let cursor = 0;
-  const results = new Array(movies.length);
-  async function worker() {
-    while (cursor < movies.length) {
-      const index = cursor++;
-      const item = movies[index];
-      let duration = displayDuration(item.duration);
-      if (!duration) {
-        try {
-          const source = await getXtreamSource(item.sourceId);
-          if (source) duration = displayDuration((await getXtreamMovieInfo(source, item.id)).duration);
-        } catch (error) {
-          console.warn(`[Xtream] Could not read movie duration for ${item.id}: ${error.message}`);
-        }
-      }
-      results[index] = { ...directXtreamItem(item), duration, kind: 'movie', contentKind: 'movie', rokuEnabled: true };
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(3, movies.length) }, worker));
-  return results;
+  // Browsing must never wait for get_vod_info. Saved metadata is enough for
+  // the card; detailed provider metadata can be fetched only when needed.
+  return movies.map(item => ({
+    ...directXtreamItem(item),
+    duration: displayDuration(item.duration),
+    kind: 'movie', contentKind: 'movie', rokuEnabled: true,
+  }));
 }
 
 function buildXtreamChannelsPayload(items) {
@@ -1904,13 +1885,12 @@ app.get('/api/roku/library', async (req, res) => {
 app.get('/api/roku/series', async (req, res) => {
   try {
     const category = String(req.query.category || '');
+    const pageInfo = rokuPage(req, rokuSeriesPageLimit);
     const selected = (await getRokuSelectedItems('series', requestOwner(req)))
       .filter(item => !category || item.category === category)
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
-    // Series summary cards are small and contain no episode payloads. Return
-    // every selected Series so Roku can build complete category rails in one
-    // request; episode metadata remains lazy-loaded from /series/detail.
-    const items = selected.map(item => ({
+    const page = rokuPagePayload(selected, pageInfo);
+    const items = page.items.map(item => ({
       id: `series-search:${item.sourceId}:${item.id}`,
       title: item.title,
       rokuTitle: rokuText(item.title),
@@ -1923,8 +1903,8 @@ app.get('/api/roku/series', async (req, res) => {
       added: item.added,
       contentKind: 'series-search',
     }));
-    console.log(`[Roku] Complete Series summary ready: ${items.length} series`);
-    res.json({ items, page: 0, limit: items.length, total: items.length, hasMore: false });
+    console.log(`[Roku] Series page ${pageInfo.page} ready: ${items.length}/${page.total}`);
+    res.json({ ...page, items });
   } catch (error) {
     console.error('[Roku] Series catalog failed:', error.message);
     res.status(502).json({ error: error.message });
@@ -1932,8 +1912,10 @@ app.get('/api/roku/series', async (req, res) => {
 });
 app.get('/api/roku/channels', async (req, res) => {
   try {
-    const items = buildXtreamChannelsPayload(await getRokuSelectedItems('channel', requestOwner(req)));
-    res.json({ items, page: 0, limit: items.length, total: items.length, hasMore: false });
+    const pageInfo = rokuPage(req, rokuChannelPageLimit);
+    const selected = await getRokuSelectedItems('channel', requestOwner(req));
+    const page = rokuPagePayload(selected, pageInfo);
+    res.json({ ...page, items: buildXtreamChannelsPayload(page.items) });
   } catch (error) { res.status(502).json({ error: error.message }); }
 });
 // Render storage is ephemeral, but a process crash can leave the prior job
