@@ -1499,11 +1499,14 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   }
 
   const inputUrl = await sourceProviderUrl(source, kind, id, extension);
-  const probeKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
-  const sourceMetadata = forceFullTranscode ? {} : await providerCodecMetadata(probeKey, inputUrl);
-  const decision = forceFullTranscode
-    ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Compatibility fallback after stream-copy failure' }
-    : determineHlsStrategy(sourceMetadata);
+  // Many Xtream subscriptions permit only one provider connection. Running
+  // ffprobe immediately before FFmpeg can leave the probe counted by the
+  // provider and make real playback fail with nonstandard HTTP 458. VOD uses
+  // one FFmpeg connection and guaranteed Roku-compatible output; channels
+  // stay on the lightweight remux path.
+  const decision = forceFullTranscode || seekableVod
+    ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: seekableVod ? 'Single-connection Roku VOD compatibility' : 'Compatibility fallback after stream-copy failure' }
+    : determineHlsStrategy({});
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
