@@ -1337,7 +1337,9 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const source = await getXtreamSource(req.params.sourceId, mediaOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
-    await trickPlay.suspendForPlayback();
+    // Range-preserving MP4 playback can coexist with a bounded, single-thread
+    // BIF scan. Do not abort a cold preview every time Roku opens or reopens a
+    // byte range; encoding playback still preempts trick-play elsewhere.
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
