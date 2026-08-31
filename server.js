@@ -829,14 +829,14 @@ async function capturePreview(inputUrl, position, key, identity, live = false, p
       '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
       '-vf', `scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black`,
-      '-q:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
+      '-pix_fmt', 'yuvj420p', '-q:v', '3', '-f', 'image2pipe', '-vcodec', 'mjpeg', 'pipe:1',
     );
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     const created = { child, error: '', stop: () => terminateChild(child) };
     created.result = new Promise((resolve, reject) => {
       const chunks = [];
       let total = 0;
-      const timeout = setTimeout(() => child.kill('SIGKILL'), live ? 8_000 : 25_000);
+      const timeout = setTimeout(() => child.kill('SIGKILL'), live ? 18_000 : 25_000);
       timeout.unref?.();
       child.stdout.on('data', chunk => {
         total += chunk.length;
