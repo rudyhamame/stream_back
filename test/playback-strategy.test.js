@@ -44,9 +44,8 @@ test('keeps FFmpeg fallback on independent, Roku-safe HLS segments', () => {
   assert.equal(hlsMuxerFlags().includes('split_by_time'), false);
 });
 
-test('uses remux for compatibility HLS and transcode only for previews', () => {
+test('uses remux for compatibility HLS', () => {
   assert.equal(choosePlaybackStrategy({ purpose: 'roku-hls' }), PlaybackStrategy.REMUX);
-  assert.equal(choosePlaybackStrategy({ purpose: 'preview' }), PlaybackStrategy.TRANSCODE);
 });
 
 test('copies compatible H.264 and AAC without encoding', () => {

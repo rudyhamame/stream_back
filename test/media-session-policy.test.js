@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPlaybackReplacedBySeekPreview, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
+import { isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
 
 test('HLS identity includes source, item, extension, and seek offset', () => {
   const base = hlsSessionKey('source', 'movie', '42', 'mp4', 0);
@@ -32,16 +32,6 @@ test('replacement is scoped to the requesting device or anonymous viewer', () =>
   assert.equal(samePlaybackViewer(job, { deviceId: 'roku-2', viewerId: 'owner-1' }), false);
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-1' }), true);
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-2' }), false);
-});
-
-test('a full-player seek frame releases only its matching active playback job', () => {
-  const identity = { deviceId: 'roku-1', viewerId: 'roku-1' };
-  const target = { sourceId: 'source-1', kind: 'series', id: 'episode-1' };
-  const matching = { persistent: true, deviceId: 'roku-1', sourceId: 'source-1', kind: 'series', mediaId: 'episode-1' };
-  assert.equal(isPlaybackReplacedBySeekPreview(matching, identity, target), true);
-  assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, deviceId: 'roku-2' }, identity, target), false);
-  assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, mediaId: 'episode-2' }, identity, target), false);
-  assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, persistent: false }, identity, target), false);
 });
 
 test('a new preview supersedes only the same viewer snapshot slot', () => {

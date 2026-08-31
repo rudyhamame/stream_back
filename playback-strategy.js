@@ -92,6 +92,5 @@ export function hlsMuxerFlags() {
 
 export function choosePlaybackStrategy({ purpose } = {}) {
   if (purpose === 'direct-proxy') return PlaybackStrategy.DIRECT;
-  if (purpose === 'preview') return PlaybackStrategy.TRANSCODE;
   return PlaybackStrategy.REMUX;
 }

@@ -15,7 +15,7 @@ import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProvi
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
-import { isPlaybackReplacedBySeekPreview, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
+import { isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, determineVodHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -788,19 +788,7 @@ app.get('/api/playback/history', async (_, res) => {
   catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-function parseXtreamPlaybackItem(itemId) {
-  const parsed = new URL(String(itemId || ''), 'http://rh-stream.internal');
-  const match = parsed.pathname.match(/^\/api\/xtream\/(?:play|roku)\/([^/]+)\/(movie|series)\/([^/]+)$/);
-  if (!match) return null;
-  return {
-    sourceId: decodeURIComponent(match[1]),
-    kind: match[2],
-    id: decodeURIComponent(match[3]),
-    extension: parsed.searchParams.get('ext') || 'mp4',
-  };
-}
-
-async function capturePreview(inputUrl, position, key, identity, live = false, playerFrame = false) {
+async function captureChannelPreview(inputUrl, key, identity) {
   const { job } = await mediaJobs.getOrCreate({
     key,
     // A one-frame JPEG is short-lived and has its own concurrency limit. Do
@@ -811,8 +799,7 @@ async function capturePreview(inputUrl, position, key, identity, live = false, p
     ...identity, userId: '', deviceId: '',
   }, async () => {
     const args = ['-hide_banner', '-loglevel', 'error'];
-    if (!live) args.push('-ss', String(Math.max(0, position)));
-    const { width, height } = previewFrameSize({ playerFrame });
+    const { width, height } = previewFrameSize();
     args.push(
       '-i', inputUrl,
       '-an', '-sn', '-frames:v', '1',
@@ -851,28 +838,16 @@ app.get('/api/playback/preview', async (req, res) => {
   const cancelPreview = () => { if (previewJobKey) mediaJobs.remove(previewJobKey, 'client-disconnect').catch(() => {}); };
   res.once('close', cancelPreview);
   try {
-    const itemId = String(req.query?.itemId || '');
     const requestedSourceId = String(req.query?.sourceId || '');
     const requestedKind = String(req.query?.kind || '');
     const requestedId = String(req.query?.id || '');
-    let playback = null;
-    let target = requestedSourceId && ['channel', 'movie', 'series'].includes(requestedKind) && requestedId
-      ? { sourceId: requestedSourceId, kind: requestedKind, id: requestedId, extension: String(req.query?.ext || 'mp4') }
-      : null;
-    if (!target) {
-      if (!itemId) return res.status(400).json({ error: 'itemId or playback target is required' });
-      playback = await getPlayback(itemId);
-      if (!playback) return res.sendStatus(404);
-      target = parseXtreamPlaybackItem(playback.url || itemId);
-    }
-    if (!target) return res.status(404).json({ error: 'Preview is unavailable for this item' });
+    if (requestedKind !== 'channel') return res.status(404).json({ error: 'Movie and series previews are disabled' });
+    if (!requestedSourceId || !requestedId) return res.status(400).json({ error: 'sourceId and channel id are required' });
+    const target = { sourceId: requestedSourceId, kind: 'channel', id: requestedId, extension: String(req.query?.ext || 'm3u8') };
     const source = await getXtreamSource(target.sourceId, requestOwner(req));
     if (!source) return res.sendStatus(404);
-    const live = target.kind === 'channel';
-    const playerFrame = !live && String(req.query?.player || '') === '1';
-    const position = live ? 0 : Math.max(0, Math.floor(Number(req.query?.position ?? playback?.position) || 0));
-    const cachePosition = live ? Math.floor(Date.now() / 30_000) : position;
-    const cacheKey = `${target.sourceId}:${target.kind}:${target.id}:${target.extension}:${cachePosition}:${playerFrame ? 'player' : 'card'}`;
+    const cachePosition = Math.floor(Date.now() / 30_000);
+    const cacheKey = `${target.sourceId}:channel:${target.id}:${target.extension}:${cachePosition}`;
     evictPreviewCache();
     let frame = previewCache.get(cacheKey)?.frame;
     if (!frame) {
@@ -882,21 +857,11 @@ app.get('/api/playback/preview', async (req, res) => {
         if (isSnapshotSupersededForViewer(job, identity)) superseded.push(mediaJobs.remove(jobKey, 'superseded-preview'));
       }
       if (superseded.length) await Promise.allSettled(superseded);
-      if (playerFrame) {
-        const replaced = [];
-        for (const [jobKey, job] of mediaJobs.entries()) {
-          if (isPlaybackReplacedBySeekPreview(job, identity, target)) replaced.push(mediaJobs.remove(jobKey, 'seek-preview'));
-        }
-        if (replaced.length) {
-          console.log(`[Playback preview] releasing ${replaced.length} active playback job before ${target.kind}:${target.id} seek frame`);
-          await Promise.allSettled(replaced);
-        }
-      }
       previewJobKey = `preview:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
-      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, identity, live, playerFrame);
-      cachePreview(cacheKey, frame, live ? 30_000 : previewCacheTtlMs);
+      frame = await captureChannelPreview(await sourceProviderUrl(source, 'channel', target.id, target.extension), previewJobKey, identity);
+      cachePreview(cacheKey, frame, 30_000);
     }
-    res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': live ? 'private, max-age=30' : 'private, max-age=86400', 'Content-Length': String(frame.length) });
+    res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=30', 'Content-Length': String(frame.length) });
     res.end(frame);
   } catch (error) {
     console.warn(`[Playback preview] ${error.message}`);
