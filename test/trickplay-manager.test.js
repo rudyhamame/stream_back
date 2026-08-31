@@ -91,8 +91,7 @@ test('active playback preempts generation and leaves the asset safely queued', a
   const manager = new TrickPlayManager({ root, canRun: () => true, runner });
   const spec = { sourceId: 'source-1', contentType: 'movie', contentId: '100', duration: 60, inputUrl: 'https://provider.invalid/movie' };
   await manager.ensure(spec);
-  manager.suspendForPlayback();
-  await Promise.all(manager.active.values());
+  await manager.suspendForPlayback();
   assert.equal((await manager.status(spec)).status, 'queued');
   assert.equal(manager.queue.length, 1);
   release?.();

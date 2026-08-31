@@ -321,9 +321,13 @@ export class TrickPlayManager {
     if (count > 0) this.serving.set(key, count); else this.serving.delete(key);
   }
 
-  suspendForPlayback(milliseconds = 5_000) {
+  async suspendForPlayback(milliseconds = 5_000) {
     this.suspendedUntil = Math.max(this.suspendedUntil, this.now() + milliseconds);
+    const active = [...this.active.values()];
     for (const controller of this.controllers.values()) controller.abort();
+    // A provider may permit only one Xtream connection. Do not report the
+    // handoff complete until FFmpeg has actually closed its thumbnail input.
+    await Promise.allSettled(active);
   }
 
   async cleanup() {

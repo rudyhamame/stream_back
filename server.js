@@ -55,7 +55,10 @@ const trickPlay = new TrickPlayManager({
   // priority and keep trick-play queued.
   canRun: () => {
     const pressure = memoryPressure(mediaLimits);
-    return mediaJobs.counts().transcode === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft && !pressure.cpuHigh;
+    // A one-thread keyframe scan is bounded and may run under ordinary host
+    // load. Blocking on loadavg left every cold BIF permanently queued on
+    // shared Render hosts; memory pressure and encoding playback still win.
+    return mediaJobs.counts().transcode === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft;
   },
 });
 const hlsMaxSegments = Math.max(12, Number.parseInt(process.env.HLS_MAX_SEGMENTS || '36', 10) || 36);
@@ -1334,7 +1337,7 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const source = await getXtreamSource(req.params.sourceId, mediaOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
-    trickPlay.suspendForPlayback();
+    await trickPlay.suspendForPlayback();
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
@@ -1478,6 +1481,13 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     }
   }
 
+  if (startSeconds > 0) {
+    // Absolute seeking has priority over cold-cache thumbnail generation.
+    // Wait for that provider connection to close before replacing the HLS
+    // stream; otherwise Roku receives a short manifest and freezes at 13%.
+    await trickPlay.suspendForPlayback(60_000);
+  }
+
   // A device is limited to one active playback job. Release its previous
   // movie/channel before starting another one so navigation does not hit the
   // idle cleanup window and return MEDIA_CAPACITY_FULL.
@@ -1522,7 +1532,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // A single-threaded BIF keyframe scan is cheap enough to coexist with a
   // stream-copy remux. Only encoding playback should preempt thumbnail work;
   // suspending on every rolling-manifest request starved BIF generation.
-  if (mode === 'transcode') trickPlay.suspendForPlayback();
+  if (mode === 'transcode') await trickPlay.suspendForPlayback();
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
