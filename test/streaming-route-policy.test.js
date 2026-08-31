@@ -13,8 +13,6 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/xtream/hls/source-1/movie/42/master.m3u8',
     '/api/xtream/hls/source-1/series/episode-3/segment-000001.ts',
     '/api/xtream/hls/source-1/channel/42/resource/0123456789abcdef01234567',
-    '/api/trickplay/source-1/movie/42/preview.bif?deviceToken=redacted',
-    '/api/trickplay/source-1/episode/episode-3/preview.bif?deviceToken=redacted',
   ];
   for (const path of allowed) assert.equal(isStreamingRoute('GET', path), true, path);
 });
@@ -37,7 +35,6 @@ test('blocks all control-plane and data-management routes', () => {
     '/api/xtream/sources',
     '/api/xtream/catalog',
     '/api/xtream/logo',
-    '/api/trickplay/source/channel/42/preview.bif',
   ];
   for (const path of blocked) assert.equal(isStreamingRoute('GET', path), false, path);
 });

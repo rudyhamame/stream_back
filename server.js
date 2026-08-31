@@ -22,7 +22,6 @@ import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
-import { TrickPlayManager } from './trickplay-manager.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -64,17 +63,6 @@ const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
 const mediaSourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
-const trickPlay = new TrickPlayManager({
-  // Xtream subscriptions frequently permit only one provider connection.
-  // A thumbnail scan must never compete with direct MP4 or compatibility HLS
-  // playback, even when that playback is only a low-CPU stream-copy remux.
-  // Cached BIF files remain independently servable while video is active.
-  canRun: () => {
-    const pressure = memoryPressure(mediaLimits);
-    const media = mediaJobs.counts();
-    return media.total === 0 && media.queued === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft;
-  },
-});
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
 const nativeHlsSessionMaxEntries = 16;
@@ -620,8 +608,6 @@ async function mediaHealthSnapshot() {
       previewMB: Number((previewCacheBytes / 1024 / 1024).toFixed(1)),
       nativeHlsSessions: nativeHlsSessions.size,
       catalogRequestsInFlight: xtreamItemsInFlight.size,
-      trickPlayQueued: trickPlay.queue.length,
-      trickPlayGenerating: trickPlay.active.size,
     },
   };
 }
@@ -630,50 +616,6 @@ app.get('/internal/media-health', async (req, res) => {
   if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
   res.set('Cache-Control', 'no-store');
   res.json(await mediaHealthSnapshot());
-});
-
-app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (req, res) => {
-  try {
-    if (!['movie', 'episode'].includes(req.params.contentType)) return res.sendStatus(400);
-    const ownerId = requestOwner(req);
-    if (!ownerId) return res.status(401).json({ error: 'Valid Roku device authorization is required' });
-    const source = await getXtreamSource(req.params.sourceId, ownerId);
-    if (!source) return res.sendStatus(404);
-    if (String(req.query.status || '') === '1') {
-      let current = await trickPlay.status(req.params);
-      const duration = Math.max(0, Number(req.query.duration) || 0);
-      if (current.status === 'missing' && duration > 0) {
-        const providerKind = req.params.contentType === 'episode' ? 'series' : 'movie';
-        current = await trickPlay.ensure({
-          ...req.params,
-          extension: req.query.ext,
-          duration,
-          inputUrl: await sourceProviderUrl(source, providerKind, req.params.contentId, req.query.ext),
-        });
-      }
-      res.set('Cache-Control', 'no-store');
-      return res.json({ status: current.status });
-    }
-    const asset = await trickPlay.readyFile(req.params);
-    if (asset.status !== 'ready') {
-      res.set('Cache-Control', 'no-store');
-      return res.status(asset.status === 'missing' ? 404 : 202).json({ status: asset.status });
-    }
-    trickPlay.beginServe(asset.paths.key);
-    let released = false;
-    const release = () => { if (!released) { released = true; trickPlay.endServe(asset.paths.key); } };
-    res.once('finish', release);
-    res.once('close', release);
-    res.type('application/octet-stream');
-    res.set('Cache-Control', 'private, max-age=86400');
-    res.set('X-Content-Type-Options', 'nosniff');
-    res.sendFile(asset.file, error => {
-      release();
-      if (error && !res.headersSent) res.sendStatus(error.code === 'ENOENT' ? 404 : 500);
-    });
-  } catch (error) {
-    if (!res.headersSent) res.status(/Invalid /.test(error.message) ? 400 : 500).json({ error: error.message });
-  }
 });
 
 app.use('/api/xtream', (req, res, next) => {
@@ -1339,10 +1281,6 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
-    // Close any thumbnail provider connection before Roku opens the MP4. This
-    // handoff is awaited because one-stream providers otherwise let playback
-    // start briefly and then terminate it when FFmpeg's BIF scan reconnects.
-    await trickPlay.suspendForPlayback();
     releaseDirectStream = directStreamLimiter.acquire(source._id);
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
@@ -1482,10 +1420,6 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     return existing;
     }
   }
-
-  // Every new playback job, including a stream-copy remux at offset zero,
-  // owns the provider connection. Wait for a cold BIF scan to close first.
-  await trickPlay.suspendForPlayback();
 
   // A device is limited to one active playback job. Release its previous
   // movie/channel before starting another one so navigation does not hit the
@@ -1672,17 +1606,6 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     }
     const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
-    if (seekableVod && startSeconds === 0) {
-      const duration = Math.max(0, Number(req.query.duration) || 0);
-      if (duration > 0) {
-        const contentType = req.params.kind === 'series' ? 'episode' : 'movie';
-        const inputUrl = await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext);
-        trickPlay.ensure({
-          sourceId: source._id, contentType, contentId: req.params.id, extension: req.query.ext,
-          duration, inputUrl,
-        }).catch(error => console.warn(`[TrickPlay] queue failed ${contentType}=${req.params.id} reason=${error.message}`));
-      }
-    }
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
@@ -1972,12 +1895,6 @@ app.get('/api/roku/channels', async (req, res) => {
 // directories behind for the lifetime of the container.
 await fs.rm(rokuHlsRoot, { recursive: true, force: true });
 await fs.mkdir(rokuHlsRoot, { recursive: true });
-await trickPlay.initialize();
-
-setInterval(() => {
-  trickPlay.cleanup().catch(error => console.warn(`[TrickPlay] cleanup failed reason=${error.message}`));
-}, 60 * 60 * 1000).unref();
-
 const resourceLogIntervalMs = Math.max(60_000, Number.parseInt(process.env.MEDIA_RESOURCE_LOG_INTERVAL_MS || '300000', 10) || 300_000);
 setInterval(async () => {
   try {
@@ -1997,7 +1914,7 @@ async function shutdown(signal) {
   const closeServer = new Promise(resolve => server.close(resolve));
   const forceTimer = setTimeout(() => process.exit(1), 10_000);
   forceTimer.unref?.();
-  await Promise.allSettled([closeServer, mediaJobs.shutdown(), trickPlay.shutdown()]);
+  await Promise.allSettled([closeServer, mediaJobs.shutdown()]);
   await fs.rm(rokuHlsRoot, { recursive: true, force: true }).catch(error => console.warn(`[Media] HLS cleanup failed: ${error.message}`));
   clearTimeout(forceTimer);
   process.exit(0);
