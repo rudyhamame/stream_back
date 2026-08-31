@@ -58,7 +58,7 @@ const trickPlay = new TrickPlayManager({
     // A one-thread keyframe scan is bounded and may run under ordinary host
     // load. Blocking on loadavg left every cold BIF permanently queued on
     // shared Render hosts; memory pressure and encoding playback still win.
-    return mediaJobs.counts().transcode === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft;
+    return mediaJobs.counts().transcode === 0 && !pressure.soft;
   },
 });
 const hlsMaxSegments = Math.max(12, Number.parseInt(process.env.HLS_MAX_SEGMENTS || '36', 10) || 36);
