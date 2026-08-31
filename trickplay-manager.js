@@ -228,6 +228,13 @@ export class TrickPlayManager {
       return current;
     }
     if (this.active.has(current.paths.key) || this.queued.has(current.paths.key)) {
+      // Catalog focus is an explicit signal that this is the item most likely
+      // to play next. Move an already-queued cold asset to the front without
+      // duplicating work, so browsing can prepare it before playback starts.
+      if (this.queued.has(current.paths.key) && spec.priority === 'focused') {
+        const index = this.queue.findIndex(job => job.paths.key === current.paths.key);
+        if (index > 0) this.queue.unshift(this.queue.splice(index, 1)[0]);
+      }
       console.log(`[TrickPlay] duplicate job suppressed ${current.paths.contentType}=${current.paths.contentId}`);
       return { ...current, status: this.active.has(current.paths.key) ? 'generating' : 'queued' };
     }

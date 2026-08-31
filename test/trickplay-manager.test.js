@@ -64,6 +64,18 @@ test('queues while playback has priority and never generates live or unknown-dur
   await assert.rejects(() => manager.ensure({ ...spec, contentType: 'channel' }), /Invalid contentType/);
 });
 
+test('focused catalog item moves to the front of the cold preview queue', async t => {
+  const root = await temporaryDirectory(t);
+  const manager = new TrickPlayManager({ root, canRun: () => false });
+  const first = { sourceId: 'source-1', contentType: 'episode', contentId: 'first', duration: 60, inputUrl: 'https://provider.invalid/first' };
+  const focused = { sourceId: 'source-1', contentType: 'episode', contentId: 'focused', duration: 60, inputUrl: 'https://provider.invalid/focused' };
+  await manager.ensure(first);
+  await manager.ensure(focused);
+  await manager.ensure({ ...focused, priority: 'focused' });
+  assert.equal(manager.queue[0].paths.contentId, 'focused');
+  assert.equal(manager.queue.length, 2);
+});
+
 test('generation failure leaves playback-independent failed metadata and no partial BIF', async t => {
   const root = await temporaryDirectory(t);
   const manager = new TrickPlayManager({ root, canRun: () => true, runner: async () => { throw new Error('provider refused'); } });

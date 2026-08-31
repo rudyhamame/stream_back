@@ -642,12 +642,16 @@ app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (r
     if (String(req.query.status || '') === '1') {
       let current = await trickPlay.status(req.params);
       const duration = Math.max(0, Number(req.query.duration) || 0);
-      if (current.status === 'missing' && duration > 0) {
+      // Re-enter ensure for queued/generating metadata as well. It deduplicates
+      // live jobs, reprioritizes focused items, and recovers metadata whose
+      // in-memory queue was lost after a process restart or preemption.
+      if (['missing', 'queued', 'generating'].includes(current.status) && duration > 0) {
         const providerKind = req.params.contentType === 'episode' ? 'series' : 'movie';
         current = await trickPlay.ensure({
           ...req.params,
           extension: req.query.ext,
           duration,
+          priority: String(req.query.priority || '') === 'focused' ? 'focused' : '',
           inputUrl: await sourceProviderUrl(source, providerKind, req.params.contentId, req.query.ext),
         });
       }
