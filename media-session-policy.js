@@ -27,6 +27,15 @@ export function samePlaybackViewer(job, identity) {
   return job.viewerId === identity.viewerId || job.viewers?.has(identity.viewerId) === true;
 }
 
+export function isPlaybackReplacedBySeekPreview(job, identity, target) {
+  if (!job?.persistent || !identity || !target) return false;
+  if (!['movie', 'series'].includes(String(target.kind))) return false;
+  return job.sourceId === String(target.sourceId)
+    && job.mediaId === String(target.id)
+    && job.kind === String(target.kind)
+    && samePlaybackViewer(job, identity);
+}
+
 export class KeyedSerialExecutor {
   constructor() { this.tails = new Map(); }
 

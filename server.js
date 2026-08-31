@@ -15,7 +15,7 @@ import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProvi
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
-import { KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
+import { isPlaybackReplacedBySeekPreview, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -836,7 +836,7 @@ async function capturePreview(inputUrl, position, key, identity, live = false, p
     created.result = new Promise((resolve, reject) => {
       const chunks = [];
       let total = 0;
-      const timeout = setTimeout(() => child.kill('SIGKILL'), live ? 18_000 : 25_000);
+      const timeout = setTimeout(() => child.kill('SIGKILL'), 17_000);
       timeout.unref?.();
       child.stdout.on('data', chunk => {
         total += chunk.length;
@@ -888,8 +888,19 @@ app.get('/api/playback/preview', async (req, res) => {
     evictPreviewCache();
     let frame = previewCache.get(cacheKey)?.frame;
     if (!frame) {
+      const identity = mediaIdentity(req);
+      if (playerFrame) {
+        const replaced = [];
+        for (const [jobKey, job] of mediaJobs.entries()) {
+          if (isPlaybackReplacedBySeekPreview(job, identity, target)) replaced.push(mediaJobs.remove(jobKey, 'seek-preview'));
+        }
+        if (replaced.length) {
+          console.log(`[Playback preview] releasing ${replaced.length} active playback job before ${target.kind}:${target.id} seek frame`);
+          await Promise.allSettled(replaced);
+        }
+      }
       previewJobKey = `preview:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
-      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, mediaIdentity(req), live, playerFrame);
+      frame = await capturePreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), position, previewJobKey, identity, live, playerFrame);
       cachePreview(cacheKey, frame, live ? 30_000 : previewCacheTtlMs);
     }
     res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': live ? 'private, max-age=30' : 'private, max-age=86400', 'Content-Length': String(frame.length) });
