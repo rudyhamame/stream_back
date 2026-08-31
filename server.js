@@ -638,7 +638,17 @@ app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (r
     const source = await getXtreamSource(req.params.sourceId, ownerId);
     if (!source) return res.sendStatus(404);
     if (String(req.query.status || '') === '1') {
-      const current = await trickPlay.status(req.params);
+      let current = await trickPlay.status(req.params);
+      const duration = Math.max(0, Number(req.query.duration) || 0);
+      if (current.status === 'missing' && duration > 0) {
+        const providerKind = req.params.contentType === 'episode' ? 'series' : 'movie';
+        current = await trickPlay.ensure({
+          ...req.params,
+          extension: req.query.ext,
+          duration,
+          inputUrl: await sourceProviderUrl(source, providerKind, req.params.contentId, req.query.ext),
+        });
+      }
       res.set('Cache-Control', 'no-store');
       return res.json({ status: current.status });
     }
@@ -1451,7 +1461,6 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinish
 }
 
 async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
-  trickPlay.suspendForPlayback();
   return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, forceFullTranscode));
 }
 
@@ -1510,6 +1519,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       : determineHlsStrategy({});
   console.log(`[Media HLS] ${kind}:${id} strategy=${decision.strategy} reason=${decision.reason}`);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
+  // A single-threaded BIF keyframe scan is cheap enough to coexist with a
+  // stream-copy remux. Only encoding playback should preempt thumbnail work;
+  // suspending on every rolling-manifest request starved BIF generation.
+  if (mode === 'transcode') trickPlay.suspendForPlayback();
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
