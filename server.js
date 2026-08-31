@@ -637,6 +637,11 @@ app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (r
     if (!ownerId) return res.status(401).json({ error: 'Valid Roku device authorization is required' });
     const source = await getXtreamSource(req.params.sourceId, ownerId);
     if (!source) return res.sendStatus(404);
+    if (String(req.query.status || '') === '1') {
+      const current = await trickPlay.status(req.params);
+      res.set('Cache-Control', 'no-store');
+      return res.json({ status: current.status });
+    }
     const asset = await trickPlay.readyFile(req.params);
     if (asset.status !== 'ready') {
       res.set('Cache-Control', 'no-store');
