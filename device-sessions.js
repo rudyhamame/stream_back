@@ -135,6 +135,25 @@ export function claimAutomaticPairing(code) {
   return result;
 }
 
+export async function authorizeDeviceSession(code, token) {
+  const session = getDeviceSession(code);
+  if (!session) return { error: 'Pairing code expired or invalid' };
+  const authorization = resolveDeviceToken(token);
+  if (authorization?.type !== 'browser' || !ObjectId.isValid(authorization.accountId)) return { error: 'Sign in to authorize this Roku' };
+  const accountId = new ObjectId(authorization.accountId);
+  const deviceCollection = await profiles();
+  const profile = await deviceCollection.findOne({ ownerId: session.ownerId }, { projection: { accountId: 1 } });
+  if (profile?.accountId && String(profile.accountId) !== String(accountId)) return { error: 'This Roku is linked to a different RH account' };
+  session.accountId = String(accountId);
+  await deviceCollection.updateOne(
+    { ownerId: session.ownerId },
+    { $setOnInsert: { ownerId: session.ownerId, deviceId: session.deviceId, createdAt: new Date() }, $set: { accountId, updatedAt: new Date() } },
+    { upsert: true },
+  );
+  session.approvedAt = Date.now();
+  return { ok: true, deviceId: session.deviceId };
+}
+
 async function consumePairing(code, email, password, setup) {
   const session = getDeviceSession(code);
   if (!session) return { error: 'Pairing code expired or invalid' };
