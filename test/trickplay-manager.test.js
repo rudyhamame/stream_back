@@ -1,10 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { promises as fs } from 'node:fs';
-import { EventEmitter } from 'node:events';
 import os from 'node:os';
 import path from 'node:path';
-import { createBif, runFfmpeg, TrickPlayManager, validateBif } from '../trickplay-manager.js';
+import { createBif, TrickPlayManager, validateBif } from '../trickplay-manager.js';
 
 const JPEG = Buffer.from([0xff, 0xd8, 0xff, 0xdb, 0x00, 0x01, 0xff, 0xd9]);
 
@@ -63,44 +62,6 @@ test('queues while playback has priority and never generates live or unknown-dur
   await Promise.all(manager.active.values());
   assert.equal(runs, 1);
   await assert.rejects(() => manager.ensure({ ...spec, contentType: 'channel' }), /Invalid contentType/);
-});
-
-test('focused catalog item moves to the front of the cold preview queue', async t => {
-  const root = await temporaryDirectory(t);
-  const manager = new TrickPlayManager({ root, canRun: () => false });
-  const first = { sourceId: 'source-1', contentType: 'episode', contentId: 'first', duration: 60, inputUrl: 'https://provider.invalid/first' };
-  const focused = { sourceId: 'source-1', contentType: 'episode', contentId: 'focused', duration: 60, inputUrl: 'https://provider.invalid/focused' };
-  await manager.ensure(first);
-  await manager.ensure(focused);
-  await manager.ensure({ ...focused, priority: 'focused' });
-  assert.equal(manager.queue[0].paths.contentId, 'focused');
-  assert.equal(manager.queue.length, 2);
-});
-
-test('FFmpeg preemption settles only after the provider process closes', async () => {
-  const child = new EventEmitter();
-  child.stderr = new EventEmitter();
-  let closed = false;
-  child.kill = () => {
-    setTimeout(() => {
-      closed = true;
-      child.emit('close', null);
-    }, 30);
-    return true;
-  };
-  const controller = new AbortController();
-  let settled = false;
-  const running = runFfmpeg({
-    inputUrl: 'https://provider.invalid/episode', framePattern: '/tmp/%08d.jpg',
-    intervalSeconds: 10, width: 320, height: 180, timeoutMs: 1_000,
-    signal: controller.signal, spawnProcess: () => child,
-  });
-  const observed = running.finally(() => { settled = true; });
-  controller.abort();
-  await new Promise(resolve => setTimeout(resolve, 5));
-  assert.equal(settled, false);
-  await assert.rejects(observed, error => error.name === 'AbortError');
-  assert.equal(closed, true);
 });
 
 test('generation failure leaves playback-independent failed metadata and no partial BIF', async t => {

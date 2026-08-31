@@ -86,7 +86,7 @@ export async function validateBif(file) {
   }
 }
 
-export function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, timeoutMs, signal, spawnProcess = spawn }) {
+function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, timeoutMs, signal, spawnProcess = spawn }) {
   return new Promise((resolve, reject) => {
     const filter = `fps=1/${intervalSeconds},scale=w='min(${width},iw)':h='min(${height},ih)':force_original_aspect_ratio=decrease`;
     const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
@@ -98,7 +98,6 @@ export function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, heig
     const child = spawnProcess('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     let errors = '';
     let settled = false;
-    let forcedError = null;
     const finish = (error) => {
       if (settled) return;
       settled = true;
@@ -107,18 +106,17 @@ export function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, heig
       if (error) reject(error); else resolve();
     };
     const abort = () => {
-      if (settled || forcedError !== null) return;
-      forcedError = new Error('Trick-play generation preempted by playback');
-      forcedError.name = 'AbortError';
       child.kill('SIGKILL');
+      const error = new Error('Trick-play generation preempted by playback');
+      error.name = 'AbortError';
+      finish(error);
     };
     child.stderr.on('data', chunk => { errors = `${errors}${chunk}`.slice(-8000); });
     child.once('error', finish);
-    child.once('close', code => finish(forcedError || (code === 0 ? null : new Error(errors.trim() || `ffmpeg exited with ${code}`))));
+    child.once('close', code => finish(code === 0 ? null : new Error(errors.trim() || `ffmpeg exited with ${code}`)));
     const timeout = setTimeout(() => {
-      if (settled || forcedError) return;
-      forcedError = new Error('Trick-play generation timed out');
       child.kill('SIGKILL');
+      finish(new Error('Trick-play generation timed out'));
     }, timeoutMs);
     timeout.unref?.();
     if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
@@ -230,13 +228,6 @@ export class TrickPlayManager {
       return current;
     }
     if (this.active.has(current.paths.key) || this.queued.has(current.paths.key)) {
-      // Catalog focus is an explicit signal that this is the item most likely
-      // to play next. Move an already-queued cold asset to the front without
-      // duplicating work, so browsing can prepare it before playback starts.
-      if (this.queued.has(current.paths.key) && spec.priority === 'focused') {
-        const index = this.queue.findIndex(job => job.paths.key === current.paths.key);
-        if (index > 0) this.queue.unshift(this.queue.splice(index, 1)[0]);
-      }
       console.log(`[TrickPlay] duplicate job suppressed ${current.paths.contentType}=${current.paths.contentId}`);
       return { ...current, status: this.active.has(current.paths.key) ? 'generating' : 'queued' };
     }
@@ -337,11 +328,6 @@ export class TrickPlayManager {
     // A provider may permit only one Xtream connection. Do not report the
     // handoff complete until FFmpeg has actually closed its thumbnail input.
     await Promise.allSettled(active);
-    // Give the upstream account a short release grace after the local process
-    // closes. Some Xtream panels update their one-connection lease slightly
-    // after TCP teardown; opening Roku's MP4 immediately can return truncated
-    // bytes that its parser reports as -5 malformed data.
-    if (active.length > 0) await new Promise(resolve => setTimeout(resolve, 250));
   }
 
   async cleanup() {
