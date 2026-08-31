@@ -1315,6 +1315,7 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const source = await getXtreamSource(req.params.sourceId, mediaOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
+    trickPlay.suspendForPlayback();
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
@@ -1441,6 +1442,7 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinish
 }
 
 async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, forceFullTranscode = false) {
+  trickPlay.suspendForPlayback();
   return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, forceFullTranscode));
 }
 

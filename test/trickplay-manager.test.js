@@ -76,6 +76,27 @@ test('generation failure leaves playback-independent failed metadata and no part
   await assert.rejects(fs.stat(`${state.paths.bif}.tmp`));
 });
 
+test('active playback preempts generation and leaves the asset safely queued', async t => {
+  const root = await temporaryDirectory(t);
+  let release;
+  const runner = ({ signal }) => new Promise((resolve, reject) => {
+    release = resolve;
+    signal.addEventListener('abort', () => {
+      const error = new Error('preempted');
+      error.name = 'AbortError';
+      reject(error);
+    }, { once: true });
+  });
+  const manager = new TrickPlayManager({ root, canRun: () => true, runner });
+  const spec = { sourceId: 'source-1', contentType: 'movie', contentId: '100', duration: 60, inputUrl: 'https://provider.invalid/movie' };
+  await manager.ensure(spec);
+  manager.suspendForPlayback();
+  await Promise.all(manager.active.values());
+  assert.equal((await manager.status(spec)).status, 'queued');
+  assert.equal(manager.queue.length, 1);
+  release?.();
+});
+
 test('rejects traversal identities', async () => {
   const manager = new TrickPlayManager();
   assert.throws(() => manager.paths({ sourceId: '..', contentType: 'movie', contentId: '1' }), /Invalid sourceId/);

@@ -86,7 +86,7 @@ export async function validateBif(file) {
   }
 }
 
-function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, timeoutMs, spawnProcess = spawn }) {
+function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, timeoutMs, signal, spawnProcess = spawn }) {
   return new Promise((resolve, reject) => {
     const filter = `fps=1/${intervalSeconds},scale=w='min(${width},iw)':h='min(${height},ih)':force_original_aspect_ratio=decrease`;
     const args = ['-hide_banner', '-loglevel', 'error', '-nostdin'];
@@ -102,7 +102,14 @@ function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, tim
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      signal?.removeEventListener('abort', abort);
       if (error) reject(error); else resolve();
+    };
+    const abort = () => {
+      child.kill('SIGKILL');
+      const error = new Error('Trick-play generation preempted by playback');
+      error.name = 'AbortError';
+      finish(error);
     };
     child.stderr.on('data', chunk => { errors = `${errors}${chunk}`.slice(-8000); });
     child.once('error', finish);
@@ -112,6 +119,7 @@ function runFfmpeg({ inputUrl, framePattern, intervalSeconds, width, height, tim
       finish(new Error('Trick-play generation timed out'));
     }, timeoutMs);
     timeout.unref?.();
+    if (signal?.aborted) abort(); else signal?.addEventListener('abort', abort, { once: true });
   });
 }
 
@@ -147,7 +155,9 @@ export class TrickPlayManager {
     this.queue = [];
     this.queued = new Set();
     this.active = new Map();
+    this.controllers = new Map();
     this.serving = new Map();
+    this.suspendedUntil = 0;
     this.timer = null;
   }
 
@@ -239,15 +249,21 @@ export class TrickPlayManager {
   }
 
   async drain() {
-    while (this.active.size < this.maxConcurrentJobs && this.queue.length > 0 && this.canRun()) {
+    while (this.active.size < this.maxConcurrentJobs && this.queue.length > 0 && this.now() >= this.suspendedUntil && this.canRun()) {
       const job = this.queue.shift();
       this.queued.delete(job.paths.key);
-      const promise = this.generate(job).finally(() => { this.active.delete(job.paths.key); void this.drain(); });
+      const controller = new AbortController();
+      this.controllers.set(job.paths.key, controller);
+      const promise = this.generate(job, controller.signal).finally(() => {
+        this.controllers.delete(job.paths.key);
+        this.active.delete(job.paths.key);
+        void this.drain();
+      });
       this.active.set(job.paths.key, promise);
     }
   }
 
-  async generate(job) {
+  async generate(job, signal) {
     const { paths } = job;
     const startedAt = this.now();
     const frameDirectory = path.join(paths.directory, 'frames.tmp');
@@ -260,7 +276,7 @@ export class TrickPlayManager {
       await fs.mkdir(frameDirectory, { recursive: true });
       await this.runner({
         inputUrl: job.inputUrl, framePattern: path.join(frameDirectory, '%08d.jpg'), intervalSeconds: this.intervalSeconds,
-        width: this.width, height: this.height, timeoutMs: this.timeoutMs,
+        width: this.width, height: this.height, timeoutMs: this.timeoutMs, signal,
       });
       const frames = (await fs.readdir(frameDirectory)).filter(name => /^\d{8}\.jpg$/.test(name)).sort().map(name => path.join(frameDirectory, name));
       const built = await createBif(frames, temporaryBif, this.intervalSeconds);
@@ -274,6 +290,14 @@ export class TrickPlayManager {
       console.log(`[TrickPlay] generation ready ${paths.contentType}=${paths.contentId} frames=${ready.thumbnailCount} duration=${Math.round((this.now() - startedAt) / 1000)}s`);
     } catch (error) {
       await fs.rm(temporaryBif, { force: true });
+      if (error.name === 'AbortError') {
+        const queued = { ...metadata, status: 'queued', updatedAt: new Date(this.now()).toISOString(), error: '' };
+        await writeJsonAtomic(paths.metadata, queued).catch(() => {});
+        this.queue.unshift({ ...job, metadata: queued });
+        this.queued.add(paths.key);
+        console.log(`[TrickPlay] preempted ${paths.contentType}=${paths.contentId}`);
+        return;
+      }
       const failed = { ...metadata, status: 'failed', updatedAt: new Date(this.now()).toISOString(), error: String(error.message || error).slice(0, 500) };
       await writeJsonAtomic(paths.metadata, failed).catch(() => {});
       console.warn(`[TrickPlay] generation failed ${paths.contentType}=${paths.contentId} reason=${failed.error}`);
@@ -295,6 +319,11 @@ export class TrickPlayManager {
   endServe(key) {
     const count = (this.serving.get(key) || 1) - 1;
     if (count > 0) this.serving.set(key, count); else this.serving.delete(key);
+  }
+
+  suspendForPlayback(milliseconds = 60_000) {
+    this.suspendedUntil = Math.max(this.suspendedUntil, this.now() + milliseconds);
+    for (const controller of this.controllers.values()) controller.abort();
   }
 
   async cleanup() {
@@ -325,6 +354,7 @@ export class TrickPlayManager {
 
   async shutdown() {
     if (this.timer) clearInterval(this.timer);
+    for (const controller of this.controllers.values()) controller.abort();
     await Promise.allSettled(this.active.values());
   }
 }
