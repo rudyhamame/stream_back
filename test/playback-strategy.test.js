@@ -23,7 +23,7 @@ test('keeps FFmpeg fallback on independent, Roku-safe HLS segments', () => {
     listSize: 30,
     startupSegments: 1,
   });
-  assert.deepEqual(hlsInputArgs(), ['-re']);
+  assert.deepEqual(hlsInputArgs(), ['-readrate', '1', '-readrate_initial_burst', '8']);
   assert.match(hlsMuxerFlags(), /independent_segments/);
   assert.equal(hlsMuxerFlags().includes('split_by_time'), false);
 });

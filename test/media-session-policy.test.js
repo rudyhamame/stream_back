@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPlaybackReplacedBySeekPreview, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
+import { isPlaybackReplacedBySeekPreview, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
 
 test('HLS identity includes source, item, extension, and seek offset', () => {
   const base = hlsSessionKey('source', 'movie', '42', 'mp4', 0);
@@ -42,6 +42,13 @@ test('a full-player seek frame releases only its matching active playback job', 
   assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, deviceId: 'roku-2' }, identity, target), false);
   assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, mediaId: 'episode-2' }, identity, target), false);
   assert.equal(isPlaybackReplacedBySeekPreview({ ...matching, persistent: false }, identity, target), false);
+});
+
+test('a new preview supersedes only the same viewer snapshot slot', () => {
+  const snapshot = { mode: 'snapshot', viewerId: 'roku-1' };
+  assert.equal(isSnapshotSupersededForViewer(snapshot, { viewerId: 'roku-1' }), true);
+  assert.equal(isSnapshotSupersededForViewer(snapshot, { viewerId: 'roku-2' }), false);
+  assert.equal(isSnapshotSupersededForViewer({ ...snapshot, mode: 'remux' }, { viewerId: 'roku-1' }), false);
 });
 
 test('serializes startup for one provider source without blocking another source', async () => {

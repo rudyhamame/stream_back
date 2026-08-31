@@ -15,7 +15,7 @@ import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProvi
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
-import { isPlaybackReplacedBySeekPreview, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
+import { isPlaybackReplacedBySeekPreview, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -889,6 +889,11 @@ app.get('/api/playback/preview', async (req, res) => {
     let frame = previewCache.get(cacheKey)?.frame;
     if (!frame) {
       const identity = mediaIdentity(req);
+      const superseded = [];
+      for (const [jobKey, job] of mediaJobs.entries()) {
+        if (isSnapshotSupersededForViewer(job, identity)) superseded.push(mediaJobs.remove(jobKey, 'superseded-preview'));
+      }
+      if (superseded.length) await Promise.allSettled(superseded);
       if (playerFrame) {
         const replaced = [];
         for (const [jobKey, job] of mediaJobs.entries()) {
@@ -1501,7 +1506,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     : determineHlsStrategy(sourceMetadata);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
-    key, mode, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
+    key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
   }, async () => {

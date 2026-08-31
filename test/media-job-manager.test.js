@@ -81,6 +81,20 @@ test('allows one short snapshot during high CPU without opening a second snapsho
   await manager.shutdown();
 });
 
+test('allows one user playback transcode during high host CPU while preserving its limit', async () => {
+  const manager = new MediaJobManager({
+    limits: { ...limits, maxTranscodes: 1, maxTotalJobs: 2 },
+    pressure: () => ({ hard: false, soft: false, cpuHigh: true }),
+  });
+  const playback = await manager.getOrCreate({ key: 'playback', mode: 'transcode', allowCpuPressure: true }, async () => ({ stop() {} }));
+  assert.equal(playback.job.mode, 'transcode');
+  await assert.rejects(
+    manager.getOrCreate({ key: 'second-playback', mode: 'transcode', allowCpuPressure: true }, async () => ({ stop() {} })),
+    /Transcoding capacity/,
+  );
+  await manager.shutdown();
+});
+
 test('idle sweep stops and removes abandoned jobs', async () => {
   let now = 1_000;
   let stopped = 0;

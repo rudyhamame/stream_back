@@ -36,6 +36,11 @@ export function isPlaybackReplacedBySeekPreview(job, identity, target) {
     && samePlaybackViewer(job, identity);
 }
 
+export function isSnapshotSupersededForViewer(job, identity) {
+  if (!job || job.mode !== 'snapshot' || !identity?.viewerId) return false;
+  return job.viewerId === identity.viewerId;
+}
+
 export class KeyedSerialExecutor {
   constructor() { this.tails = new Map(); }
 
