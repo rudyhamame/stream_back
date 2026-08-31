@@ -56,10 +56,10 @@ export function hlsPlaylistProfile() {
 }
 
 export function hlsInputArgs() {
-  // Read the opening seconds as fast as possible so FFmpeg reaches the next
-  // source keyframe and publishes Roku's first HLS segment promptly. After
-  // the burst, continue at normal playback rate to keep disk/CPU bounded.
-  return ['-readrate', '1', '-readrate_initial_burst', '8'];
+  // Render's FFmpeg build supports -readrate but not the newer
+  // -readrate_initial_burst option. Keep playback paced without passing an
+  // unsupported argument that makes every HLS job exit before startup.
+  return ['-readrate', '1'];
 }
 
 export function hlsMuxerFlags() {
