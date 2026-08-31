@@ -33,6 +33,30 @@ export function determineHlsStrategy(sourceMetadata = {}) {
   return { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Video and audio codecs require conversion' };
 }
 
+export function determineVodHlsStrategy(extension = '', forceFullTranscode = false) {
+  if (forceFullTranscode) {
+    return {
+      videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE,
+      reason: 'Compatibility fallback after stream-copy failure',
+    };
+  }
+  const container = String(extension || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
+  // The selected provider exposes these containers as normal H.264/AAC VOD.
+  // Remuxing changes only the container, starts quickly, and avoids Render CPU
+  // starvation. It also avoids a separate ffprobe connection on one-slot
+  // Xtream accounts. Less predictable containers retain compatibility mode.
+  if (['mp4', 'm4v', 'mov'].includes(container)) {
+    return {
+      videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX,
+      reason: `Fast ${container.toUpperCase()} VOD remux`,
+    };
+  }
+  return {
+    videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE,
+    reason: `Compatibility transcode for ${container || 'unknown'} VOD container`,
+  };
+}
+
 export function hlsCodecArgs(decision) {
   const args = decision.videoMode === 'copy'
     ? ['-c:v', 'copy']

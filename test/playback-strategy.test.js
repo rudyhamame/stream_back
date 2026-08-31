@@ -5,12 +5,27 @@ import {
   PlaybackStrategy,
   choosePlaybackStrategy,
   determineHlsStrategy,
+  determineVodHlsStrategy,
   hlsCodecArgs,
   hlsInputArgs,
   hlsMuxerFlags,
   hlsPlaylistProfile,
   strategyUsesEncoding,
 } from '../playback-strategy.js';
+
+test('remuxes MP4-family VOD without opening a codec probe', () => {
+  for (const extension of ['mp4', 'M4V', 'mov']) {
+    const decision = determineVodHlsStrategy(extension);
+    assert.equal(decision.strategy, HlsStrategy.REMUX);
+    assert.deepEqual(hlsCodecArgs(decision), ['-c:v', 'copy', '-c:a', 'copy']);
+    assert.equal(strategyUsesEncoding(decision), false);
+  }
+});
+
+test('retains full compatibility mode for unpredictable VOD containers and fallback', () => {
+  assert.equal(determineVodHlsStrategy('mkv').strategy, HlsStrategy.FULL_TRANSCODE);
+  assert.equal(determineVodHlsStrategy('mp4', true).strategy, HlsStrategy.FULL_TRANSCODE);
+});
 
 test('keeps range-capable proxy playback on the direct path', () => {
   assert.equal(choosePlaybackStrategy({ purpose: 'direct-proxy' }), PlaybackStrategy.DIRECT);

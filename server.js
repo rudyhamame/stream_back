@@ -16,7 +16,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackReplacedBySeekPreview, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
-import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { HlsStrategy, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, determineVodHlsStrategy, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -1487,14 +1487,15 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   }
 
   const inputUrl = await sourceProviderUrl(source, kind, id, extension);
-  // Many Xtream subscriptions permit only one provider connection. Running
-  // ffprobe immediately before FFmpeg can leave the probe counted by the
-  // provider and make real playback fail with nonstandard HTTP 458. VOD uses
-  // one FFmpeg connection and guaranteed Roku-compatible output; channels
-  // stay on the lightweight remux path.
-  const decision = forceFullTranscode || seekableVod
-    ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: seekableVod ? 'Single-connection Roku VOD compatibility' : 'Compatibility fallback after stream-copy failure' }
-    : determineHlsStrategy({});
+  // Do not open ffprobe before FFmpeg: this provider allows one connection.
+  // MP4-family VOD can be remuxed immediately without consuming Render CPU;
+  // less predictable containers retain the compatibility transcode path.
+  const decision = seekableVod
+    ? determineVodHlsStrategy(extension, forceFullTranscode)
+    : forceFullTranscode
+      ? { videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Compatibility fallback after stream-copy failure' }
+      : determineHlsStrategy({});
+  console.log(`[Media HLS] ${kind}:${id} strategy=${decision.strategy} reason=${decision.reason}`);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode,
