@@ -69,9 +69,11 @@ const trickPlay = new TrickPlayManager({
   // A thumbnail scan must never compete with direct MP4 or compatibility HLS
   // playback, even when that playback is only a low-CPU stream-copy remux.
   // Cached BIF files remain independently servable while video is active.
-  // Cold generation is intentionally off. It must not open a second provider
-  // connection beside or between Original MP4 requests.
-  canRun: () => false,
+  canRun: () => {
+    const pressure = memoryPressure(mediaLimits);
+    const media = mediaJobs.counts();
+    return media.total === 0 && media.queued === 0 && directStreamLimiter.activeCount === 0 && !pressure.soft;
+  },
 });
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
@@ -638,9 +640,19 @@ app.get('/api/trickplay/:sourceId/:contentType/:contentId/preview.bif', async (r
     const source = await getXtreamSource(req.params.sourceId, ownerId);
     if (!source) return res.sendStatus(404);
     if (String(req.query.status || '') === '1') {
-      const current = await trickPlay.status(req.params);
+      let current = await trickPlay.status(req.params);
+      const duration = Math.max(0, Number(req.query.duration) || 0);
+      if (current.status === 'missing' && duration > 0) {
+        const providerKind = req.params.contentType === 'episode' ? 'series' : 'movie';
+        current = await trickPlay.ensure({
+          ...req.params,
+          extension: req.query.ext,
+          duration,
+          inputUrl: await sourceProviderUrl(source, providerKind, req.params.contentId, req.query.ext),
+        });
+      }
       res.set('Cache-Control', 'no-store');
-      return res.json({ status: current.status === 'ready' ? 'ready' : 'unavailable' });
+      return res.json({ status: current.status });
     }
     const asset = await trickPlay.readyFile(req.params);
     if (asset.status !== 'ready') {
@@ -784,9 +796,7 @@ app.get('/api/roku/series/detail', async (req, res) => {
 });
 
 async function buildXtreamMoviesPayload({ limit, selected } = {}) {
-  // Catalog rails traverse in library insertion order. Keep Home's separate
-  // "recently added" bootstrap newest-first, but never reverse rail pages.
-  let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
+  let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
   if (Number.isFinite(limit) && limit > 0) movies = movies.slice(0, limit);
   // Browsing must never wait for get_vod_info. Saved metadata is enough for
   // the card; detailed provider metadata can be fetched only when needed.
@@ -814,7 +824,7 @@ app.get('/api/roku/movies', async (req, res) => {
     pageInfo.offset = pageInfo.page * pageInfo.limit;
     const selected = (await getRokuSelectedItems('movie', requestOwner(req)))
       .slice()
-      .sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
+      .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
     const sourcePage = selected.slice(pageInfo.offset, pageInfo.offset + pageInfo.limit);
     const items = await buildXtreamMoviesPayload({ selected: sourcePage });
     res.json({
@@ -1329,6 +1339,10 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
+    // Close any thumbnail provider connection before Roku opens the MP4. This
+    // handoff is awaited because one-stream providers otherwise let playback
+    // start briefly and then terminate it when FFmpeg's BIF scan reconnects.
+    await trickPlay.suspendForPlayback();
     releaseDirectStream = directStreamLimiter.acquire(source._id);
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
@@ -1468,6 +1482,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     return existing;
     }
   }
+
+  // Every new playback job, including a stream-copy remux at offset zero,
+  // owns the provider connection. Wait for a cold BIF scan to close first.
+  await trickPlay.suspendForPlayback();
 
   // A device is limited to one active playback job. Release its previous
   // movie/channel before starting another one so navigation does not hit the
@@ -1654,6 +1672,17 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     }
     const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
+    if (seekableVod && startSeconds === 0) {
+      const duration = Math.max(0, Number(req.query.duration) || 0);
+      if (duration > 0) {
+        const contentType = req.params.kind === 'series' ? 'episode' : 'movie';
+        const inputUrl = await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext);
+        trickPlay.ensure({
+          sourceId: source._id, contentType, contentId: req.params.id, extension: req.query.ext,
+          duration, inputUrl,
+        }).catch(error => console.warn(`[TrickPlay] queue failed ${contentType}=${req.params.id} reason=${error.message}`));
+      }
+    }
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
@@ -1840,7 +1869,7 @@ app.get('/api/xtream/roku/:sourceId/:kind/:id', async (req, res) => {
   }
 });
 async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected } = {}) {
-  let selected = (suppliedSelected || await getAllXtreamItems('series')).slice().sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
+  let selected = suppliedSelected || (await getAllXtreamItems('series')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
   if (Number.isFinite(limit) && limit > 0) selected = selected.slice(0, limit);
   let cursor = 0;
   const groups = new Array(selected.length);
@@ -1909,7 +1938,7 @@ app.get('/api/roku/series', async (req, res) => {
     const pageInfo = rokuPage(req, rokuSeriesPageLimit);
     const selected = (await getRokuSelectedItems('series', requestOwner(req)))
       .filter(item => !category || item.category === category)
-      .sort((a, b) => Number(a.added || 0) - Number(b.added || 0));
+      .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
     const page = rokuPagePayload(selected, pageInfo);
     const items = page.items.map(item => ({
       id: `series-search:${item.sourceId}:${item.id}`,
