@@ -1487,7 +1487,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // Absolute seeking has priority over cold-cache thumbnail generation.
     // Wait for that provider connection to close before replacing the HLS
     // stream; otherwise Roku receives a short manifest and freezes at 13%.
-    await trickPlay.suspendForPlayback(60_000);
+    await trickPlay.suspendForPlayback(20_000);
   }
 
   // A device is limited to one active playback job. Release its previous
