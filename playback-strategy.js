@@ -22,17 +22,17 @@ export const PlaybackClient = Object.freeze({
 const clientDefaults = Object.freeze({
   [PlaybackClient.ROKU]: {
     videoCodecs: ['h264'], audioCodecs: ['aac', 'mp3'],
-    hevcMain: false, hevcMain10: false, maxH264Width: 1920, maxH264Height: 1080,
+    hevcMain: false, hevcMain10: false, maxH264Level: 4.2, maxHevcMainLevel: 0, maxHevcMain10Level: 0, maxH264Width: 1920, maxH264Height: 1080,
     maxHevcWidth: 3840, maxHevcHeight: 2160, maxAacChannels: 2,
   },
   [PlaybackClient.BROWSER]: {
     videoCodecs: ['h264'], audioCodecs: ['aac', 'mp3'],
-    hevcMain: false, hevcMain10: false, maxH264Width: 3840, maxH264Height: 2160,
+    hevcMain: false, hevcMain10: false, maxH264Level: 5.1, maxHevcMainLevel: 0, maxHevcMain10Level: 0, maxH264Width: 3840, maxH264Height: 2160,
     maxHevcWidth: 3840, maxHevcHeight: 2160, maxAacChannels: 2,
   },
   [PlaybackClient.ANDROID]: {
     videoCodecs: ['h264'], audioCodecs: ['aac', 'mp3'],
-    hevcMain: false, hevcMain10: false, maxH264Width: 3840, maxH264Height: 2160,
+    hevcMain: false, hevcMain10: false, maxH264Level: 5.1, maxHevcMainLevel: 0, maxHevcMain10Level: 0, maxH264Width: 3840, maxH264Height: 2160,
     maxHevcWidth: 3840, maxHevcHeight: 2160, maxAacChannels: 2,
   },
 });
@@ -49,8 +49,10 @@ export function getPlaybackCapabilities(clientType = PlaybackClient.BROWSER, rep
     client,
     videoCodecs: new Set(defaults.videoCodecs),
     audioCodecs,
-    hevcMain: tokens.has('hevc-main'),
-    hevcMain10: tokens.has('hevc-main10'),
+    hevcMain: tokens.has('hevc-main') || tokens.has('hevc-main-41') || tokens.has('hevc-main-51'),
+    hevcMain10: tokens.has('hevc-main10') || tokens.has('hevc-main10-41') || tokens.has('hevc-main10-51'),
+    maxHevcMainLevel: tokens.has('hevc-main-51') || tokens.has('hevc-main') ? 5.1 : tokens.has('hevc-main-41') ? 4.1 : 0,
+    maxHevcMain10Level: tokens.has('hevc-main10-51') || tokens.has('hevc-main10') ? 5.1 : tokens.has('hevc-main10-41') ? 4.1 : 0,
     maxAacChannels: tokens.has('aac-multichannel') ? 8 : defaults.maxAacChannels,
   };
 }
@@ -70,6 +72,14 @@ function frameRate(value) {
   return Number.isFinite(result) ? result : 0;
 }
 
+function codecLevel(value, codec) {
+  const raw = Number(value);
+  if (!Number.isFinite(raw) || raw <= 0) return 0;
+  if (raw < 10) return raw;
+  if (codec === 'hevc' && raw >= 90) return raw / 30;
+  return raw / 10;
+}
+
 function videoCompatibility(metadata, capabilities) {
   const codec = normalizedCodec(metadata.videoCodec || metadata.codecVideo || metadata.codec);
   if (!codec) return { compatible: false, reason: 'video codec unavailable' };
@@ -83,20 +93,25 @@ function videoCompatibility(metadata, capabilities) {
   const h264 = ['h264', 'avc', 'avc1'].includes(codec);
   const hevc = ['hevc', 'h265', 'hev1', 'hvc1'].includes(codec);
   if (h264) {
+    const level = codecLevel(metadata.videoLevel || metadata.level, 'h264');
     if (!capabilities.videoCodecs.has('h264')) return { compatible: false, reason: 'H.264 unavailable on target' };
     if (profile && !['baseline', 'constrainedbaseline', 'main', 'high'].includes(profile)) return { compatible: false, reason: `H.264 profile ${profile} unsupported` };
     if (!is420 || bitDepth > 8) return { compatible: false, reason: `H.264 ${pixelFormat || `${bitDepth}-bit`} unsupported` };
+    if (level > capabilities.maxH264Level) return { compatible: false, reason: `H.264 level ${level.toFixed(1)} exceeds target` };
     if ((width > capabilities.maxH264Width) || (height > capabilities.maxH264Height)) return { compatible: false, reason: `H.264 dimensions ${width}x${height} exceed target` };
     if (fps > 60.1) return { compatible: false, reason: `H.264 frame rate ${fps.toFixed(2)} exceeds target` };
     return { compatible: true, reason: 'H.264 stream is target-compatible' };
   }
   if (hevc) {
+    const level = codecLevel(metadata.videoLevel || metadata.level, 'hevc');
     if (!is420 || bitDepth > 10) return { compatible: false, reason: `HEVC ${pixelFormat || `${bitDepth}-bit`} unsupported` };
     if ((width > capabilities.maxHevcWidth) || (height > capabilities.maxHevcHeight)) return { compatible: false, reason: `HEVC dimensions ${width}x${height} exceed target` };
     if (fps > 60.1) return { compatible: false, reason: `HEVC frame rate ${fps.toFixed(2)} exceeds target` };
     const main10 = bitDepth > 8 || profile.includes('main10');
     if (main10 && !capabilities.hevcMain10) return { compatible: false, reason: 'HEVC Main 10 unavailable on target' };
     if (!main10 && !capabilities.hevcMain) return { compatible: false, reason: 'HEVC unavailable on target' };
+    const maxLevel = main10 ? capabilities.maxHevcMain10Level : capabilities.maxHevcMainLevel;
+    if (level > maxLevel) return { compatible: false, reason: `HEVC level ${level.toFixed(1)} exceeds target` };
     return { compatible: true, reason: `HEVC ${main10 ? 'Main 10' : 'Main'} stream is target-compatible` };
   }
   return { compatible: false, reason: `video codec ${codec} requires H.264 conversion` };
@@ -130,30 +145,6 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
     return { videoMode: 'transcode', audioMode: 'copy', strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: detail };
   }
   return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: detail };
-}
-
-export function determineVodHlsStrategy(extension = '', forceFullTranscode = false) {
-  if (forceFullTranscode) {
-    return {
-      videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE,
-      reason: 'Compatibility fallback after stream-copy failure',
-    };
-  }
-  const container = String(extension || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
-  // The selected provider exposes these containers as normal H.264/AAC VOD.
-  // Remuxing changes only the container, starts quickly, and avoids Render CPU
-  // starvation. It also avoids a separate ffprobe connection on one-slot
-  // Xtream accounts. Less predictable containers retain compatibility mode.
-  if (['mp4', 'm4v', 'mov'].includes(container)) {
-    return {
-      videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX,
-      reason: `Fast ${container.toUpperCase()} VOD remux`,
-    };
-  }
-  return {
-    videoMode: 'transcode', audioMode: 'transcode', strategy: HlsStrategy.FULL_TRANSCODE,
-    reason: `Compatibility transcode for ${container || 'unknown'} VOD container`,
-  };
 }
 
 export function hlsCodecArgs(decision) {

@@ -1637,14 +1637,18 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     // aggressive split-by-time preview experiment produced Roku -3/-5 errors.
     let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target);
     let playlistProfile = hlsPlaylistProfile();
-    let manifestReady = await waitForHlsManifest(job.manifest, 15_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
-    if (!manifestReady && job.hlsStrategy !== HlsStrategy.FULL_TRANSCODE) {
+    let manifestReady = false;
+    // At most two bounded fallbacks are allowed. Accurate probe metadata
+    // should select the first strategy; retries exist only for an unexpected
+    // MPEG-TS mux/runtime incompatibility.
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      manifestReady = await waitForHlsManifest(job.manifest, attempt === 0 ? 15_000 : 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
+      if (manifestReady || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
       const fallback = fallbackHlsStrategy(job.hlsDecision);
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback);
       playlistProfile = hlsPlaylistProfile();
-      manifestReady = await waitForHlsManifest(job.manifest, 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
     }
     if (!manifestReady) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest timeout detail=${job.error.trim().slice(-240) || 'none'}`);

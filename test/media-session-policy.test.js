@@ -8,6 +8,7 @@ test('HLS identity includes source, item, extension, and seek offset', () => {
   assert.notEqual(base, hlsSessionKey('source', 'movie', '42', 'mkv', 0));
   assert.notEqual(base, hlsSessionKey('source', 'movie', '42', 'mp4', 60));
   assert.notEqual(base, hlsSessionKey('source', 'series', '42', 'mp4', 0));
+  assert.notEqual(base, hlsSessionKey('source', 'movie', '42', 'mp4', 0, 'roku:hevc-main'));
 });
 
 test('HLS child requests preserve every value used by authentication and session identity', () => {
@@ -15,10 +16,14 @@ test('HLS child requests preserve every value used by authentication and session
     deviceToken: 'roku token',
     streamTicket: 'ticket/value',
     ext: 'm3u8',
+    client: 'roku',
+    caps: 'hevc-main,eac3',
   }, 90);
   assert.equal(params.get('deviceToken'), 'roku token');
   assert.equal(params.get('streamTicket'), 'ticket/value');
   assert.equal(params.get('ext'), 'm3u8');
+  assert.equal(params.get('client'), 'roku');
+  assert.equal(params.get('caps'), 'hevc-main,eac3');
   assert.equal(params.get('start'), '90');
   assert.equal(
     hlsSessionKey('source', 'movie', '42', params.get('ext'), Number(params.get('start'))),
