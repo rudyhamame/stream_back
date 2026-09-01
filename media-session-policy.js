@@ -1,9 +1,9 @@
 import { createHash } from 'node:crypto';
 
-export function hlsSessionKey(sourceId, kind, id, extension, startSeconds = 0) {
+export function hlsSessionKey(sourceId, kind, id, extension, startSeconds = 0, capabilityKey = '') {
   const normalizedExtension = String(extension || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
   return createHash('sha256')
-    .update(`${sourceId}:${kind}:${id}:${normalizedExtension}:${startSeconds}`)
+    .update(`${sourceId}:${kind}:${id}:${normalizedExtension}:${startSeconds}:${String(capabilityKey)}`)
     .digest('hex')
     .slice(0, 24);
 }
@@ -16,6 +16,10 @@ export function hlsChildRequestQuery(query = {}, startSeconds = 0) {
   if (streamTicket) params.set('streamTicket', streamTicket);
   const extension = String(query.ext || '').trim();
   if (extension) params.set('ext', extension);
+  const client = String(query.client || '').trim();
+  if (client) params.set('client', client);
+  const capabilities = String(query.caps || '').trim();
+  if (capabilities) params.set('caps', capabilities);
   if (startSeconds > 0) params.set('start', String(startSeconds));
   return params;
 }
@@ -25,6 +29,11 @@ export function samePlaybackViewer(job, identity) {
   if (identity.deviceId) return job.deviceId === identity.deviceId;
   if (!identity.viewerId) return false;
   return job.viewerId === identity.viewerId || job.viewers?.has(identity.viewerId) === true;
+}
+
+export function isPlaybackSupersededForViewer(job, identity, nextKey = '') {
+  if (!job?.persistent || job.key === nextKey) return false;
+  return samePlaybackViewer(job, identity);
 }
 
 export function isSnapshotSupersededForViewer(job, identity) {

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
+import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
 
 test('HLS identity includes source, item, extension, and seek offset', () => {
   const base = hlsSessionKey('source', 'movie', '42', 'mp4', 0);
@@ -32,6 +32,13 @@ test('replacement is scoped to the requesting device or anonymous viewer', () =>
   assert.equal(samePlaybackViewer(job, { deviceId: 'roku-2', viewerId: 'owner-1' }), false);
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-1' }), true);
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-2' }), false);
+});
+
+test('a new Android episode replaces the prior job for the same account viewer', () => {
+  const priorEpisode = { key: 'episode-1', persistent: true, deviceId: '', viewerId: 'account-1', viewers: new Map() };
+  assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-1' }, 'episode-2'), true);
+  assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-2' }, 'episode-2'), false);
+  assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-1' }, 'episode-1'), false);
 });
 
 test('a new preview supersedes only the same viewer snapshot slot', () => {
