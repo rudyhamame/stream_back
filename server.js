@@ -1642,9 +1642,19 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     // should select the first strategy; retries exist only for an unexpected
     // MPEG-TS mux/runtime incompatibility.
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      manifestReady = await waitForHlsManifest(job.manifest, attempt === 0 ? 15_000 : 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
+      // Roku abandons a manifest request at roughly 50 seconds. A compatible
+      // stream-copy normally closes its first segment in under eight seconds;
+      // beyond that, do not spend the remaining startup window on another
+      // video-copy attempt with the same sparse-keyframe limitation.
+      const firstAttemptTimeout = seekableVod && target.client === PlaybackClient.ROKU ? 8_000 : 15_000;
+      manifestReady = await waitForHlsManifest(job.manifest, attempt === 0 ? firstAttemptTimeout : 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
       if (manifestReady || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
-      const fallback = fallbackHlsStrategy(job.hlsDecision);
+      let fallback = fallbackHlsStrategy(job.hlsDecision);
+      if (seekableVod && target.client === PlaybackClient.ROKU && job.hlsDecision.videoMode === 'copy') {
+        // Audio-only conversion cannot create video keyframes. Jump directly
+        // to the keyframe-controlled H.264 fallback after a startup timeout.
+        if (fallback.videoMode === 'copy') fallback = fallbackHlsStrategy(fallback);
+      }
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback);
