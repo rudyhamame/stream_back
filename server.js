@@ -22,6 +22,8 @@ import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
+import { normalizePlaylistRules, PlaylistRuleRuntime } from './playlist-rules.js';
+import { acquireProviderStreamLease } from './provider-stream-leases.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -63,6 +65,7 @@ const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
 const mediaSourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
+const playlistRuleRuntime = new PlaylistRuleRuntime();
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
 const nativeHlsSessionMaxEntries = 16;
@@ -1325,6 +1328,7 @@ app.post('/api/xtream/sources/:id/archive/:key/restore', async (req, res) => {
 app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
   const controller = new AbortController();
   let releaseDirectStream;
+  let releaseProviderLease;
   const connectionTimer = setTimeout(() => controller.abort(new Error('Provider connection timed out')), 15_000);
   connectionTimer.unref?.();
   const abortUpstream = () => controller.abort(new Error('Downstream client disconnected'));
@@ -1333,10 +1337,22 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     const source = await getXtreamSource(req.params.sourceId, mediaOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
+    const rules = normalizePlaylistRules(source.rules);
+    if (req.params.kind === 'channel' && rules.forceServerProxy.enabled) {
+      const query = new URLSearchParams();
+      for (const [name, value] of Object.entries(req.query || {})) if (value != null) query.set(name, String(value));
+      const suffix = query.toString();
+      return res.redirect(302, `/api/xtream/hls/${encodeURIComponent(source._id)}/channel/${encodeURIComponent(req.params.id)}/master.m3u8${suffix ? `?${suffix}` : ''}`);
+    }
+    playlistRuleRuntime.checkStreamStart(source);
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
-    releaseDirectStream = directStreamLimiter.acquire(source._id);
+    releaseDirectStream = directStreamLimiter.acquire(source._id, rules.maxConcurrentStreams.enabled ? rules.maxConcurrentStreams.limit : undefined);
+    if (rules.maxConcurrentStreams.enabled) {
+      releaseProviderLease = await acquireProviderStreamLease(source._id, rules.maxConcurrentStreams.limit);
+      if (!releaseProviderLease) throw new MediaCapacityError(`Provider rule: maximum ${rules.maxConcurrentStreams.limit} simultaneous stream${rules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+    }
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
     headers['user-agent'] = req.headers['user-agent'] || 'RH-Stream/1.0';
@@ -1370,6 +1386,7 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
   } catch (error) {
     if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(error.name === 'AbortError' ? 499 : 502).json({ error: error.message });
   } finally {
+    await releaseProviderLease?.();
     releaseDirectStream?.();
     clearTimeout(connectionTimer);
     res.off('close', abortUpstream);
@@ -1505,6 +1522,13 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     }
   }
 
+  const providerRules = normalizePlaylistRules(source.rules);
+  if (providerRules.maxConcurrentStreams.enabled) {
+    const activeForSource = [...mediaJobs.values()].filter(job => job?.persistent && job.sourceId === String(source._id) && !job.finished).length + directStreamLimiter.countForSource(source._id);
+    if (activeForSource >= providerRules.maxConcurrentStreams.limit) throw new MediaCapacityError(`Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+  }
+  playlistRuleRuntime.checkStreamStart(source);
+
   const inputUrl = await sourceProviderUrl(source, kind, id, extension);
   // VOD decisions come from the actual streams and the requesting player's
   // reported capability. The bounded probe cache/in-flight map prevents two
@@ -1526,6 +1550,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
   }, async () => {
+    let releaseProviderLease;
+    if (providerRules.maxConcurrentStreams.enabled) {
+      releaseProviderLease = await acquireProviderStreamLease(source._id, providerRules.maxConcurrentStreams.limit);
+      if (!releaseProviderLease) throw new MediaCapacityError(`Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+    }
+    try {
     const directory = path.join(rokuHlsRoot, key);
     await fs.mkdir(directory, { recursive: true });
     const manifest = path.join(directory, 'master.m3u8');
@@ -1548,7 +1578,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const child = spawn('ffmpeg', args, { stdio: ['ignore', 'ignore', 'pipe'] });
     const created = {
       directory, manifest, child, inputUrl, error: '',
-      stop: async () => { await terminateChild(child); await fs.rm(directory, { recursive: true, force: true }); },
+      stop: async () => { await terminateChild(child); await fs.rm(directory, { recursive: true, force: true }); await releaseProviderLease?.(); },
     };
     child.stderr.on('data', chunk => {
       created.error = appendTail(created.error, chunk);
@@ -1563,6 +1593,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const ffmpegStartedAt = Date.now();
     child.on('close', code => {
       created.finished = true;
+      releaseProviderLease?.().catch(() => {});
       const registered = mediaJobs.get(key);
       if (registered) registered.finished = true;
       const safeError = created.error.replaceAll(inputUrl, '[provider URL]');
@@ -1578,6 +1609,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       }
     });
     return created;
+    } catch (error) {
+      await releaseProviderLease?.();
+      throw error;
+    }
   });
   return job;
 }

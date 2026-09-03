@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { MongoClient } from 'mongodb';
+import { defaultPlaylistRules, normalizePlaylistRules } from './playlist-rules.js';
 
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'rh_stream';
@@ -33,6 +34,7 @@ export function publicXtreamSource(source) {
     archivedItems: Array.isArray(source.archivedItems) ? source.archivedItems : [],
     selectedCount: Array.isArray(source.enabledKeys) ? source.enabledKeys.length : 0,
     archivedCount: Array.isArray(source.archivedKeys) ? source.archivedKeys.length : 0,
+    rules: normalizePlaylistRules(source.rules),
     updatedAt: source.updatedAt,
   };
 }
@@ -54,7 +56,7 @@ export async function getAllXtreamSources(ownerId) {
 export async function createXtreamSource({ name, type = 'xtream', baseUrl, username = '', password = '', ownerId }) {
   const source = {
     _id: randomUUID(), name, type, baseUrl, username, password, ownerId,
-    enabledKeys: [], enabledItems: [], archivedKeys: [], archivedItems: [], createdAt: new Date(), updatedAt: new Date(),
+    rules: defaultPlaylistRules(), enabledKeys: [], enabledItems: [], archivedKeys: [], archivedItems: [], createdAt: new Date(), updatedAt: new Date(),
   };
   await (await sourceCollection()).insertOne(source);
   return publicXtreamSource(source);

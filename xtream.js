@@ -1,4 +1,7 @@
+import { PlaylistRuleRuntime } from './playlist-rules.js';
+
 const cache = new Map();
+const playlistRuleRuntime = new PlaylistRuleRuntime();
 const cacheTtl = 5 * 60 * 1000;
 const cacheMaxEntries = 6;
 const inFlight = new Map();
@@ -33,6 +36,7 @@ async function request(source, params, transform = value => value) {
   if (inFlight.has(key)) return inFlight.get(key);
   if (inFlight.size >= maxInFlight) throw new Error('Xtream provider request capacity is full');
   const pending = (async () => {
+    playlistRuleRuntime.checkApiRequest(source);
     const response = await fetch(apiUrl(source, params), { signal: AbortSignal.timeout(25_000) });
     if (!response.ok) throw new Error(`Xtream server returned HTTP ${response.status}`);
     const data = transform(await response.json());
