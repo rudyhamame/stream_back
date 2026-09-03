@@ -108,6 +108,8 @@ export async function createDeviceSession(deviceId, frontendUrl, deviceToken = '
   const pairUrl = pairUrlObject.toString();
   // Camera apps hand this Android intent URL to RH when it is installed. If
   // it is not installed, Chrome opens the existing web pairing page instead.
+  // Keep the browser pairing page as the fallback when the Android intent is
+  // not installed or cannot be opened by the scanning camera app.
   const appPairUrl = `intent://pair?pair=${encodeURIComponent(session.code)}#Intent;scheme=rhstream;package=com.rhstream.library;S.browser_fallback_url=${encodeURIComponent(pairUrl)};end`;
   return {
     code: session.code, deviceId: session.deviceId, expiresAt: session.expiresAt,

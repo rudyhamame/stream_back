@@ -736,7 +736,7 @@ app.get('/api/roku/search', async (req, res) => {
   try {
     const kind = String(req.query.kind || '');
     const query = String(req.query.q || '').trim().toLocaleLowerCase();
-    if ((kind !== 'series' && kind !== 'movie') || !query) return res.status(400).json({ error: 'kind and q are required' });
+    if (!['series', 'movie', 'channel'].includes(kind) || !query) return res.status(400).json({ error: 'kind and q are required' });
     const matches = (await getRokuSelectedItems(kind, requestOwner(req)))
       .filter(item => item.title.toLocaleLowerCase().includes(query))
       .slice(0, 60);
@@ -752,6 +752,7 @@ app.get('/api/roku/search', async (req, res) => {
         contentKind: 'series-search',
       })) });
     }
+    if (kind === 'channel') return res.json({ items: buildXtreamChannelsPayload(matches) });
     const items = matches.map(item => ({
       ...directXtreamItem(item),
       thumbnail: item.logo,
