@@ -13,6 +13,8 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/xtream/hls/source-1/movie/42/master.m3u8',
     '/api/xtream/hls/source-1/series/episode-3/segment-000001.ts',
     '/api/xtream/hls/source-1/channel/42/resource/0123456789abcdef01234567',
+    '/api/xtream/sorry-busy/master.m3u8',
+    '/api/xtream/sorry-busy/segment-000001.ts',
   ];
   for (const path of allowed) assert.equal(isStreamingRoute('GET', path), true, path);
 });

@@ -13,8 +13,9 @@ import { createXtreamSource, deleteXtreamSource, getAllXtreamSources, getXtreamS
 import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
 import { getProviderCatalogItems, getProviderCatalogMeta, replaceProviderCatalog } from './provider-catalog-store.js';
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
-import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
+import { MediaCapacityError, MediaJobManager, ProviderLineBusyError, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
+import { ensureSorryBusyStream, sorryBusyDirectory } from './sorry-busy-stream.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
 import { applyQualityCeiling, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
@@ -23,7 +24,7 @@ import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
-import { normalizePlaylistRules, PlaylistRuleRuntime } from './playlist-rules.js';
+import { normalizePlaylistRules, providerLineIdentity, PlaylistRuleRuntime } from './playlist-rules.js';
 import { acquireProviderStreamLease } from './provider-stream-leases.js';
 
 const app = express();
@@ -784,6 +785,10 @@ app.get('/internal/active-streams', (req, res) => {
 
 app.use('/api/xtream', (req, res, next) => {
   if (req.path === '/logo') return next();
+  // The "someone else is streaming" clip carries no provider content or
+  // per-user data, so it is exempt the same way /logo is - the manifest route
+  // redirects here with no streamTicket/deviceToken of its own to forward.
+  if (req.path.startsWith('/sorry-busy/')) return next();
   const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|resource\/[a-f0-9]{24})$/);
   if (hls && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
   const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
@@ -1481,10 +1486,14 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
     if (req.params.kind === 'channel') return res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
     const strategy = choosePlaybackStrategy({ purpose: 'direct-proxy', extension: req.query.ext });
     if (strategy !== PlaybackStrategy.DIRECT) throw new Error('Direct media strategy unavailable');
-    releaseDirectStream = directStreamLimiter.acquire(source._id, rules.maxConcurrentStreams.enabled ? rules.maxConcurrentStreams.limit : undefined);
+    const capacityKey = rules.strictSharedLine.enabled ? providerLineIdentity(source) : String(source._id);
+    releaseDirectStream = directStreamLimiter.acquire(capacityKey, rules.maxConcurrentStreams.enabled ? rules.maxConcurrentStreams.limit : undefined);
     if (rules.maxConcurrentStreams.enabled) {
-      releaseProviderLease = await acquireProviderStreamLease(source._id, rules.maxConcurrentStreams.limit);
-      if (!releaseProviderLease) throw new MediaCapacityError(`Provider rule: maximum ${rules.maxConcurrentStreams.limit} simultaneous stream${rules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+      releaseProviderLease = await acquireProviderStreamLease(capacityKey, rules.maxConcurrentStreams.limit);
+      if (!releaseProviderLease) {
+        const message = `Provider rule: maximum ${rules.maxConcurrentStreams.limit} simultaneous stream${rules.maxConcurrentStreams.limit === 1 ? '' : 's'}`;
+        throw rules.strictSharedLine.enabled ? new ProviderLineBusyError(message) : new MediaCapacityError(message);
+      }
     }
     const headers = {};
     if (req.headers.range) headers.range = req.headers.range;
@@ -1660,9 +1669,18 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   }
 
   const providerRules = normalizePlaylistRules(source.rules);
+  // strictSharedLine groups this check (and the lease below) by the actual
+  // provider line (host+account) instead of this one source document, so two
+  // different app users who each saved the same line as their own source
+  // still only ever get the one connection the provider actually allows -
+  // across every client (Roku, web, Android all share this route).
+  const capacityKey = providerRules.strictSharedLine.enabled ? providerLineIdentity(source) : String(source._id);
   if (providerRules.maxConcurrentStreams.enabled) {
-    const activeForSource = [...mediaJobs.values()].filter(job => job?.persistent && job.sourceId === String(source._id) && !job.finished).length + directStreamLimiter.countForSource(source._id);
-    if (activeForSource >= providerRules.maxConcurrentStreams.limit) throw new MediaCapacityError(`Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+    const activeForSource = [...mediaJobs.values()].filter(job => job?.persistent && job.capacityKey === capacityKey && !job.finished).length + directStreamLimiter.countForSource(capacityKey);
+    if (activeForSource >= providerRules.maxConcurrentStreams.limit) {
+      const message = `Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`;
+      throw providerRules.strictSharedLine.enabled ? new ProviderLineBusyError(message) : new MediaCapacityError(message);
+    }
   }
   playlistRuleRuntime.checkStreamStart(source);
 
@@ -1694,14 +1712,17 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
-    persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
+    persistent: true, sourceId: String(source._id), capacityKey, mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
     clientIp: identity.clientIp, client: identity.client,
   }, async () => {
     let releaseProviderLease;
     if (providerRules.maxConcurrentStreams.enabled) {
-      releaseProviderLease = await acquireProviderStreamLease(source._id, providerRules.maxConcurrentStreams.limit);
-      if (!releaseProviderLease) throw new MediaCapacityError(`Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`);
+      releaseProviderLease = await acquireProviderStreamLease(capacityKey, providerRules.maxConcurrentStreams.limit);
+      if (!releaseProviderLease) {
+        const message = `Provider rule: maximum ${providerRules.maxConcurrentStreams.limit} simultaneous stream${providerRules.maxConcurrentStreams.limit === 1 ? '' : 's'}`;
+        throw providerRules.strictSharedLine.enabled ? new ProviderLineBusyError(message) : new MediaCapacityError(message);
+      }
     }
     try {
     const directory = path.join(rokuHlsRoot, key);
@@ -1780,6 +1801,30 @@ setInterval(async () => {
   await Promise.allSettled([...mediaJobs.values()].filter(job => job.persistent).map(enforceHlsFileBound));
   } finally { mediaHousekeepingRunning = false; }
 }, 5_000).unref();
+
+app.get('/api/xtream/sorry-busy/master.m3u8', async (req, res) => {
+  try {
+    await ensureSorryBusyStream();
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(await fs.readFile(path.join(sorryBusyDirectory(), 'master.m3u8'), 'utf8'));
+  } catch (error) {
+    console.warn(`[Media HLS] sorry-busy manifest failed: ${error.message}`);
+    res.sendStatus(502);
+  }
+});
+
+app.get('/api/xtream/sorry-busy/:segment', async (req, res) => {
+  try {
+    if (!/^segment-\d{6}\.ts$/.test(req.params.segment)) return res.sendStatus(404);
+    await ensureSorryBusyStream();
+    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Cache-Control', 'no-store');
+    res.sendFile(path.join(sorryBusyDirectory(), req.params.segment));
+  } catch {
+    res.sendStatus(404);
+  }
+});
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
   const manifestRequestStartedAt = Date.now();
@@ -1870,7 +1915,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
-    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: error.message });
+    if (res.headersSent || res.destroyed) return;
+    // A strictSharedLine refusal is a normal, expected "someone else already
+    // has the one connection" outcome, not a server error - redirect the
+    // player straight to the short "sorry" clip instead of a JSON body, so
+    // every client (Roku, web, Android all request this same manifest route)
+    // visibly plays something rather than failing.
+    if (error.sorryVideo) return res.redirect(302, '/api/xtream/sorry-busy/master.m3u8');
+    if (!capacityResponse(res, error)) res.status(502).json({ error: error.message });
   }
 });
 

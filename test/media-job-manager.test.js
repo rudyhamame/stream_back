@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MediaCapacityError, MediaJobManager } from '../media-job-manager.js';
+import { MediaCapacityError, MediaJobManager, ProviderLineBusyError } from '../media-job-manager.js';
 
 const limits = {
   maxTranscodes: 1,
@@ -112,4 +112,14 @@ test('hard memory pressure rejects all new FFmpeg jobs', async () => {
     manager.getOrCreate({ key: 'blocked', mode: 'remux' }, async () => ({ stop() {} })),
     /memory pressure/i,
   );
+});
+
+test('a strictSharedLine refusal is a distinguishable, marked MediaCapacityError', () => {
+  const error = new ProviderLineBusyError('Provider rule: maximum 1 simultaneous stream');
+  assert.ok(error instanceof MediaCapacityError);
+  assert.equal(error.sorryVideo, true);
+  assert.equal(error.statusCode, 503);
+  // A generic capacity error (server overload) must not accidentally trigger
+  // the "sorry" video redirect - only the explicitly-marked subclass does.
+  assert.equal(new MediaCapacityError('busy').sorryVideo, undefined);
 });

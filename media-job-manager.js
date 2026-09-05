@@ -9,6 +9,19 @@ export class MediaCapacityError extends Error {
   }
 }
 
+// A strictSharedLine provider refusal (see playlist-rules.js) is a normal,
+// expected outcome - someone else is already on the one connection this line
+// allows - not a server overload. The manifest route recognizes this marker
+// and hands the player a short "someone else is streaming" clip instead of a
+// JSON error, so it visibly plays something rather than failing silently.
+export class ProviderLineBusyError extends MediaCapacityError {
+  constructor(message, retryAfterSeconds = 10) {
+    super(message, retryAfterSeconds);
+    this.name = 'ProviderLineBusyError';
+    this.sorryVideo = true;
+  }
+}
+
 const positiveInt = (value, fallback) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;

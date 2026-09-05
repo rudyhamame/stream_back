@@ -14,6 +14,10 @@ const STREAMING_PATH_PATTERNS = [
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/master\.m3u8$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/segment-\d{6}\.ts$/,
   /^\/api\/xtream\/hls\/[^/]+\/channel\/[^/]+\/resource\/[a-f0-9]{24}$/,
+  // The "someone else is streaming" clip served in place of a strictSharedLine
+  // refusal - a static, provider-agnostic asset, not tied to any source/id.
+  /^\/api\/xtream\/sorry-busy\/master\.m3u8$/,
+  /^\/api\/xtream\/sorry-busy\/segment-\d{6}\.ts$/,
 ];
 
 export function isStreamingRoute(method, pathname) {
