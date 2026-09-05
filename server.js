@@ -26,6 +26,7 @@ import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, c
 import { enforceStreamingOnly } from './streaming-route-policy.js';
 import { normalizePlaylistRules, providerLineIdentity, PlaylistRuleRuntime } from './playlist-rules.js';
 import { acquireProviderStreamLease } from './provider-stream-leases.js';
+import { getWwpSession, reconcileWwpSession, waitForWwpSession } from './wwp-sessions.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -141,6 +142,12 @@ function mediaIdentity(req) {
     viewerId: String(session?.deviceId || session?.ownerId || ticket?.ownerId || req.ip || 'anonymous'),
     clientIp: clientAddress(req),
     client: String(req.query.client || ''),
+    wwpSessionId: String(req.query.wwpSessionId || ''),
+    // The raw quality rung (e.g. "1080"), not the derived capabilityKey below -
+    // this is what a Watch with Partner peer needs to set its own quality
+    // selector to, so it must stay in the human-meaningful shape the client
+    // itself sent, not the opaque per-target key used for job routing.
+    wwpQuality: String(req.query.quality || ''),
   };
 }
 
@@ -781,6 +788,27 @@ app.get('/internal/active-streams', (req, res) => {
   for (const pid of procCpuCache.keys()) if (!livePids.has(pid)) procCpuCache.delete(pid);
   res.set('Cache-Control', 'no-store');
   res.json({ port, count: streams.length, streams });
+});
+
+// Watch with Partner: whichever side has an open device session (host) or a
+// valid stream ticket for this exact title (partner) can long-poll here to
+// learn when the OTHER side seeks/changes quality, and follow. The ticket
+// itself (only ever handed to the host and the one invited partner) is the
+// authorization - it is what proves this caller was actually invited.
+app.get('/api/xtream/wwp-sync/:sessionId', async (req, res) => {
+  try {
+    const wwpSession = getWwpSession(req.params.sessionId);
+    if (!wwpSession) return res.status(404).json({ error: 'Watch with Partner session not found or expired' });
+    const ownerId = requestOwner(req)
+      || resolveStreamTicket(req.query.streamTicket, wwpSession.sourceId, wwpSession.kind, wwpSession.id)?.ownerId
+      || null;
+    if (!ownerId) return res.status(401).json({ error: 'Not authorized for this session' });
+    const since = Number.parseInt(String(req.query.since || '0'), 10) || 0;
+    const updated = await waitForWwpSession(req.params.sessionId, since);
+    if (!updated) return res.status(404).json({ error: 'Watch with Partner session not found or expired' });
+    res.set('Cache-Control', 'no-store');
+    res.json({ revision: updated.revision, sourceId: updated.sourceId, kind: updated.kind, id: updated.id, extension: updated.extension, start: updated.start, quality: updated.quality });
+  } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
 app.use('/api/xtream', (req, res, next) => {
@@ -1630,12 +1658,27 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // sharing one job exactly as before (empty capabilityKey).
   const capabilityKey = (seekableVod || target.maxHeight) ? String(target.key || target.client || PlaybackClient.BROWSER) : '';
   const key = rokuHlsKey(source._id, kind, id, extension, startSeconds, capabilityKey);
+
+  // Watch with Partner: whoever acts (host or partner) moves both to the
+  // same position/quality. The usual "replace my own prior job" teardown
+  // below is gated on samePlaybackViewer, which is false across two
+  // different accounts - so a partner-initiated seek needs its own check
+  // here, keyed purely by the shared wwpSessionId, to make sure only one
+  // provider connection is ever alive for this pair.
+  if (identity.wwpSessionId) {
+    const wwpSession = getWwpSession(identity.wwpSessionId);
+    if (wwpSession && wwpSession.key && wwpSession.key !== key && mediaJobs.get(wwpSession.key)) {
+      await mediaJobs.remove(wwpSession.key, 'replaced-partner-seek');
+    }
+  }
+
   const existing = mediaJobs.get(key);
   if (existing) {
     if (existing.finished || existing.child?.exitCode !== null) {
       await mediaJobs.remove(key, 'restart-failed');
     } else {
     mediaJobs.touch(existing, identity.viewerId);
+    reconcileWwpSession(identity.wwpSessionId, { key, sourceId: String(source._id), kind, id: String(id), extension: String(extension || ''), start: startSeconds, quality: identity.wwpQuality, ownerId: identity.userId });
     return existing;
     }
   }
@@ -1783,6 +1826,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       throw error;
     }
   });
+  reconcileWwpSession(identity.wwpSessionId, { key, sourceId: String(source._id), kind, id: String(id), extension: String(extension || ''), start: startSeconds, quality: identity.wwpQuality, ownerId: identity.userId });
   return job;
 }
 

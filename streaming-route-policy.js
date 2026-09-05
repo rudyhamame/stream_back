@@ -18,6 +18,10 @@ const STREAMING_PATH_PATTERNS = [
   // refusal - a static, provider-agnostic asset, not tied to any source/id.
   /^\/api\/xtream\/sorry-busy\/master\.m3u8$/,
   /^\/api\/xtream\/sorry-busy\/segment-\d{6}\.ts$/,
+  // Watch with Partner: long-poll for the other participant's seek/quality
+  // change. Read-only, scoped to one session id, authorized inside the route
+  // itself (device session or stream ticket) - no account/library surface.
+  /^\/api\/xtream\/wwp-sync\/[^/]+$/,
 ];
 
 export function isStreamingRoute(method, pathname) {
