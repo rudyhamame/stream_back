@@ -91,6 +91,17 @@ function resolveStreamTicket(token, sourceId, kind, id) {
   } catch { return null; }
 }
 
+// Android's ExoPlayer attaches auth as a global HTTP header (DefaultHttpDataSource
+// .setDefaultRequestProperties) applied to every request it makes for a media
+// item, manifest and segments alike - a header survives onto segment fetches
+// where a query param on the manifest URL alone would not (ExoPlayer's HLS
+// extractor resolves relative segment URLs from the manifest without
+// repeating its query string). A Watch with Partner partner has no device
+// token, so this header is how their segment requests authenticate.
+function requestStreamTicket(req) {
+  return String(req.query.streamTicket || req.get('x-stream-ticket') || '');
+}
+
 const sourceType = source => source?.type === 'm3u' ? 'm3u' : 'xtream';
 const getSourceCatalog = (source, kind) => sourceType(source) === 'm3u' ? getM3uCatalog(source, kind) : getXtreamCatalog(source, kind);
 const getSourceCategories = (source, kind) => sourceType(source) === 'm3u' ? getM3uCategories(source, kind) : getXtreamCategories(source, kind);
@@ -135,7 +146,7 @@ function clientAddress(req) {
 function mediaIdentity(req) {
   const token = String(req.get('x-device-token') || req.query.deviceToken || '');
   const session = resolveDeviceToken(token);
-  const ticket = resolveStreamTicket(req.query.streamTicket, req.params.sourceId, req.params.kind, req.params.id);
+  const ticket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
   return {
     userId: String(session?.ownerId || ticket?.ownerId || ''),
     deviceId: String(session?.deviceId || ''),
@@ -371,7 +382,7 @@ function requestOwner(req) {
 }
 
 function mediaOwner(req) {
-  return requestOwner(req) || resolveStreamTicket(req.query.streamTicket, req.params.sourceId, req.params.kind, req.params.id)?.ownerId || null;
+  return requestOwner(req) || resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id)?.ownerId || null;
 }
 
 function requestAccount(req) {
@@ -800,7 +811,7 @@ app.get('/api/xtream/wwp-sync/:sessionId', async (req, res) => {
     const wwpSession = getWwpSession(req.params.sessionId);
     if (!wwpSession) return res.status(404).json({ error: 'Watch with Partner session not found or expired' });
     const ownerId = requestOwner(req)
-      || resolveStreamTicket(req.query.streamTicket, wwpSession.sourceId, wwpSession.kind, wwpSession.id)?.ownerId
+      || resolveStreamTicket(requestStreamTicket(req), wwpSession.sourceId, wwpSession.kind, wwpSession.id)?.ownerId
       || null;
     if (!ownerId) return res.status(401).json({ error: 'Not authorized for this session' });
     const since = Number.parseInt(String(req.query.since || '0'), 10) || 0;
@@ -818,9 +829,9 @@ app.use('/api/xtream', (req, res, next) => {
   // redirects here with no streamTicket/deviceToken of its own to forward.
   if (req.path.startsWith('/sorry-busy/')) return next();
   const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|resource\/[a-f0-9]{24})$/);
-  if (hls && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
+  if (hls && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
   const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
-  if (direct && resolveStreamTicket(req.query.streamTicket, decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
+  if (direct && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
   if (!requestOwner(req)) {
     if (req.path.startsWith('/hls/')) {
       console.warn(`[Media HLS] authorization rejected path=${req.path} token=${req.query.deviceToken ? 'present-invalid' : 'missing'}`);
