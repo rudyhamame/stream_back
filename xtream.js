@@ -6,6 +6,11 @@ const cacheTtl = 5 * 60 * 1000;
 const cacheMaxEntries = 6;
 const inFlight = new Map();
 const maxInFlight = Math.max(4, Number.parseInt(process.env.XTREAM_MAX_IN_FLIGHT || '12', 10) || 12);
+// Bulk catalog lists (get_vod_streams/get_series/get_live_streams) scale with
+// provider size, not a fixed budget — some providers return well past
+// 50MB/200k rows, which can take over a minute to download. The 25s default
+// below stays tight so a dead provider fails fast on everything else.
+const catalogTimeoutMs = Math.max(25_000, Math.min(120_000, Number.parseInt(process.env.XTREAM_CATALOG_TIMEOUT_MS || '120000', 10) || 120_000));
 
 export function evictXtreamCache(now = Date.now(), aggressive = false) {
   for (const [key, entry] of cache) if (entry.expires <= now) cache.delete(key);
@@ -23,7 +28,7 @@ function apiUrl(source, params = {}) {
   return url;
 }
 
-async function request(source, params, transform = value => value) {
+async function request(source, params, transform = value => value, options = {}) {
   const key = `${source._id}:${JSON.stringify(params)}`;
   const now = Date.now();
   evictXtreamCache(now);
@@ -37,7 +42,8 @@ async function request(source, params, transform = value => value) {
   if (inFlight.size >= maxInFlight) throw new Error('Xtream provider request capacity is full');
   const pending = (async () => {
     playlistRuleRuntime.checkApiRequest(source);
-    const response = await fetch(apiUrl(source, params), { signal: AbortSignal.timeout(25_000) });
+    const timeoutMs = Math.max(2_000, Math.min(120_000, Number(options.timeoutMs) || 25_000));
+    const response = await fetch(apiUrl(source, params), { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`Xtream server returned HTTP ${response.status}`);
     const data = transform(await response.json());
     if (cacheable) {
@@ -90,7 +96,7 @@ export async function getXtreamCatalog(source, kind) {
       rating: String(row.rating || ''),
       added: String(row.added || row.last_modified || ''),
     };
-  }));
+  }), { timeoutMs: catalogTimeoutMs });
 }
 
 export async function getXtreamMovieInfo(source, movieId) {

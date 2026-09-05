@@ -1,11 +1,11 @@
 # RH Streamer backend
 
-Dedicated media data plane shared by two isolated Render deployments:
+Dedicated media data plane run as two isolated local processes:
 
-- `rh-stream-backend-tbm7.onrender.com` serves the Library frontend.
-- `rh-stream-backend.onrender.com` serves Roku devices.
+- port `8788` serves the Library/Android frontend.
+- port `8789` serves Roku devices.
 
-Each deployment runs its own FFmpeg jobs, capacity limits, HLS files, and
+Each process runs its own FFmpeg jobs, capacity limits, HLS files, and
 provider connections. Its public surface is
 deny-by-default and accepts only read-only health, direct playback, and HLS
 delivery requests. Account, device, catalog, category, favorites, weather, and
@@ -47,7 +47,8 @@ MEDIA_TEST_PLAYBACK_PATH='/api/xtream/hls/.../master.m3u8' \
 npm run test:media-leak
 ```
 
-## Render
+## Self-hosted deployment
 
-The repository includes `render.yaml` and a Dockerfile. Configure
-`MONGODB_URI` as a Render secret. Never commit `.env` or provider credentials.
+This service runs on the local machine only, managed by the systemd units in
+`../deploy/`. Set `MONGODB_URI`, `DEVICE_AUTH_SECRET`, and `PUBLIC_BASE_URL` in
+`.env`. Never commit `.env` or provider credentials.

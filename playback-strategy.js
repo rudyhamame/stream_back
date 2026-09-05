@@ -147,13 +147,23 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
   return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: detail };
 }
 
+// Approximate H.264 ceilings per rung — capped VBR (CRF floor + -maxrate) so a
+// clean scene stays sharp but a busy one cannot blow past the viewer's pipe.
+export const QUALITY_RUNGS = Object.freeze({ 1080: 5000, 720: 2800, 480: 1400, 360: 800 });
+
 export function hlsCodecArgs(decision) {
+  const maxHeight = Number(decision.maxHeight) || 0;
+  const rungKbps = QUALITY_RUNGS[maxHeight] || 0;
+  const qualityArgs = decision.videoMode === 'copy' || maxHeight <= 0
+    ? []
+    : ['-vf', `scale=-2:${maxHeight}`, ...(rungKbps ? ['-maxrate', `${rungKbps}k`, '-bufsize', `${rungKbps * 2}k`] : [])];
   const args = decision.videoMode === 'copy'
     ? ['-c:v', 'copy']
     : [
       '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
       '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '4.0',
       '-force_key_frames', 'expr:gte(t,n_forced*2)',
+      ...qualityArgs,
     ];
   args.push(...(decision.audioMode === 'copy'
     ? ['-c:a', 'copy']
@@ -161,15 +171,27 @@ export function hlsCodecArgs(decision) {
   return args;
 }
 
+// Force a downscale transcode when the viewer picked a rung below the source
+// height. A source already at or under the rung keeps its native (often copy)
+// strategy — no point burning CPU to re-encode it larger or same-size.
+export function applyQualityCeiling(decision, maxHeight, sourceHeight = 0) {
+  const ceiling = Number(maxHeight) || 0;
+  if (ceiling <= 0) return decision;
+  if (sourceHeight > 0 && sourceHeight <= ceiling + 16) return decision;
+  const strategy = decision.audioMode === 'transcode' ? HlsStrategy.FULL_TRANSCODE : HlsStrategy.PARTIAL_TRANSCODE;
+  return { ...decision, videoMode: 'transcode', maxHeight: ceiling, strategy, reason: `${decision.reason}; capped to ${ceiling}p` };
+}
+
 export function fallbackHlsStrategy(decision) {
+  const maxHeight = Number(decision.maxHeight) || 0;
   if (decision.videoMode === 'copy' && decision.audioMode === 'copy') {
     return {
-      videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: 2,
+      videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: 2, maxHeight,
       strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: 'Bounded fallback after copy/copy muxing failure',
     };
   }
   return {
-    videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: 2,
+    videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: 2, maxHeight,
     strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Bounded compatibility fallback after partial strategy failure',
   };
 }
@@ -182,10 +204,24 @@ export function hlsPlaylistProfile() {
   return { segmentSeconds: 2, initialSegmentSeconds: 0, listSize: 30, startupSegments: 1 };
 }
 
-export function hlsInputArgs() {
-  // Render's FFmpeg build supports -readrate but not the newer
-  // -readrate_initial_burst option. Keep playback paced without passing an
-  // unsupported argument that makes every HLS job exit before startup.
+export function hlsInputArgs(live = false, vodInitialBurstSeconds = 0) {
+  if (live) {
+    // A live source is already realtime-paced by the provider, so -readrate
+    // only delays the first segment. Cap input analysis so ffmpeg starts
+    // muxing in ~1s instead of ffprobe's multi-second default — this is the
+    // bulk of the Roku "stuck at 13%" wait for live channels.
+    return ['-fflags', 'nobuffer+genpts', '-analyzeduration', '1000000', '-probesize', '1000000'];
+  }
+  // VOD must stay paced (-readrate 1); otherwise ffmpeg races to the end of the
+  // movie and the rolling window deletes segments the viewer has not reached.
+  // The optional initial burst reads the opening seconds at full speed so the
+  // first segment lands in ~1s instead of waiting a real GOP under pacing —
+  // this is what makes web playback start quickly. -readrate_initial_burst
+  // needs a modern FFmpeg (Render's build lacks it), so it is opt-in via
+  // HLS_VOD_INITIAL_BURST_SECONDS and left at 0 everywhere it is unset.
+  if (vodInitialBurstSeconds > 0) {
+    return ['-readrate', '1', '-readrate_initial_burst', String(vodInitialBurstSeconds)];
+  }
   return ['-readrate', '1'];
 }
 

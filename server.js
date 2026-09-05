@@ -5,18 +5,19 @@ import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
 import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
-import { promises as fs } from 'node:fs';
+import { promises as fs, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { shapeArabicForRoku } from './arabic-shaper.js';
 import { createXtreamSource, deleteXtreamSource, getAllXtreamSources, getXtreamSource, getXtreamSources, publicXtreamSource, updateXtreamSelection, updateXtreamSource } from './xtream-store.js';
 import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
+import { getProviderCatalogItems, getProviderCatalogMeta, replaceProviderCatalog } from './provider-catalog-store.js';
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer } from './media-session-policy.js';
-import { HlsStrategy, PlaybackClient, PlaybackStrategy, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { applyQualityCeiling, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsInputArgs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -46,7 +47,7 @@ const rokuMoviePageLimit = 10;
 const rokuChannelPageLimit = Math.min(50, Math.max(10, Number.parseInt(process.env.ROKU_CHANNEL_PAGE_LIMIT || '20', 10)));
 const xtreamItemsInFlight = new Map();
 const rokuHlsRoot = path.join(os.tmpdir(), 'rh-stream-hls');
-const frontendUrl = process.env.FRONTEND_URL || 'https://rh-stream-frontend.onrender.com';
+const frontendUrl = process.env.FRONTEND_URL || 'http://127.0.0.1:8787';
 const mediaLimits = defaultMediaLimits();
 const debugMediaLogging = String(process.env.DEBUG_MEDIA_LOGGING || 'false').toLowerCase() === 'true';
 const mediaJobs = new MediaJobManager({ limits: mediaLimits, debug: debugMediaLogging });
@@ -55,6 +56,10 @@ const previewCacheMaxEntries = Math.max(2, Number.parseInt(process.env.PREVIEW_C
 const previewCacheMaxBytes = Math.max(2, Number.parseInt(process.env.PREVIEW_CACHE_MAX_MB || '12', 10) || 12) * 1024 * 1024;
 const previewCacheTtlMs = Math.max(60_000, Number.parseInt(process.env.PREVIEW_CACHE_TTL_MS || '3600000', 10) || 3_600_000);
 const mediaStreamIdleTimeoutMs = Math.max(10_000, Number.parseInt(process.env.MEDIA_STREAM_IDLE_TIMEOUT_MS || '45000', 10) || 45_000);
+// Full-speed read of the opening seconds of a VOD so the first HLS segment is
+// written in ~1s rather than waiting a real GOP under -readrate pacing. Needs a
+// modern FFmpeg (-readrate_initial_burst); keep 0 on builds that lack it.
+const hlsVodInitialBurstSeconds = Math.max(0, Number.parseInt(process.env.HLS_VOD_INITIAL_BURST_SECONDS || '0', 10) || 0);
 const codecProbeTtlMs = Math.max(60_000, Number.parseInt(process.env.CODEC_PROBE_TTL_MS || '21600000', 10) || 21_600_000);
 const codecProbeMaxEntries = Math.max(16, Number.parseInt(process.env.CODEC_PROBE_MAX_ENTRIES || '256', 10) || 256);
 const maxCodecProbes = Math.max(1, Number.parseInt(process.env.MAX_CODEC_PROBES || '2', 10) || 2);
@@ -89,6 +94,42 @@ const getSourceCatalog = (source, kind) => sourceType(source) === 'm3u' ? getM3u
 const getSourceCategories = (source, kind) => sourceType(source) === 'm3u' ? getM3uCategories(source, kind) : getXtreamCategories(source, kind);
 const sourceProviderUrl = (source, kind, id, extension = '') => sourceType(source) === 'm3u' ? m3uProviderUrl(source, kind, id) : xtreamProviderUrl(source, kind, id, extension);
 
+// MongoDB snapshot of each provider/kind item list, shared with the Library
+// backend's own copy of provider-catalog-store.js (same database, same
+// collections). Roku's catalog-browse endpoints used to download a
+// provider's entire item list live on every single request — for a provider
+// with hundreds of thousands of VOD entries that is tens of seconds to
+// minutes, repeated on every page turn. A kind is now downloaded from the
+// provider at most once per TTL window; the stored snapshot serves every
+// request in between (and keeps serving it if the provider errors).
+const CATALOG_SNAPSHOT_TTL_MS = Math.max(5 * 60_000, Number.parseInt(process.env.CATALOG_SNAPSHOT_TTL_MS || '2700000', 10) || 45 * 60_000);
+const catalogSnapshotJobs = new Map();
+
+function refreshCatalogSnapshot(ownerId, source, kind) {
+  const key = `${ownerId}:${source._id}:${kind}`;
+  if (catalogSnapshotJobs.has(key)) return catalogSnapshotJobs.get(key);
+  const job = getSourceCatalog(source, kind)
+    .then(catalog => replaceProviderCatalog(ownerId, String(source._id), source.name, kind, catalog))
+    .catch(error => console.warn(`[Catalog] snapshot refresh failed source=${source._id} kind=${kind}: ${error.message}`))
+    .finally(() => catalogSnapshotJobs.delete(key));
+  catalogSnapshotJobs.set(key, job);
+  return job;
+}
+
+// Block only on a first-ever fetch. A stale snapshot is served immediately
+// while a single background refresh runs; a provider block never clears it.
+async function ensureCatalogSnapshot(ownerId, source, kind) {
+  const meta = await getProviderCatalogMeta(ownerId, String(source._id)).catch(() => null);
+  const syncedAt = meta?.kinds?.[kind]?.syncedAt ? new Date(meta.kinds[kind].syncedAt).getTime() : 0;
+  if (!syncedAt) { await refreshCatalogSnapshot(ownerId, source, kind); return; }
+  if (Date.now() - syncedAt > CATALOG_SNAPSHOT_TTL_MS) void refreshCatalogSnapshot(ownerId, source, kind);
+}
+
+function clientAddress(req) {
+  const forwarded = String(req.get('x-forwarded-for') || '').split(',')[0].trim();
+  return (forwarded || req.ip || '').replace(/^::ffff:/, '');
+}
+
 function mediaIdentity(req) {
   const token = String(req.get('x-device-token') || req.query.deviceToken || '');
   const session = resolveDeviceToken(token);
@@ -97,6 +138,8 @@ function mediaIdentity(req) {
     userId: String(session?.ownerId || ticket?.ownerId || ''),
     deviceId: String(session?.deviceId || ''),
     viewerId: String(session?.deviceId || session?.ownerId || ticket?.ownerId || req.ip || 'anonymous'),
+    clientIp: clientAddress(req),
+    client: String(req.query.client || ''),
   };
 }
 
@@ -171,11 +214,18 @@ function playbackTarget(req) {
         ? PlaybackClient.ANDROID
         : PlaybackClient.BROWSER;
   const reported = String(req.query.caps || '').split(',').map(value => value.trim()).filter(Boolean).sort();
+  // Manual quality rung (YouTube-style). "auto"/absent keeps the native
+  // strategy; a numeric rung forces a downscale transcode and forks its own
+  // ffmpeg job so switching quality does not disturb other viewers.
+  const maxHeight = Object.hasOwn(QUALITY_RUNGS, String(req.query.quality || '').trim())
+    ? Number(String(req.query.quality).trim())
+    : 0;
   return {
     client,
     reported,
+    maxHeight,
     capabilities: getPlaybackCapabilities(client, reported),
-    key: `${client}:${reported.join(',')}`,
+    key: `${client}:${reported.join(',')}${maxHeight ? `:h${maxHeight}` : ''}`,
   };
 }
 
@@ -195,6 +245,18 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
     })
     .catch(error => {
       console.warn(`[Media probe] ${cacheKey} unavailable: ${error.message}`);
+      // A hard provider refusal (expired line / no VOD / IP block) will fail
+      // ffmpeg the same way - surface it so the caller can stop fast instead
+      // of burning the whole startup window on transcode retries. Cache it
+      // briefly so a Roku that re-polls the manifest every few seconds does
+      // not hammer an already-refusing provider.
+      if (/\b(403|404|401)\b|forbidden|access denied|not found/i.test(String(error.message || ''))) {
+        const metadata = { providerUnavailable: true, providerError: String(error.message || '').slice(0, 160) };
+        codecProbeCache.delete(cacheKey);
+        codecProbeCache.set(cacheKey, { metadata, expiresAt: Date.now() + 60_000 });
+        evictCodecProbeCache();
+        return metadata;
+      }
       return {};
     });
   codecProbesInFlight.set(cacheKey, pending);
@@ -384,7 +446,9 @@ async function getAllXtreamItems(kind) {
     const sources = await getAllXtreamSources();
     const groups = await Promise.all(sources.map(async source => {
       try {
-        const [catalog, categories] = await Promise.all([getSourceCatalog(source, kind), getSourceCategories(source, kind)]);
+        const ownerId = String(source.ownerId || '');
+        await ensureCatalogSnapshot(ownerId, source, kind);
+        const [catalog, categories] = await Promise.all([getProviderCatalogItems(ownerId, String(source._id), kind), getSourceCategories(source, kind)]);
         const categoryNames = new Map(categories.map(category => [category.id, category.name]));
         return catalog.map(item => {
           const category = categoryNames.get(item.categoryId) || source.name || 'Other';
@@ -566,7 +630,7 @@ app.post('/api/roku/heartbeat', async (req, res) => {
   try {
     const session = resolveDeviceToken(String(req.get('x-device-token') || req.query.deviceToken || ''));
     if (!session?.deviceId) return res.status(401).json({ error: 'Valid Roku device authorization is required' });
-    await recordDeviceHeartbeat(session.deviceId);
+    await recordDeviceHeartbeat(session.deviceId, req.body?.streaming === true, clientAddress(req));
     res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -652,6 +716,70 @@ app.get('/internal/media-health', async (req, res) => {
   if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
   res.set('Cache-Control', 'no-store');
   res.json(await mediaHealthSnapshot());
+});
+
+function loopbackRequest(req) {
+  const ip = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
+  return ip === '127.0.0.1' || ip === '::1';
+}
+
+// Per-pid CPU% (jiffies delta between polls) and RSS from /proc.
+const procCpuCache = new Map();
+const USER_HZ = 100;
+function procStats(pid) {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const fields = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+    const jiffies = Number(fields[11]) + Number(fields[12]); // utime + stime
+    const nowNs = process.hrtime.bigint();
+    const prev = procCpuCache.get(pid);
+    procCpuCache.set(pid, { jiffies, at: nowNs });
+    let cpuPercent = null;
+    if (prev) {
+      const seconds = Number(nowNs - prev.at) / 1e9;
+      if (seconds > 0.2) cpuPercent = Math.max(0, Math.round(((jiffies - prev.jiffies) / USER_HZ) / seconds * 100));
+    }
+    let rssMB = null;
+    const rss = readFileSync(`/proc/${pid}/status`, 'utf8').match(/VmRSS:\s+(\d+)\s+kB/);
+    if (rss) rssMB = Math.round(Number(rss[1]) / 1024 * 10) / 10;
+    return { cpuPercent, rssMB };
+  } catch { return null; }
+}
+
+app.get('/internal/active-streams', (req, res) => {
+  if (!loopbackRequest(req)) return res.sendStatus(404);
+  const port = Number(process.env.PORT) || null;
+  const streams = [];
+  const livePids = new Set();
+  for (const [key, job] of mediaJobs.entries()) {
+    if (job.finished) continue;
+    const pid = job.child?.pid || null;
+    if (pid) livePids.add(pid);
+    const proc = pid ? procStats(pid) : null;
+    streams.push({
+      port, key,
+      deviceId: job.deviceId || '',
+      userId: job.userId || '',
+      viewerId: job.viewerId || '',
+      clientIp: job.clientIp || '',
+      client: job.client || '',
+      sourceId: job.sourceId || '',
+      kind: job.kind || '',
+      itemId: job.mediaId || '',
+      mode: job.mode || (job.persistent ? 'hls' : 'direct'),
+      strategy: job.hlsStrategy || job.mode || '',
+      persistent: job.persistent === true,
+      viewers: job.viewers ? job.viewers.size : 0,
+      startedAt: job.createdAt ? new Date(job.createdAt).toISOString() : null,
+      lastAccessAt: job.lastAccessAt ? new Date(job.lastAccessAt).toISOString() : null,
+      pid,
+      cpuPercent: proc?.cpuPercent ?? null,
+      rssMB: proc?.rssMB ?? null,
+    });
+  }
+  for (const pid of procCpuCache.keys()) if (!livePids.has(pid)) procCpuCache.delete(pid);
+  res.set('Cache-Control', 'no-store');
+  res.json({ port, count: streams.length, streams });
 });
 
 app.use('/api/xtream', (req, res, next) => {
@@ -1140,12 +1268,14 @@ app.delete('/api/xtream/sources/:id', async (req, res) => {
 
 app.get('/api/xtream/catalog', async (req, res) => {
   try {
-    const source = await getXtreamSource(String(req.query.sourceId || ''), requestOwner(req));
+    const ownerId = requestOwner(req);
+    const source = await getXtreamSource(String(req.query.sourceId || ''), ownerId);
     if (!source) return res.status(404).json({ error: 'Xtream source not found' });
     const aliases = { live: 'channel', channel: 'channel', movie: 'movie', vod: 'movie', series: 'series' };
     const kind = aliases[String(req.query.kind || '')];
     if (!kind) return res.status(400).json({ error: 'kind must be channel, movie, or series' });
-    const [allItems, categories] = await Promise.all([getSourceCatalog(source, kind), getSourceCategories(source, kind)]);
+    await ensureCatalogSnapshot(ownerId, source, kind);
+    const [allItems, categories] = await Promise.all([getProviderCatalogItems(ownerId, String(source._id), kind), getSourceCategories(source, kind)]);
     const enabled = new Set(source.enabledKeys || []);
     const query = String(req.query.q || '').trim().toLocaleLowerCase();
     const category = String(req.query.category || 'all');
@@ -1181,8 +1311,10 @@ async function resolveXtreamEnabledItems(source, enabledKeys) {
     const allowed = enabledKeys.map(String).filter(key => /^(channel|movie|series):[^:]+$/.test(key));
     const allowedSet = new Set(allowed);
     const kinds = [...new Set(allowed.map(key => key.split(':', 1)[0]))];
+    const ownerId = String(source.ownerId || '');
+    await Promise.all(kinds.map(kind => ensureCatalogSnapshot(ownerId, source, kind)));
     const [catalogs, categoryGroups] = await Promise.all([
-      Promise.all(kinds.map(kind => getSourceCatalog(source, kind))),
+      Promise.all(kinds.map(kind => getProviderCatalogItems(ownerId, String(source._id), kind))),
       Promise.all(kinds.map(kind => getSourceCategories(source, kind))),
     ]);
     const categoryNamesByKind = new Map(kinds.map((kind, index) => [
@@ -1483,7 +1615,11 @@ async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0
 async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null) {
   const seekableVod = kind === 'movie' || kind === 'series';
   const startSeconds = seekableVod ? hlsStartSeconds(requestedStart) : 0;
-  const capabilityKey = seekableVod ? String(target.key || target.client || PlaybackClient.BROWSER) : '';
+  // A manual quality rung forks its own job even for a live channel (folding
+  // target.key in), so one viewer picking 480p never disturbs another
+  // viewer's Auto stream of the same channel. Auto-only channel viewers keep
+  // sharing one job exactly as before (empty capabilityKey).
+  const capabilityKey = (seekableVod || target.maxHeight) ? String(target.key || target.client || PlaybackClient.BROWSER) : '';
   const key = rokuHlsKey(source._id, kind, id, extension, startSeconds, capabilityKey);
   const existing = mediaJobs.get(key);
   if (existing) {
@@ -1537,10 +1673,20 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const metadata = seekableVod
     ? await providerCodecMetadata(`${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`, inputUrl)
     : {};
+  if (metadata.providerUnavailable) {
+    const error = new Error(`Playlist provider refused this title (${metadata.providerError || 'access denied'})`);
+    error.statusCode = 502;
+    error.providerUnavailable = true;
+    throw error;
+  }
   const capabilities = target.capabilities || getPlaybackCapabilities(target.client);
-  const decision = strategyOverride || (seekableVod
+  const baseDecision = strategyOverride || (seekableVod
     ? determineHlsStrategy(metadata, capabilities)
     : determineHlsStrategy({ videoCodec: 'h264', audioCodec: 'aac' }, getPlaybackCapabilities(PlaybackClient.ROKU)));
+  // No codec probe for live (avoids extra provider connections), so
+  // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
+  // rung in that case, which is exactly what a live "pick 480p" should do.
+  const decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
@@ -1550,6 +1696,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
     persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
+    clientIp: identity.clientIp, client: identity.client,
   }, async () => {
     let releaseProviderLease;
     if (providerRules.maxConcurrentStreams.enabled) {
@@ -1568,7 +1715,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // freeze the first short manifest, while EVENT retains an unbounded history.
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
-                  ...hlsInputArgs(), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
+                  ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
     '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision), '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
@@ -1654,8 +1801,11 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${fastPreview}`);
     if (req.params.kind === 'channel') {
       const existingNativeSession = nativeHlsSession(req, identity);
-      if (nativeHlsDisabled && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
-      if (!nativeHlsDisabled && (fastPreview || existingNativeSession)) {
+      if ((nativeHlsDisabled || target.maxHeight) && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
+      // A manual quality rung means transcode-to-that-height; the native
+      // passthrough just relays the provider's own manifest unmodified, so it
+      // can never honor a rung and must be skipped in favor of the ffmpeg path.
+      if (!nativeHlsDisabled && !target.maxHeight && (fastPreview || existingNativeSession)) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
           const upstreamUrl = session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
@@ -1781,7 +1931,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const target = playbackTarget(req);
-    const capabilityKey = seekableVod ? target.key : '';
+    const capabilityKey = (seekableVod || target.maxHeight) ? target.key : '';
     const key = rokuHlsKey(req.params.sourceId, req.params.kind, req.params.id, req.query.ext, startSeconds, capabilityKey);
     const job = mediaJobs.get(key);
     if (!job) {

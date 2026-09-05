@@ -219,14 +219,18 @@ export async function getLinkedDevices(accountId) {
   }));
 }
 
-export async function recordDeviceHeartbeat(deviceId) {
+export async function recordDeviceHeartbeat(deviceId, streaming = false, clientIp = '') {
   const normalized = String(deviceId || '').trim();
   if (!normalized) return;
   const now = Date.now();
   if (now - (heartbeatCache.get(normalized) || 0) < heartbeatIntervalMs) return;
   heartbeatCache.set(normalized, now);
   try {
-    await (await profiles()).updateOne({ deviceId: normalized }, { $set: { lastSeenAt: new Date(now) } });
+    const ip = String(clientIp || '').replace(/^::ffff:/, '').trim();
+    const update = { $set: { lastSeenAt: new Date(now) } };
+    if (ip) update.$set.lastClientIp = ip;
+    if (streaming) update.$set.lastStreamingSeenAt = new Date(now);
+    await (await profiles()).updateOne({ deviceId: normalized }, update);
   } catch {
     heartbeatCache.delete(normalized);
   }

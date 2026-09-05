@@ -20,6 +20,8 @@ export function hlsChildRequestQuery(query = {}, startSeconds = 0) {
   if (client) params.set('client', client);
   const capabilities = String(query.caps || '').trim();
   if (capabilities) params.set('caps', capabilities);
+  const quality = String(query.quality || '').trim();
+  if (quality) params.set('quality', quality);
   if (startSeconds > 0) params.set('start', String(startSeconds));
   return params;
 }
