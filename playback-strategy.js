@@ -1,3 +1,5 @@
+import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
+
 export const HlsStrategy = Object.freeze({
   REMUX: 'HLS_REMUX',
   PARTIAL_TRANSCODE: 'HLS_PARTIAL_TRANSCODE',
@@ -128,9 +130,31 @@ function audioCompatibility(metadata, capabilities) {
   return { compatible: true, reason: `${codec.toUpperCase()} stream is target-compatible`, outputChannels: channels || 2 };
 }
 
+export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybackCapabilities(PlaybackClient.ROKU), container = '') {
+  const ext = String(container || metadata.container || '').replace(/^\./, '').trim().toLowerCase();
+  if (!['mp4', 'm4v', 'mov', 'mkv'].includes(ext)) {
+    return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for Roku direct playback` };
+  }
+  const required = [
+    ['video codec', metadata.videoCodec], ['video profile', metadata.videoProfile],
+    ['video level', metadata.videoLevel], ['pixel format', metadata.pixelFormat],
+    ['width', metadata.width], ['height', metadata.height], ['frame rate', metadata.frameRate],
+    ['audio codec', metadata.audioCodec], ['audio channels', metadata.audioChannels],
+    ['audio sample rate', metadata.audioSampleRate],
+  ];
+  const missing = required.filter(([, value]) => value === undefined || value === null || value === '' || Number(value) === 0).map(([name]) => name);
+  if (missing.length) return { compatible: false, reason: `direct-play facts unavailable: ${missing.join(', ')}` };
+  const video = videoCompatibility(metadata, capabilities);
+  if (!video.compatible) return { compatible: false, reason: video.reason };
+  const audio = audioCompatibility(metadata, capabilities);
+  if (!audio.compatible) return { compatible: false, reason: audio.reason };
+  return { compatible: true, reason: 'roku-compatible-source' };
+}
+
 export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlaybackCapabilities()) {
   const video = videoCompatibility(sourceMetadata, capabilities);
   const audio = audioCompatibility(sourceMetadata, capabilities);
+  return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: 'full-transcode-only policy' };
   const videoCompatible = video.compatible;
   const audioCompatible = audio.compatible;
   const detail = `${video.reason}; ${audio.reason}`;
@@ -151,23 +175,48 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
 // clean scene stays sharp but a busy one cannot blow past the viewer's pipe.
 export const QUALITY_RUNGS = Object.freeze({ 1080: 5000, 720: 2800, 480: 1400, 360: 800 });
 
-export function hlsCodecArgs(decision) {
+// CPU-only invariant: never attach a hardware device or enable hardware decode.
+export function hlsHwDeviceArgs({ enabled = false } = {}) {
+  if (!enabled) return [];
+  return ['-vaapi_device', process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'];
+}
+
+export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
   const maxHeight = Number(decision.maxHeight) || 0;
   const rungKbps = QUALITY_RUNGS[maxHeight] || 0;
-  const qualityArgs = decision.videoMode === 'copy' || maxHeight <= 0
-    ? []
-    : ['-vf', `scale=-2:${maxHeight}`, ...(rungKbps ? ['-maxrate', `${rungKbps}k`, '-bufsize', `${rungKbps * 2}k`] : [])];
-  const args = decision.videoMode === 'copy'
-    ? ['-c:v', 'copy']
-    : [
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-      '-pix_fmt', 'yuv420p', '-profile:v', 'main', '-level', '4.0',
-      '-force_key_frames', 'expr:gte(t,n_forced*2)',
-      ...qualityArgs,
+  // Diagnostic Roku VOD transcodes use a fixed two-second keyframe cadence.
+  // Keep the expression as one argv element; server.js spawns FFmpeg without
+  // a shell, so no shell quoting or escaping is needed here.
+  const keyFrames = 'expr:gte(t,n_forced*2)';
+  // Cap against the input height in FFmpeg itself so a 480p source is never
+  // enlarged merely because the viewer selected 1080p.
+  const scaleTo = maxHeight > 0 ? `min(ih\\,${maxHeight})` : null;
+  const rateArgs = rungKbps ? ['-maxrate', `${rungKbps}k`, '-bufsize', `${rungKbps * 2}k`] : [];
+  let args;
+  if (decision.videoMode === 'copy') {
+    args = ['-c:v', 'copy'];
+  } else if (hardware) {
+    const videoFilter = scaleTo ? `scale=-2:${scaleTo},format=nv12,hwupload` : 'format=nv12,hwupload';
+    args = [
+      '-c:v', 'h264_vaapi', '-qp', '20',
+      '-profile:v', 'high', '-level', '4.1',
+      '-flags', '+cgop',
+      '-force_key_frames', keyFrames,
+      '-vf', videoFilter,
     ];
+  } else {
+    args = [
+      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20',
+      '-pix_fmt', 'yuv420p', '-profile:v', 'high', '-level', '4.1',
+      '-flags', '+cgop',
+      '-force_key_frames', keyFrames,
+      ...(fastStart ? ['-tune', 'zerolatency'] : []),
+      ...(scaleTo ? ['-vf', `scale=-2:${scaleTo}`, ...rateArgs] : []),
+    ];
+  }
   args.push(...(decision.audioMode === 'copy'
     ? ['-c:a', 'copy']
-    : ['-c:a', 'aac', '-b:a', '128k', '-ar', '48000', '-ac', String(Math.max(1, Number(decision.outputAudioChannels) || 2))]));
+    : ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2']));
   return args;
 }
 
@@ -200,17 +249,44 @@ export function strategyUsesEncoding(decision) {
   return decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
 }
 
-export function hlsPlaylistProfile() {
-  return { segmentSeconds: 2, initialSegmentSeconds: 0, listSize: 30, startupSegments: 1 };
+export function hlsPlaylistProfile({ fastStart = false, preview = false } = {}) {
+  // listSize * segmentSeconds is how many seconds of already-produced segments
+  // stay on disk. Roku can briefly keep an older manifest while it recovers
+  // from a stall; a short 90-second window then deletes the segment it asks
+  // for and causes another restart/back-jump. Keep six minutes by default so
+  // recovery requests remain available. Env-tunable for disk-constrained hosts.
+  const listSize = Math.min(600, Math.max(12, Number.parseInt(process.env.HLS_VOD_LIST_SIZE || '', 10) || 180));
+  // Do not hand Roku the manifest at the first segment. A rolling HLS job can
+  // briefly pause while the provider or encoder catches up; three completed
+  // segments give the decoder a real cushion before consumption begins.
+  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview ? 1 : 3 };
 }
 
-export function hlsInputArgs(live = false, vodInitialBurstSeconds = 0) {
+export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', strategy = '' } = {}) {
+  if (!seekableVod || client !== PlaybackClient.ROKU) return 15_000;
+  // A Roku copy/remux that cannot close its first GOP quickly needs the
+  // keyframe-controlled transcode fallback. Once that fallback is already in
+  // use, however, keep the original request open long enough for providers
+  // whose first read takes more than eight seconds. Returning a premature 504
+  // makes Roku park at 13% while it tears down and re-polls the same job.
+  // A deep seek lands stream-copy further from its next keyframe than a
+  // fresh-start playback does, so closing that first GOP can genuinely take
+  // longer than 8s on some sources - falling back to full transcode there is
+  // strictly worse (a real decode+encode start, ~20-25s, versus just letting
+  // copy finish). 16s gives copy real room before paying that much bigger cost.
+  return strategy === HlsStrategy.FULL_TRANSCODE ? 30_000 : 16_000;
+}
+
+// Many Xtream/IPTV providers serve live-channel HLS segments as bare,
+// extensionless token URLs. hlsExtensionAllowlistArgs() (imported above) is the
+// version-aware opt-out - the flag set differs between ffmpeg 6.1.x and 7.0+.
+export function hlsInputArgs(live = false, vodInitialBurstSeconds = 0, vodReadrate = 1) {
   if (live) {
     // A live source is already realtime-paced by the provider, so -readrate
     // only delays the first segment. Cap input analysis so ffmpeg starts
     // muxing in ~1s instead of ffprobe's multi-second default — this is the
     // bulk of the Roku "stuck at 13%" wait for live channels.
-    return ['-fflags', 'nobuffer+genpts', '-analyzeduration', '1000000', '-probesize', '1000000'];
+    return [...hlsExtensionAllowlistArgs(), '-fflags', 'nobuffer+genpts', '-analyzeduration', '1000000', '-probesize', '1000000'];
   }
   // VOD must stay paced (-readrate 1); otherwise ffmpeg races to the end of the
   // movie and the rolling window deletes segments the viewer has not reached.
@@ -219,14 +295,22 @@ export function hlsInputArgs(live = false, vodInitialBurstSeconds = 0) {
   // this is what makes web playback start quickly. -readrate_initial_burst
   // needs a modern FFmpeg (Render's build lacks it), so it is opt-in via
   // HLS_VOD_INITIAL_BURST_SECONDS and left at 0 everywhere it is unset.
+  // readrate > 1 lets ffmpeg transcode ahead of playback, so a real
+  // buffered-ahead window builds up on the client scrubber. The rolling
+  // window (HLS_VOD_LIST_SIZE) caps how far ahead it can get before
+  // delete_segments prunes.
+  // ponytail: a long client pause with readrate high enough that the window
+  // slides past the pause point will need a job restart on resume - the
+  // existing restartPlaybackAt path already handles a missing segment.
+  const rate = Number.isFinite(vodReadrate) && vodReadrate > 1 ? String(vodReadrate) : '1';
   if (vodInitialBurstSeconds > 0) {
-    return ['-readrate', '1', '-readrate_initial_burst', String(vodInitialBurstSeconds)];
+    return ['-readrate', rate, '-readrate_initial_burst', String(vodInitialBurstSeconds)];
   }
-  return ['-readrate', '1'];
+  return ['-readrate', rate];
 }
 
-export function hlsMuxerFlags() {
-  return 'independent_segments+temp_file+delete_segments';
+export function hlsMuxerFlags({ deleteSegments = true } = {}) {
+  return `independent_segments+temp_file${deleteSegments ? '+delete_segments' : ''}`;
 }
 
 export function choosePlaybackStrategy({ purpose } = {}) {

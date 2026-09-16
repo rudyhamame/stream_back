@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { MongoClient } from 'mongodb';
-import { defaultPlaylistRules, normalizePlaylistRules } from './playlist-rules.js';
 
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'rh_stream';
@@ -20,21 +19,34 @@ async function sourceCollection() {
   return collectionPromise;
 }
 
-export function publicXtreamSource(source) {
+const selectionFields = ['enabledKeys', 'enabledItems', 'archivedKeys', 'archivedItems'];
+
+export function selectionFor(source, ownerId, accountOwner) {
+  const selection = ownerId && accountOwner && String(ownerId) !== String(accountOwner)
+    ? source?.selections?.[String(ownerId)]
+    : source;
+  return Object.fromEntries(selectionFields.map(field => [field, Array.isArray(selection?.[field]) ? selection[field] : []]));
+}
+
+export function flattenSelection(sources, ownerId, accountOwner) {
+  return (sources || []).map(source => ({ ...source, ...selectionFor(source, ownerId, accountOwner) }));
+}
+
+export function publicXtreamSource(source, ownerId, accountOwner) {
   if (!source) return null;
+  const selected = selectionFor(source, ownerId, accountOwner);
   return {
     id: source._id,
     name: source.name,
     type: source.type || 'xtream',
     endpoint: source.baseUrl,
     hasCredentials: Boolean(source.username && source.password),
-    enabledKeys: Array.isArray(source.enabledKeys) ? source.enabledKeys : [],
-    enabledItems: Array.isArray(source.enabledItems) ? source.enabledItems : [],
-    archivedKeys: Array.isArray(source.archivedKeys) ? source.archivedKeys : [],
-    archivedItems: Array.isArray(source.archivedItems) ? source.archivedItems : [],
-    selectedCount: Array.isArray(source.enabledKeys) ? source.enabledKeys.length : 0,
-    archivedCount: Array.isArray(source.archivedKeys) ? source.archivedKeys.length : 0,
-    rules: normalizePlaylistRules(source.rules),
+    enabledKeys: selected.enabledKeys,
+    enabledItems: selected.enabledItems,
+    archivedKeys: selected.archivedKeys,
+    archivedItems: selected.archivedItems,
+    selectedCount: selected.enabledKeys.length,
+    archivedCount: selected.archivedKeys.length,
     updatedAt: source.updatedAt,
   };
 }
@@ -56,7 +68,7 @@ export async function getAllXtreamSources(ownerId) {
 export async function createXtreamSource({ name, type = 'xtream', baseUrl, username = '', password = '', ownerId }) {
   const source = {
     _id: randomUUID(), name, type, baseUrl, username, password, ownerId,
-    rules: defaultPlaylistRules(), enabledKeys: [], enabledItems: [], archivedKeys: [], archivedItems: [], createdAt: new Date(), updatedAt: new Date(),
+    enabledKeys: [], enabledItems: [], archivedKeys: [], archivedItems: [], createdAt: new Date(), updatedAt: new Date(),
   };
   await (await sourceCollection()).insertOne(source);
   return publicXtreamSource(source);
@@ -71,11 +83,18 @@ export async function updateXtreamSource(id, changes, ownerId) {
   return publicXtreamSource(result?.value || result);
 }
 
-export async function updateXtreamSelection(id, enabledKeys, enabledItems = [], ownerId) {
-  return updateXtreamSource(id, {
-    enabledKeys: [...new Set(enabledKeys.map(String))],
-    enabledItems,
-  }, ownerId);
+export async function updateXtreamSelection(id, selection, accountOwner, profileOwner = accountOwner) {
+  if (profileOwner && String(profileOwner) !== String(accountOwner) && !/^[a-f0-9]{64}$/i.test(String(profileOwner))) return null;
+  const fields = Object.fromEntries(selectionFields.map(field => [field, Array.isArray(selection?.[field]) ? selection[field] : []]));
+  const ownerPath = String(profileOwner || accountOwner) === String(accountOwner)
+    ? fields
+    : Object.fromEntries(selectionFields.map(field => [`selections.${String(profileOwner)}.${field}`, fields[field]]));
+  const result = await (await sourceCollection()).findOneAndUpdate(
+    { _id: id, ...(accountOwner ? { ownerId: accountOwner } : {}) },
+    { $set: { ...ownerPath, updatedAt: new Date() } },
+    { returnDocument: 'after' },
+  );
+  return publicXtreamSource(result?.value || result, profileOwner, accountOwner);
 }
 
 export async function deleteXtreamSource(id, ownerId) {

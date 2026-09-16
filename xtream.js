@@ -1,7 +1,4 @@
-import { PlaylistRuleRuntime } from './playlist-rules.js';
-
 const cache = new Map();
-const playlistRuleRuntime = new PlaylistRuleRuntime();
 const cacheTtl = 5 * 60 * 1000;
 const cacheMaxEntries = 6;
 const inFlight = new Map();
@@ -41,7 +38,6 @@ async function request(source, params, transform = value => value, options = {})
   if (inFlight.has(key)) return inFlight.get(key);
   if (inFlight.size >= maxInFlight) throw new Error('Xtream provider request capacity is full');
   const pending = (async () => {
-    playlistRuleRuntime.checkApiRequest(source);
     const timeoutMs = Math.max(2_000, Math.min(120_000, Number(options.timeoutMs) || 25_000));
     const response = await fetch(apiUrl(source, params), { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`Xtream server returned HTTP ${response.status}`);
@@ -101,8 +97,18 @@ export async function getXtreamCatalog(source, kind) {
 
 export async function getXtreamMovieInfo(source, movieId) {
   const data = await request(source, { action: 'get_vod_info', vod_id: movieId });
-  const seconds = Number(data?.info?.duration_secs || data?.movie_data?.duration_secs || 0);
   let duration = String(data?.info?.duration || data?.movie_data?.duration || '');
+  const parts = duration.trim().split(':').map(Number);
+  let parsed = parts.length === 3 ? parts[0] * 3600 + parts[1] * 60 + parts[2]
+    : parts.length === 2 ? parts[0] * 60 + parts[1] : Number(duration) || 0;
+  if (parts.length === 1 && parsed > 0 && parsed < 240) parsed *= 60;
+  // Some panels mislabel `duration_secs` - it holds MINUTES (e.g. "122" for a
+  // 2h film). Trust a valid duration value even when duration_secs is close;
+  // a shortened seconds field otherwise cuts the visible end off the movie.
+  const rawSecs = Number(data?.info?.duration_secs || data?.movie_data?.duration_secs || 0) || 0;
+  let seconds;
+  if (parsed > 0) seconds = parsed;
+  else seconds = rawSecs > 0 && rawSecs < 240 ? rawSecs * 60 : rawSecs;
   if (!duration && seconds > 0) {
     const hours = Math.floor(seconds / 3600);
     const minutes = Math.floor((seconds % 3600) / 60);
@@ -112,9 +118,16 @@ export async function getXtreamMovieInfo(source, movieId) {
   return { duration, seconds };
 }
 
+// Adult/18+ category names are dropped so they never appear as a browsable
+// folder - Play Store policy: this is a general streaming app, not one whose
+// purpose is adult material.
+const ADULT_CATEGORY_RE = /adult|\bxxx\b|(?:^|\D)18\s*\+|\+\s*18|\bporn|erotic|\bsex\b|hentai|onlyfans|للكبار|للبالغين|إباح/i;
+
 export async function getXtreamCategories(source, kind) {
   const action = kind === 'channel' ? 'get_live_categories' : kind === 'movie' ? 'get_vod_categories' : 'get_series_categories';
-  return request(source, { action }, rows => (Array.isArray(rows) ? rows : []).map(row => ({ id: stringId(row.category_id), name: String(row.category_name || 'Other') })));
+  return request(source, { action }, rows => (Array.isArray(rows) ? rows : [])
+    .map(row => ({ id: stringId(row.category_id), name: String(row.category_name || 'Other') }))
+    .filter(category => !ADULT_CATEGORY_RE.test(category.name)));
 }
 
 export async function getXtreamSeriesEpisodes(source, seriesId) {
@@ -124,7 +137,7 @@ export async function getXtreamSeriesEpisodes(source, seriesId) {
   for (const [seasonNumber, rows] of Object.entries(data?.episodes || {})) {
     for (const row of Array.isArray(rows) ? rows : []) {
       episodes.push({
-        id: stringId(row.id),
+        id: stringId(row.id ?? row.episode_id ?? row.stream_id),
         title: String(row.title || `Episode ${row.episode_num || episodes.length + 1}`),
         episodeNumber: Number(row.episode_num) || episodes.length + 1,
         seasonNumber: Number(seasonNumber) || 1,

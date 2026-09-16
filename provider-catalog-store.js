@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { MongoClient } from 'mongodb';
+import { arabicSearchRegexSource } from './arabic-search.js';
 
 // MongoDB-backed snapshot of a provider's catalog. It exists to keep provider
 // traffic low: a category is downloaded from the provider at most once per TTL
@@ -166,7 +167,10 @@ export async function queryProviderCatalogItems(ownerId, sourceId, kind, { q = '
   const { items } = await collections();
   const filter = { ownerId: String(ownerId), sourceId: String(sourceId), kind };
   const term = String(q || '').trim();
-  if (term) filter.title = { $regex: term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+  if (term) {
+    const source = arabicSearchRegexSource(term) || term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    filter.title = { $regex: source, $options: 'i' };
+  }
   const boundedLimit = Math.max(1, Math.min(200, Number(limit) || 50));
   const boundedPage = Math.max(1, Number(page) || 1);
   const total = await items.countDocuments(filter);

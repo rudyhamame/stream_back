@@ -103,10 +103,18 @@ export async function getM3uCatalog(source, kind) {
   return kind === 'channel' ? loadM3u(source) : [];
 }
 
+// Adult/18+ category names are dropped so they never appear as a browsable
+// folder - Play Store policy: this is a general streaming app, not one whose
+// purpose is adult material.
+const ADULT_CATEGORY_RE = /adult|\bxxx\b|(?:^|\D)18\s*\+|\+\s*18|\bporn|erotic|\bsex\b|hentai|onlyfans|للكبار|للبالغين|إباح/i;
+
 export async function getM3uCategories(source, kind) {
   if (kind !== 'channel') return [];
   const items = await loadM3u(source);
-  return [...new Set(items.map(item => item.category))].sort().map(name => ({ id: name, name }));
+  return [...new Set(items.map(item => item.category))]
+    .filter(name => !ADULT_CATEGORY_RE.test(name))
+    .sort()
+    .map(name => ({ id: name, name }));
 }
 
 export async function m3uProviderUrl(source, kind, id) {

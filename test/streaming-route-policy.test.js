@@ -7,14 +7,15 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/health',
     '/api/live',
     '/api/roku/auth-health?deviceToken=redacted',
+    '/api/roku/internet-health?deviceToken=redacted',
+    '/api/roku/playback-decision/source-1/movie/42?deviceToken=redacted&ext=mkv&client=roku',
     '/api/playback/preview?sourceId=source-1&kind=channel&id=42',
+    '/api/playback/preview?sourceId=source-1&kind=movie&id=42&at=120',
     '/internal/media-health',
     '/api/xtream/play/source-1/channel/42',
     '/api/xtream/hls/source-1/movie/42/master.m3u8',
     '/api/xtream/hls/source-1/series/episode-3/segment-000001.ts',
     '/api/xtream/hls/source-1/channel/42/resource/0123456789abcdef01234567',
-    '/api/xtream/sorry-busy/master.m3u8',
-    '/api/xtream/sorry-busy/segment-000001.ts',
   ];
   for (const path of allowed) assert.equal(isStreamingRoute('GET', path), true, path);
 });
@@ -45,6 +46,14 @@ test('blocks mutations even when the path resembles streaming', () => {
   assert.equal(isStreamingRoute('POST', '/api/xtream/play/source/channel/42'), false);
   assert.equal(isStreamingRoute('PUT', '/api/xtream/hls/source/movie/42/master.m3u8'), false);
   assert.equal(isStreamingRoute('DELETE', '/api/health'), false);
+});
+
+test('allows only the Android handoff POST under /internal/streams', () => {
+  assert.equal(isStreamingRoute('POST', '/internal/streams/stop'), false);
+  assert.equal(isStreamingRoute('POST', '/internal/streams/android-handoff'), true);
+  assert.equal(isStreamingRoute('GET', '/internal/streams/stop'), false);
+  assert.equal(isStreamingRoute('GET', '/internal/streams/android-handoff'), false);
+  assert.equal(isStreamingRoute('POST', '/internal/streams/stop/extra'), false);
 });
 
 test('rejects prefix and traversal lookalikes', () => {

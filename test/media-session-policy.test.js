@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer } from '../media-session-policy.js';
+import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey, samePlaybackViewer, scopedPlaybackViewerId } from '../media-session-policy.js';
 
 test('HLS identity includes source, item, extension, and seek offset', () => {
   const base = hlsSessionKey('source', 'movie', '42', 'mp4', 0);
@@ -18,17 +18,40 @@ test('HLS child requests preserve every value used by authentication and session
     ext: 'm3u8',
     client: 'roku',
     caps: 'hevc-main,eac3',
+    quality: '720',
+    hlsFallback: ' FULL ',
+    playbackAttemptId: '6',
+    sessionId: 'roku-device-123-4',
+    playbackClientId: 'phone-123',
   }, 90);
   assert.equal(params.get('deviceToken'), 'roku token');
   assert.equal(params.get('streamTicket'), 'ticket/value');
   assert.equal(params.get('ext'), 'm3u8');
   assert.equal(params.get('client'), 'roku');
   assert.equal(params.get('caps'), 'hevc-main,eac3');
+  assert.equal(params.get('quality'), '720');
+  assert.equal(params.get('hlsFallback'), 'full');
+  assert.equal(params.get('playbackAttemptId'), '6');
+  assert.equal(params.get('sessionId'), 'roku-device-123-4');
+  assert.equal(params.get('playbackClientId'), 'phone-123');
   assert.equal(params.get('start'), '90');
   assert.equal(
     hlsSessionKey('source', 'movie', '42', params.get('ext'), Number(params.get('start'))),
     hlsSessionKey('source', 'movie', '42', 'm3u8', 90),
   );
+});
+
+test('HLS child requests preserve explicit diagnostic modes and reject unknown identities', () => {
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'remux' }).get('hlsFallback'), 'remux');
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'audio' }).get('hlsFallback'), 'audio');
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'video' }).get('hlsFallback'), 'video');
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'mystery' }).has('hlsFallback'), false);
+});
+
+test('Android playback identity is isolated from the account and Roku viewers', () => {
+  assert.equal(scopedPlaybackViewerId('account-1', 'android', 'phone-123'), 'account-1:android:phone-123');
+  assert.equal(scopedPlaybackViewerId('roku-1', 'roku', 'phone-123'), 'roku-1');
+  assert.equal(scopedPlaybackViewerId('account-1', 'android', '../bad value'), 'account-1');
 });
 
 test('replacement is scoped to the requesting device or anonymous viewer', () => {

@@ -4,12 +4,26 @@ import { MongoClient } from 'mongodb';
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'rh_stream';
 const collectionName = process.env.MONGODB_PROVIDER_LEASE_COLLECTION || 'provider_stream_leases';
-const leaseTtlMs = 30_000;
+// 15s TTL, renewed every 5s (3 tries per window survives a transient Mongo
+// blip). A crashed holder's slot frees within 15s instead of 30 - the wedge
+// that leaves Roku stuck at 13% when the browser/Android streamer dies mid-
+// stream. Live playback is never at risk: the heartbeat outpaces expiry.
+const leaseTtlMs = 15_000;
+const holderId = randomUUID();
 let collectionPromise;
 
 async function leaseCollection() {
   if (!collectionPromise) collectionPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 }).connect().then(client => client.db(databaseName).collection(collectionName)).catch(error => { collectionPromise = undefined; throw error; });
   return collectionPromise;
+}
+
+// The provider connection cap is per real line = baseUrl + username, not per
+// stored source row. Two RH accounts that added the same credential must share
+// one lease; keying by source._id let each of them hold a slot independently.
+export function providerLeaseKey(source) {
+  const base = String(source?.baseUrl || '').replace(/\/+$/, '').toLowerCase();
+  const user = String(source?.username || '').toLowerCase();
+  return base && user ? `${base}|${user}` : String(source?._id || '');
 }
 
 export async function acquireProviderStreamLease(sourceId, limit) {
@@ -23,7 +37,7 @@ export async function acquireProviderStreamLease(sourceId, limit) {
     try {
       const result = await collection.findOneAndUpdate(
         { _id: id, $or: [{ expiresAt: { $lte: now } }, { token }] },
-        { $set: { sourceId: sourceKey, slot, token, expiresAt: new Date(now.getTime() + leaseTtlMs), updatedAt: now } },
+        { $set: { sourceId: sourceKey, slot, token, holderId, expiresAt: new Date(now.getTime() + leaseTtlMs), updatedAt: now } },
         { upsert: true, returnDocument: 'after' },
       );
       const document = result?.value || result;
@@ -38,6 +52,13 @@ export async function acquireProviderStreamLease(sourceId, limit) {
         if (released) return;
         released = true;
         clearInterval(heartbeat);
+        // Expire first, then delete. If a transient Mongo error prevents the
+        // delete, another player can still claim the slot immediately instead
+        // of being held at Roku's 13% loading state until cleanup catches up.
+        await collection.updateOne(
+          { _id: id, token },
+          { $set: { expiresAt: new Date(0), updatedAt: new Date() } },
+        ).catch(() => {});
         await collection.deleteOne({ _id: id, token }).catch(() => {});
       };
     } catch (error) {
@@ -45,4 +66,26 @@ export async function acquireProviderStreamLease(sourceId, limit) {
     }
   }
   return null;
+}
+
+// A process can lose the final child/HTTP callback during an abrupt playback
+// transition while remaining alive. Reclaim only leases created by this exact
+// process; leases held by the browser backend or another server stay intact.
+export async function releaseOrphanedProviderStreamLeases(sourceId) {
+  const collection = await leaseCollection();
+  const sourceKey = String(sourceId);
+  await collection.updateMany(
+    { sourceId: sourceKey, holderId },
+    { $set: { expiresAt: new Date(0), updatedAt: new Date() } },
+  ).catch(() => {});
+  await collection.deleteMany({ sourceId: sourceKey, holderId }).catch(() => {});
+}
+
+// Ops "release" button: drop every lease for a source no matter which process
+// holds it, so the operator can reclaim a wedged provider slot on demand. The
+// running job (if any) is stopped separately; a surviving heartbeat is a plain
+// updateOne and will not recreate a deleted lease.
+export async function expireProviderStreamLeasesForSource(sourceId) {
+  const collection = await leaseCollection();
+  await collection.deleteMany({ sourceId: String(sourceId) });
 }
