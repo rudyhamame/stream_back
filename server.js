@@ -24,7 +24,7 @@ import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClie
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
-import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
+import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getActiveRokuPlaybackHeartbeats, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
 import { releaseOrphanedProviderStreamLeases, providerLeaseKey } from './provider-stream-leases.js';
 import { applyWwpControl, appendWwpCallSignal, endWwpSession, getWwpSession, noteWwpPresence, reconcileWwpSession, setWwpCallRing, waitForWwpCallSignals, waitForWwpSession, wwpSyncToken } from './wwp-sessions.js';
@@ -848,7 +848,10 @@ app.post('/api/roku/heartbeat', async (req, res) => {
   try {
     const session = resolveDeviceToken(String(req.get('x-device-token') || req.query.deviceToken || ''));
     if (!session?.deviceId) return res.status(401).json({ error: 'Valid Roku device authorization is required' });
-    await recordDeviceHeartbeat(session.deviceId, req.body?.streaming === true, clientAddress(req));
+    await recordDeviceHeartbeat(session.deviceId, req.body?.streaming === true, clientAddress(req), {
+      sourceId: req.body?.sourceId, kind: req.body?.kind, itemId: req.body?.itemId,
+      strategy: req.body?.strategy, mode: req.body?.mode,
+    });
     res.json({ ok: true });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
@@ -975,7 +978,7 @@ app.get('/internal/media-duration/:sourceId/:kind/:id', (req, res) => {
   res.json({ seconds: recallVodDuration(String(req.params.sourceId), String(req.params.kind), String(req.params.id)) });
 });
 
-app.get('/internal/active-streams', (req, res) => {
+app.get('/internal/active-streams', async (req, res) => {
   if (!loopbackRequest(req)) return res.sendStatus(404);
   const port = Number(process.env.PORT) || null;
   const streams = [];
@@ -1006,6 +1009,22 @@ app.get('/internal/active-streams', (req, res) => {
       pid,
       cpuPercent: proc?.cpuPercent ?? null,
       rssMB: proc?.rssMB ?? null,
+    });
+  }
+  // DIRECT Roku playback never creates a streamer/FFmpeg job because the Roku
+  // contacts the provider itself. Include the short-lived Roku heartbeat so
+  // the RH Server dashboard can still show that session and its strategy.
+  const jobDevices = new Set(streams.map(stream => String(stream.deviceId || '')).filter(Boolean));
+  for (const heartbeat of await getActiveRokuPlaybackHeartbeats()) {
+    if (jobDevices.has(heartbeat.deviceId)) continue;
+    streams.push({
+      ...heartbeat,
+      port,
+      persistent: false,
+      viewers: 1,
+      pid: null,
+      cpuPercent: null,
+      rssMB: null,
     });
   }
   for (const pid of procCpuCache.keys()) if (!livePids.has(pid)) procCpuCache.delete(pid);

@@ -264,7 +264,7 @@ export async function getLinkedDevices(accountId) {
   }));
 }
 
-export async function recordDeviceHeartbeat(deviceId, streaming = false, clientIp = '') {
+export async function recordDeviceHeartbeat(deviceId, streaming = false, clientIp = '', playback = {}) {
   const normalized = String(deviceId || '').trim();
   if (!normalized) return;
   const now = Date.now();
@@ -274,10 +274,46 @@ export async function recordDeviceHeartbeat(deviceId, streaming = false, clientI
     const ip = String(clientIp || '').replace(/^::ffff:/, '').trim();
     const update = { $set: { lastSeenAt: new Date(now) } };
     if (ip) update.$set.lastClientIp = ip;
-    if (streaming) update.$set.lastStreamingSeenAt = new Date(now);
+    if (streaming) {
+      update.$set.lastStreamingSeenAt = new Date(now);
+      for (const [field, value] of [
+        ['playbackSourceId', playback.sourceId], ['playbackKind', playback.kind],
+        ['playbackItemId', playback.itemId], ['playbackStrategy', playback.strategy],
+        ['playbackMode', playback.mode],
+      ]) {
+        const normalizedValue = String(value || '').trim();
+        if (normalizedValue) update.$set[field] = normalizedValue;
+      }
+    } else {
+      update.$unset = {
+        lastStreamingSeenAt: '', playbackSourceId: '', playbackKind: '',
+        playbackItemId: '', playbackStrategy: '', playbackMode: '',
+      };
+    }
     await (await profiles()).updateOne({ deviceId: normalized }, update);
   } catch {
     heartbeatCache.delete(normalized);
+  }
+}
+
+export async function getActiveRokuPlaybackHeartbeats(windowMs = 15_000) {
+  try {
+    const since = new Date(Date.now() - Math.max(5_000, Number(windowMs) || 15_000));
+    return (await (await profiles()).find(
+      { deviceId: { $regex: /^roku-/ }, lastStreamingSeenAt: { $gte: since } },
+      { projection: { deviceId: 1, lastStreamingSeenAt: 1, playbackSourceId: 1, playbackKind: 1, playbackItemId: 1, playbackStrategy: 1, playbackMode: 1 } },
+    ).toArray()).map(row => ({
+      deviceId: String(row.deviceId || ''),
+      lastAccessAt: row.lastStreamingSeenAt || null,
+      sourceId: String(row.playbackSourceId || ''),
+      kind: String(row.playbackKind || ''),
+      itemId: String(row.playbackItemId || ''),
+      strategy: String(row.playbackStrategy || ''),
+      mode: String(row.playbackMode || ''),
+      client: 'roku',
+    }));
+  } catch {
+    return [];
   }
 }
 
