@@ -44,11 +44,7 @@ function normalizedAccountLibrary(library) {
       live: Array.isArray(library?.savedSelections?.live) ? library.savedSelections.live : [],
     },
     series_last_watched: Array.isArray(library?.series_last_watched) ? library.series_last_watched : [],
-    last_kinds_watched: {
-      episode: library?.last_kinds_watched?.episode || null,
-      movie: library?.last_kinds_watched?.movie || null,
-      live: library?.last_kinds_watched?.live || null,
-    },
+    last_kinds_watched: Array.isArray(library?.last_kinds_watched) ? library.last_kinds_watched : [],
   };
 }
 
