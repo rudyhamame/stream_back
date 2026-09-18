@@ -1221,11 +1221,7 @@ app.get('/api/roku/bootstrap', async (req, res) => {
       rokuEnabled: true,
     }));
     res.set('Cache-Control', 'no-store');
-    const providers = sources.map(source => ({
-      id: String(source._id), type: source.type || 'xtream', baseUrl: source.baseUrl || '',
-      username: source.username || '', password: source.password || '', name: source.name || '',
-    }));
-    res.json({ items: [...series, ...movies], providers });
+    res.json({ items: [...series, ...movies] });
   } catch (error) {
     res.status(502).json({ error: error.message });
   }
