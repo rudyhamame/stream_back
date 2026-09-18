@@ -1,13 +1,39 @@
 import { randomUUID } from 'node:crypto';
 import { accountForLibraryOwner, allAccountDocuments, updateAccountLibrary } from './account-library-data.js';
 import { accountOwnerId } from './account-library-owner.js';
+import { xtreamProviderUrl } from './xtream.js';
 
-const selectionFields = ['enabledKeys', 'enabledItems', 'archivedKeys', 'archivedItems'];
+const savedKinds = ['series', 'movies', 'live'];
+const kindFor = value => String(value || '').toLowerCase() === 'channel' || String(value || '').toLowerCase() === 'live' ? 'live' : (String(value || '').toLowerCase() === 'movie' || String(value || '').toLowerCase() === 'movies' ? 'movies' : 'series');
+const savedShape = value => {
+  const next = Object.fromEntries(savedKinds.map(kind => [kind, Array.isArray(value?.[kind]) ? value[kind].map(String).filter(Boolean) : []]));
+  if (!savedKinds.some(kind => next[kind].length) && Array.isArray(value?.enabledItems)) for (const item of value.enabledItems) {
+    const url = String(item?.providerUrl || ''); if (url) next[kindFor(item.kind)].push(url);
+  }
+  return next;
+};
+function sourceUrl(source, kind, id, extension = '') { return xtreamProviderUrl(source, kind === 'live' ? 'channel' : kind.slice(0, -1), id, extension); }
+function urlsForSource(source, saved) {
+  const result = savedShape(saved);
+  for (const kind of savedKinds) result[kind] = result[kind].filter(url => String(url).startsWith(String(source.baseUrl || '').replace(/\/$/, '') + '/'));
+  return result;
+}
+function itemFromUrl(url, source) {
+  const text = String(url || '');
+  const match = text.match(/\/(series|movie|live)\/[^/]+\/[^/]+\/([^/?#]+?)(?:\.[a-z0-9]+)?(?:[?#].*)?$/i);
+  if (!match) return null;
+  const kind = match[1].toLowerCase() === 'live' ? 'channel' : match[1].toLowerCase();
+  const id = match[2];
+  return { key: `${kind}:${id}`, id, kind, providerUrl: text, sourceId: String(source._id), title: id, extension: text.split('.').pop()?.split('?')[0] || '' };
+}
 
 export function selectionFor(source, ownerId, accountOwner) {
   void accountOwner;
-  const selection = source?.selections?.[String(ownerId)] || {};
-  return Object.fromEntries(selectionFields.map(field => [field, Array.isArray(selection?.[field]) ? selection[field] : []]));
+  const raw = source?.selections?.[String(ownerId)] || source?.savedSelections || {};
+  if (!Array.isArray(raw.series) && !Array.isArray(raw.movies) && !Array.isArray(raw.live) && Array.isArray(raw.enabledKeys)) return { enabledKeys: raw.enabledKeys, enabledItems: raw.enabledItems || [], archivedKeys: raw.archivedKeys || [], archivedItems: raw.archivedItems || [] };
+  const saved = urlsForSource(source, raw);
+  const enabledItems = savedKinds.flatMap(kind => saved[kind].map(url => itemFromUrl(url, source)).filter(Boolean));
+  return { enabledKeys: enabledItems.map(item => item.key), enabledItems, archivedKeys: [], archivedItems: [], savedSelections: saved };
 }
 
 function sourcesForAccount(account) {
@@ -15,7 +41,7 @@ function sourcesForAccount(account) {
   return (Array.isArray(account.providers) ? account.providers : []).map(source => {
     const selections = {};
     for (const profile of account.profiles || []) {
-      const selection = profile.library?.savedSelections?.[String(source._id)];
+      const selection = profile.library?.savedSelections;
       if (selection) selections[String(profile.ownerId)] = selection;
     }
     return { ...source, ownerId: accountOwner, selections, _accountId: account._id };
@@ -86,11 +112,19 @@ export async function updateXtreamSource(id, changes, ownerId) {
 
 export async function updateXtreamSelection(id, selection, accountOwner, profileOwner = accountOwner) {
   if (!accountOwner || !profileOwner) return null;
-  const fields = Object.fromEntries(selectionFields.map(field => [field, Array.isArray(selection?.[field]) ? selection[field] : []]));
   const located = await locateSource(id, accountOwner);
   if (!located) return null;
-  await updateAccountLibrary(profileOwner, library => { library.savedSelections[String(id)] = fields; return library; });
-  return publicXtreamSource({ ...located.source, selections: { [String(profileOwner)]: fields } }, profileOwner, accountOwner);
+  const prior = savedShape((await accountForLibraryOwner(profileOwner)).account?.profiles?.find(profile => String(profile.ownerId) === String(profileOwner))?.library?.savedSelections);
+  const next = savedShape(prior);
+  for (const kind of savedKinds) next[kind] = next[kind].filter(url => !String(url).startsWith(String(located.source.baseUrl || '').replace(/\/$/, '') + '/'));
+  const items = Array.isArray(selection?.enabledItems) ? selection.enabledItems : [];
+  for (const item of items) {
+    const kind = kindFor(item.kind);
+    const url = String(item.providerUrl || sourceUrl(located.source, kind, item.id, item.extension));
+    if (url) next[kind].push(url);
+  }
+  await updateAccountLibrary(profileOwner, library => { library.savedSelections = next; return library; });
+  return publicXtreamSource({ ...located.source, selections: { [String(profileOwner)]: next } }, profileOwner, accountOwner);
 }
 
 export async function deleteXtreamSource(id, ownerId) {
