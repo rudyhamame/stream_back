@@ -232,7 +232,7 @@ async function inspectProviderCodecs(inputUrl) {
     const child = spawn(ffprobeBin, [
       '-v', 'error', '-rw_timeout', '12000000',
       '-probesize', '1048576', '-analyzeduration', '3000000',
-      '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:format=duration',
+      '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:format=format_name,duration',
       '-of', 'json', inputUrl,
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
@@ -260,6 +260,7 @@ async function inspectProviderCodecs(inputUrl) {
         const video = streams.find(stream => stream.codec_type === 'video') || {};
         const audio = streams.find(stream => stream.codec_type === 'audio') || {};
         finish(null, {
+          container: String(probe.format?.format_name || ''),
           containerSeconds: Math.max(0, Math.round(Number(probe.format?.duration) || 0)),
           videoCodec: String(video.codec_name || ''),
           videoProfile: String(video.profile || ''),

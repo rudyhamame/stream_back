@@ -131,7 +131,14 @@ function audioCompatibility(metadata, capabilities) {
 }
 
 export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybackCapabilities(PlaybackClient.ROKU), container = '') {
-  const ext = String(container || metadata.container || '').replace(/^\./, '').trim().toLowerCase();
+  const probedContainers = String(metadata.container || '').toLowerCase().split(',').map(value => value.trim()).filter(Boolean);
+  let ext = String(container || '').replace(/^\./, '').trim().toLowerCase();
+  if (probedContainers.length) {
+    if (probedContainers.includes('matroska') || probedContainers.includes('webm')) ext = 'mkv';
+    else if (probedContainers.includes('mp4')) ext = 'mp4';
+    else if (probedContainers.includes('mov')) ext = 'mov';
+    else ext = probedContainers[0];
+  }
   if (!['mp4', 'm4v', 'mov', 'mkv'].includes(ext)) {
     return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for Roku direct playback` };
   }

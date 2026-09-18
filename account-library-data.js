@@ -51,7 +51,6 @@ function normalizedAccountLibrary(library) {
 
 function selectedProfile(account, ownerId) {
   const profiles = Array.isArray(account.profiles) ? account.profiles : [];
-  if (String(ownerId) === accountOwnerId(account._id)) return profiles.find(row => row.isDefault === true);
   return profiles.find(row => row.ownerId === String(ownerId));
 }
 
