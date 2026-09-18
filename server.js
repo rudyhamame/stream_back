@@ -554,12 +554,12 @@ function displayDuration(value) {
   return [hours, minutes, remaining].map(part => String(part).padStart(2, '0')).join(':');
 }
 
-async function getAllXtreamItems(kind) {
+async function getAllXtreamItems(kind, accountOwner) {
   // Always ask the provider for a fresh catalog. No catalog is persisted in
   // MongoDB; saved/library records contain IDs only.
   if (xtreamItemsInFlight.has(kind)) return xtreamItemsInFlight.get(kind);
   const request = (async () => {
-    const sources = await getAllXtreamSources();
+    const sources = await getAllXtreamSources(accountOwner);
     const groups = await Promise.all(sources.map(async source => {
       try {
         const [catalog, categories] = await Promise.all([getSourceCatalog(source, kind), getSourceCategories(source, kind)]);
@@ -1193,10 +1193,9 @@ app.use('/api/xtream', (req, res, next) => {
 // fetched separately when the user opens it.
 app.get('/api/roku/bootstrap', async (req, res) => {
   try {
-    // Home needs a very small, fast catalog only. Return the newest saved
-    // Roku entries without expanding every series into episodes.
-    const [selectedSeries, selectedMovies] = await Promise.all([
-      getRokuSelectedItems('series', requestOwner(req), requestAccountOwner(req)), getRokuSelectedItems('movie', requestOwner(req), requestAccountOwner(req)),
+    const accountOwner = requestAccountOwner(req);
+    const [selectedSeries, selectedMovies, selectedChannels] = await Promise.all([
+      getAllXtreamItems('series', accountOwner), getAllXtreamItems('movie', accountOwner), getAllXtreamItems('channel', accountOwner),
     ]);
     const newestFirst = (items) => [...items]
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0))
@@ -1221,7 +1220,10 @@ app.get('/api/roku/bootstrap', async (req, res) => {
       rokuEnabled: true,
     }));
     res.set('Cache-Control', 'no-store');
-    res.json({ items: [...series, ...movies] });
+    res.json({
+      items: [...series, ...movies],
+      stats: { series: selectedSeries.length, movies: selectedMovies.length, channels: selectedChannels.length },
+    });
   } catch (error) {
     res.status(502).json({ error: error.message });
   }
@@ -1259,16 +1261,7 @@ app.get('/api/roku/search', async (req, res) => {
     const query = String(req.query.q || '').trim().toLocaleLowerCase();
     if (!['series', 'movie', 'channel'].includes(kind) || !query) return res.status(400).json({ error: 'kind and q are required' });
     const normalizedQuery = normalizeArabicSearch(query);
-    const sources = await getAllXtreamSources(requestAccountOwner(req));
-    const live = (await Promise.all(sources.map(async source => {
-      const categories = await getSourceCategories(source, kind);
-      const categoryNames = new Map(categories.map(row => [String(row.id), String(row.name)]));
-      const items = await getSourceCatalog(source, kind);
-      return items.map(item => selectedXtreamItem(source, {
-        ...item,
-        category: item.category || categoryNames.get(String(item.categoryId)) || 'Other',
-      }));
-    }))).flat();
+    const live = await getAllXtreamItems(kind, requestAccountOwner(req));
     const matches = live.filter(item => normalizeArabicSearch(item.title).includes(normalizedQuery)).slice(0, 60);
     if (kind === 'series') {
       return res.json({ items: matches.map(item => ({
@@ -1298,14 +1291,14 @@ app.get('/api/roku/series/detail', async (req, res) => {
     const sourceId = String(req.query.sourceId || '');
     const seriesId = String(req.query.seriesId || '');
     if (!sourceId || !seriesId) return res.status(400).json({ error: 'sourceId and seriesId are required' });
-    const series = (await getRokuSelectedItems('series', requestOwner(req), requestAccountOwner(req))).find(item => String(item.sourceId) === sourceId && item.id === seriesId);
+    const series = (await getAllXtreamItems('series', requestAccountOwner(req))).find(item => String(item.sourceId) === sourceId && item.id === seriesId);
     if (!series) return res.status(404).json({ error: 'Series not found' });
-    res.json({ items: await buildXtreamSeriesPayload({ selected: [series] }) });
+    res.json({ items: await buildXtreamSeriesPayload({ selected: [series], accountOwner: requestAccountOwner(req) }) });
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-async function buildXtreamMoviesPayload({ limit, selected } = {}) {
-  let movies = (selected || await getRokuSelectedItems('movie')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+async function buildXtreamMoviesPayload({ limit, selected, accountOwner } = {}) {
+  let movies = (selected || await getAllXtreamItems('movie', accountOwner)).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
   if (Number.isFinite(limit) && limit > 0) movies = movies.slice(0, limit);
   // Browsing must never wait for get_vod_info. Saved metadata is enough for
   // the card; detailed provider metadata can be fetched only when needed.
@@ -1331,7 +1324,7 @@ app.get('/api/roku/movies', async (req, res) => {
     // Roku movie pages are deliberately fixed at ten items per request.
     pageInfo.limit = rokuMoviePageLimit;
     pageInfo.offset = pageInfo.page * pageInfo.limit;
-    const selected = (await getRokuSelectedItems('movie', requestOwner(req), requestAccountOwner(req)))
+    const selected = (await getAllXtreamItems('movie', requestAccountOwner(req)))
       .slice()
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
     const sourcePage = selected.slice(pageInfo.offset, pageInfo.offset + pageInfo.limit);
@@ -2698,8 +2691,8 @@ app.get('/api/xtream/roku/:sourceId/:kind/:id', async (req, res) => {
     } else res.destroy(error);
   }
 });
-async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected } = {}) {
-  let selected = suppliedSelected || (await getAllXtreamItems('series')).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
+async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected, accountOwner } = {}) {
+  let selected = suppliedSelected || (await getAllXtreamItems('series', accountOwner)).slice().sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
   if (Number.isFinite(limit) && limit > 0) selected = selected.slice(0, limit);
   let cursor = 0;
   const groups = new Array(selected.length);
@@ -2709,7 +2702,7 @@ async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected } = 
       const seriesItem = selected[index];
       const items = [];
       try {
-        const source = await getXtreamSource(seriesItem.sourceId, requestAccountOwner(req));
+        const source = await getXtreamSource(seriesItem.sourceId, accountOwner);
         if (!source) { groups[index] = items; continue; }
         const details = await getXtreamSeriesEpisodes(source, seriesItem.id);
         for (const episode of details.episodes) {
@@ -2751,14 +2744,16 @@ async function buildXtreamSeriesPayload({ limit, selected: suppliedSelected } = 
 }
 app.get('/api/roku/library', async (req, res) => {
   try {
-    // Compatibility for older Roku packages. This remains limited to the
-    // saved frontend selection, never the provider's full catalog.
+    // Compatibility for older Roku packages. Read the provider live just like
+    // the current per-kind endpoints; saved selections are only a separate
+    // library filter.
+    const accountOwner = requestAccountOwner(req);
     const [selectedSeries, selectedMovies, selectedChannels] = await Promise.all([
-      getRokuSelectedItems('series', requestOwner(req), requestAccountOwner(req)), getRokuSelectedItems('movie', requestOwner(req), requestAccountOwner(req)), getRokuSelectedItems('channel', requestOwner(req), requestAccountOwner(req)),
+      getAllXtreamItems('series', accountOwner), getAllXtreamItems('movie', accountOwner), getAllXtreamItems('channel', accountOwner),
     ]);
     const [series, movies, channels] = await Promise.all([
-      buildXtreamSeriesPayload({ selected: selectedSeries.slice(0, rokuInitialSeriesLimit) }),
-      buildXtreamMoviesPayload({ selected: selectedMovies }),
+      buildXtreamSeriesPayload({ selected: selectedSeries.slice(0, rokuInitialSeriesLimit), accountOwner }),
+      buildXtreamMoviesPayload({ selected: selectedMovies, accountOwner }),
       Promise.resolve(buildXtreamChannelsPayload(selectedChannels)),
     ]);
     res.json({ items: [...series, ...movies, ...channels] });
@@ -2769,7 +2764,7 @@ app.get('/api/roku/series', async (req, res) => {
   try {
     const category = String(req.query.category || '');
     const pageInfo = rokuPage(req, rokuSeriesPageLimit);
-    const selected = (await getRokuSelectedItems('series', requestOwner(req), requestAccountOwner(req)))
+    const selected = (await getAllXtreamItems('series', requestAccountOwner(req)))
       .filter(item => !category || item.category === category)
       .sort((a, b) => Number(b.added || 0) - Number(a.added || 0));
     const page = rokuPagePayload(selected, pageInfo);
@@ -2796,7 +2791,7 @@ app.get('/api/roku/series', async (req, res) => {
 app.get('/api/roku/channels', async (req, res) => {
   try {
     const pageInfo = rokuPage(req, rokuChannelPageLimit);
-    const selected = await getRokuSelectedItems('channel', requestOwner(req), requestAccountOwner(req));
+    const selected = await getAllXtreamItems('channel', requestAccountOwner(req));
     const page = rokuPagePayload(selected, pageInfo);
     res.json({ ...page, items: buildXtreamChannelsPayload(page.items) });
   } catch (error) { res.status(502).json({ error: error.message }); }
