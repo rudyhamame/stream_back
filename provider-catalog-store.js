@@ -10,7 +10,7 @@ import { arabicSearchRegexSource } from './arabic-search.js';
 // client request for a stale kind.
 
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
-const databaseName = process.env.MONGODB_DB || 'rh_stream';
+const databaseName = process.env.MONGODB_DB || 'rh_roku';
 const collectionName = process.env.MONGODB_PROVIDER_CATALOG_COLLECTION || 'provider_catalog_items';
 const metaCollectionName = process.env.MONGODB_PROVIDER_CATALOG_SYNC_COLLECTION || 'provider_catalog_syncs';
 let collectionsPromise;

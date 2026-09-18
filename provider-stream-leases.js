@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { MongoClient } from 'mongodb';
 
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
-const databaseName = process.env.MONGODB_DB || 'rh_stream';
+const databaseName = process.env.MONGODB_DB || 'rh_roku';
 const collectionName = process.env.MONGODB_PROVIDER_LEASE_COLLECTION || 'provider_stream_leases';
 // 15s TTL, renewed every 5s (3 tries per window survives a transient Mongo
 // blip). A crashed holder's slot frees within 15s instead of 30 - the wedge
