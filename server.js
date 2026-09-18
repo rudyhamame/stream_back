@@ -937,7 +937,13 @@ app.get('/internal/media-health', async (req, res) => {
 
 function loopbackRequest(req) {
   const ip = String(req.socket?.remoteAddress || '').replace(/^::ffff:/, '');
-  return ip === '127.0.0.1' || ip === '::1';
+  if (ip === '127.0.0.1' || ip === '::1') return true;
+  // rh-api calls this over the rh-internal Docker network now, not
+  // localhost - the two used to share a host/process, but are separate
+  // containers today. This endpoint is still never reachable from outside
+  // Docker (no Caddy route proxies to /internal/*), so trusting the private
+  // bridge-network range is equivalent to the old loopback-only guarantee.
+  return /^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.)/.test(ip);
 }
 
 // Per-pid CPU% (jiffies delta between polls) and RSS from /proc.
