@@ -8,7 +8,6 @@ const maxPairingSessions = Math.max(50, Number.parseInt(process.env.MAX_PAIRING_
 const tokenTtlMs = 365 * 24 * 60 * 60 * 1000;
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'rh_roku';
-const collectionName = process.env.MONGODB_DEVICE_COLLECTION || 'device_profiles';
 const accountCollectionName = process.env.MONGODB_ACCOUNT_COLLECTION || 'accounts';
 const signingSecret = process.env.DEVICE_AUTH_SECRET || 'local-development-secret-change-before-production';
 let profilesPromise;
@@ -19,15 +18,60 @@ const runningWindowMs = 90_000;
 
 async function profiles() {
   if (!profilesPromise) {
-    profilesPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 }).connect()
-      .then(async client => {
-        const collection = client.db(databaseName).collection(collectionName);
-        await collection.createIndex({ ownerId: 1 }, { unique: true });
-        return collection;
-      })
-      .catch(error => { profilesPromise = undefined; throw error; });
+    profilesPromise = Promise.resolve({
+      findOne: async filter => (await linkedDeviceRows(filter))[0] || null,
+      find: (filter = {}) => {
+        let sortField = '';
+        return {
+          sort(spec) { sortField = Object.keys(spec)[0] || ''; return this; },
+          async toArray() {
+            const rows = await linkedDeviceRows(filter);
+            if (sortField) rows.sort((a, b) => new Date(a[sortField] || 0) - new Date(b[sortField] || 0));
+            return rows;
+          },
+        };
+      },
+      updateOne: updateLinkedDevice,
+    });
   }
   return profilesPromise;
+}
+
+async function linkedDeviceRows(filter = {}) {
+  const collection = await accounts();
+  const query = ObjectId.isValid(filter.accountId) ? { _id: new ObjectId(String(filter.accountId)) } : {};
+  if (filter.deviceId) query['metadata.devices.deviceId'] = String(filter.deviceId);
+  const accountRows = await collection.find(query, { projection: { metadata: 1 } }).toArray();
+  return accountRows.flatMap(account => (account.metadata?.devices || []).map(device => ({
+    ...device, _id: `device:${device.deviceId}`, accountId: account._id,
+  }))).filter(device => Object.entries(filter).every(([key, value]) => String(device[key] ?? '') === String(value)));
+}
+
+async function updateLinkedDevice(filter, update, options = {}) {
+  const collection = await accounts();
+  if (options.upsert) {
+    const accountId = update.$set?.accountId;
+    const deviceId = String(update.$setOnInsert?.deviceId || filter.deviceId || '');
+    if (!ObjectId.isValid(accountId) || !deviceId) throw new Error('A linked device needs an account and device ID');
+    const id = new ObjectId(String(accountId));
+    const existing = await linkedDeviceRows({ deviceId });
+    for (const row of existing) if (String(row.accountId) !== String(id)) await collection.updateOne({ _id: row.accountId }, { $pull: { 'metadata.devices': { deviceId } } });
+    if (existing.some(row => String(row.accountId) === String(id))) return updateLinkedDevice({ accountId: id, deviceId }, update);
+    const { accountId: ignored, ...setFields } = update.$set || {};
+    void ignored;
+    return collection.updateOne(
+      { _id: id, 'metadata.devices.deviceId': { $ne: deviceId } },
+      { $push: { 'metadata.devices': { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date() } },
+    );
+  }
+  const row = (await linkedDeviceRows(filter))[0];
+  if (!row) return { matchedCount: 0, modifiedCount: 0 };
+  if (Object.hasOwn(update.$unset || {}, 'accountId')) return collection.updateOne({ _id: row.accountId }, { $pull: { 'metadata.devices': { deviceId: row.deviceId } } });
+  const { accountId: ignored, ...setFields } = update.$set || {};
+  void ignored;
+  const set = Object.fromEntries(Object.entries(setFields).map(([key, value]) => [`metadata.devices.$.${key}`, value]));
+  if (!Object.keys(set).length) return { matchedCount: 1, modifiedCount: 0 };
+  return collection.updateOne({ _id: row.accountId, 'metadata.devices.deviceId': row.deviceId }, { $set: set });
 }
 
 async function accounts() {
@@ -36,6 +80,7 @@ async function accounts() {
       .then(async client => {
         const collection = client.db(databaseName).collection(accountCollectionName);
         await collection.createIndex({ email: 1 }, { unique: true });
+        await collection.createIndex({ 'metadata.devices.deviceId': 1 }, { name: 'account_device_id', unique: true, sparse: true });
         return collection;
       })
       .catch(error => { accountsPromise = undefined; throw error; });
@@ -170,14 +215,14 @@ async function consumePairing(code, email, password, setup) {
   if (setup) {
     if (profile?.accountId) return { error: 'This Roku is already activated. Sign in instead.' };
     if (await accountCollection.findOne({ email: normalizedEmail }, { projection: { _id: 1 } })) return { error: 'An account with this email already exists. Sign in instead.' };
-    const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: hashPassword(password), createdAt: new Date(), updatedAt: new Date() });
+    const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: hashPassword(password), metadata: { devices: [] }, createdAt: new Date(), updatedAt: new Date() });
     account = { _id: created.insertedId };
   } else {
     account = await accountCollection.findOne({ email: normalizedEmail });
     // A profile created by the earlier device-password implementation can be
     // adopted on its first successful sign-in without losing its library.
     if (!account && profile?.email === normalizedEmail && verifyPassword(password, profile.passwordHash)) {
-      const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: profile.passwordHash, createdAt: profile.createdAt || new Date(), updatedAt: new Date() });
+      const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: profile.passwordHash, metadata: { devices: [] }, createdAt: profile.createdAt || new Date(), updatedAt: new Date() });
       account = { _id: created.insertedId };
     }
     if (!account || !verifyPassword(password, account.passwordHash)) return { error: 'Incorrect email or password' };
