@@ -1,6 +1,3 @@
-const cache = new Map();
-const cacheTtl = 5 * 60 * 1000;
-const cacheMaxEntries = 6;
 const inFlight = new Map();
 const maxInFlight = Math.max(4, Number.parseInt(process.env.XTREAM_MAX_IN_FLIGHT || '12', 10) || 12);
 // Bulk catalog lists (get_vod_streams/get_series/get_live_streams) scale with
@@ -10,12 +7,11 @@ const maxInFlight = Math.max(4, Number.parseInt(process.env.XTREAM_MAX_IN_FLIGHT
 const catalogTimeoutMs = Math.max(25_000, Math.min(120_000, Number.parseInt(process.env.XTREAM_CATALOG_TIMEOUT_MS || '120000', 10) || 120_000));
 
 export function evictXtreamCache(now = Date.now(), aggressive = false) {
-  for (const [key, entry] of cache) if (entry.expires <= now) cache.delete(key);
-  if (aggressive) while (cache.size > 2) cache.delete(cache.keys().next().value);
-  while (cache.size > cacheMaxEntries) cache.delete(cache.keys().next().value);
+  // Catalog data is never retained. This compatibility hook only exists for
+  // callers that still invoke the old cache-eviction endpoint.
 }
 
-export function xtreamCacheStats() { return { entries: cache.size, maxEntries: cacheMaxEntries, inFlight: inFlight.size, maxInFlight }; }
+export function xtreamCacheStats() { return { entries: 0, maxEntries: 0, inFlight: inFlight.size, maxInFlight }; }
 
 function apiUrl(source, params = {}) {
   const url = new URL(`${source.baseUrl.replace(/\/$/, '')}/player_api.php`);
@@ -28,13 +24,9 @@ function apiUrl(source, params = {}) {
 async function request(source, params, transform = value => value, options = {}) {
   const key = `${source._id}:${JSON.stringify(params)}`;
   const now = Date.now();
-  evictXtreamCache(now);
   // A series-info response may carry hundreds of episodes and images. Keeping
-  // every expanded series in the five-minute cache is what grows the Render
-  // heap until Node is terminated. Catalog lists remain cached; details do not.
-  const cacheable = !['get_series_info', 'get_vod_info'].includes(params?.action);
-  const cached = cache.get(key);
-  if (cacheable && cached?.expires > now) return cached.data;
+  // any provider response in memory would violate the live-provider catalog
+  // contract. Only an in-flight request is shared by concurrent callers.
   if (inFlight.has(key)) return inFlight.get(key);
   if (inFlight.size >= maxInFlight) throw new Error('Xtream provider request capacity is full');
   const pending = (async () => {
@@ -42,11 +34,6 @@ async function request(source, params, transform = value => value, options = {})
     const response = await fetch(apiUrl(source, params), { signal: AbortSignal.timeout(timeoutMs) });
     if (!response.ok) throw new Error(`Xtream server returned HTTP ${response.status}`);
     const data = transform(await response.json());
-    if (cacheable) {
-      cache.delete(key);
-      cache.set(key, { data, expires: Date.now() + cacheTtl });
-      evictXtreamCache();
-    }
     return data;
   })();
   inFlight.set(key, pending);

@@ -1,19 +1,14 @@
 import { createHash } from 'node:crypto';
 
-const cache = new Map();
-const cacheTtl = 5 * 60 * 1000;
-const cacheMaxEntries = Math.max(1, Number.parseInt(process.env.M3U_CACHE_MAX_ENTRIES || '2', 10) || 2);
 const maxPlaylistBytes = Math.max(1024 * 1024, (Number.parseInt(process.env.M3U_MAX_MB || '8', 10) || 8) * 1024 * 1024);
 const inFlight = new Map();
 const maxInFlight = Math.max(1, Number.parseInt(process.env.M3U_MAX_IN_FLIGHT || '2', 10) || 2);
 
 export function evictM3uCache(now = Date.now(), aggressive = false) {
-  for (const [key, entry] of cache) if (entry.expires <= now) cache.delete(key);
-  if (aggressive) while (cache.size > 1) cache.delete(cache.keys().next().value);
-  while (cache.size > cacheMaxEntries) cache.delete(cache.keys().next().value);
+  // Catalog data is never retained. Compatibility no-op.
 }
 
-export function m3uCacheStats() { return { entries: cache.size, maxEntries: cacheMaxEntries, inFlight: inFlight.size, maxInFlight }; }
+export function m3uCacheStats() { return { entries: 0, maxEntries: 0, inFlight: inFlight.size, maxInFlight }; }
 
 function attribute(line, name) {
   return line.match(new RegExp(`${name}="([^"]*)"`, 'i'))?.[1]?.trim() || '';
@@ -77,16 +72,11 @@ async function downloadM3u(source, key) {
   pending += decoder.decode();
   if (pending) consumeLine(pending);
   if (!items.length) throw new Error('This URL did not return a valid M3U playlist');
-  cache.set(key, { items, expires: Date.now() + cacheTtl });
-  evictM3uCache();
   return items;
 }
 
 async function loadM3u(source) {
-  evictM3uCache();
   const key = `${source._id || 'validation'}:${source.baseUrl}`;
-  const cached = cache.get(key);
-  if (cached?.expires > Date.now()) return cached.items;
   if (inFlight.has(key)) return inFlight.get(key);
   if (inFlight.size >= maxInFlight) throw new Error('M3U provider request capacity is full');
   const pending = downloadM3u(source, key);
