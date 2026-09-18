@@ -14,7 +14,6 @@ import { shapeArabicForRoku } from './arabic-shaper.js';
 import { normalizeArabicSearch } from './arabic-search.js';
 import { createXtreamSource, deleteXtreamSource, flattenSelection, getAllXtreamSources, getXtreamSource, getXtreamSources, publicXtreamSource, selectionFor, updateXtreamSelection, updateXtreamSource } from './xtream-store.js';
 import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSeriesEpisodes, validateXtreamConnection, xtreamCacheStats, xtreamProviderUrl } from './xtream.js';
-import { getProviderCatalogItems, getProviderCatalogMeta, replaceProviderCatalog } from './provider-catalog-store.js';
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
@@ -139,37 +138,6 @@ const sourceProviderUrl = (source, kind, id, extension = '') => sourceType(sourc
 // manifest in the last 15s. The manifest is withheld from BOTH players until
 // this reaches 2 and the shared job has enough segments, so neither can start
 // ahead of the other. Keyed by wwpSessionId.
-
-// MongoDB snapshot of each provider/kind item list, shared with the Library
-// backend's own copy of provider-catalog-store.js (same database, same
-// collections). Roku's catalog-browse endpoints used to download a
-// provider's entire item list live on every single request — for a provider
-// with hundreds of thousands of VOD entries that is tens of seconds to
-// minutes, repeated on every page turn. A kind is now downloaded from the
-// provider at most once per TTL window; the stored snapshot serves every
-// request in between (and keeps serving it if the provider errors).
-const CATALOG_SNAPSHOT_TTL_MS = Math.max(5 * 60_000, Number.parseInt(process.env.CATALOG_SNAPSHOT_TTL_MS || '2700000', 10) || 45 * 60_000);
-const catalogSnapshotJobs = new Map();
-
-function refreshCatalogSnapshot(ownerId, source, kind) {
-  const key = `${ownerId}:${source._id}:${kind}`;
-  if (catalogSnapshotJobs.has(key)) return catalogSnapshotJobs.get(key);
-  const job = getSourceCatalog(source, kind)
-    .then(catalog => replaceProviderCatalog(ownerId, String(source._id), source.name, kind, catalog))
-    .catch(error => console.warn(`[Catalog] snapshot refresh failed source=${source._id} kind=${kind}: ${error.message}`))
-    .finally(() => catalogSnapshotJobs.delete(key));
-  catalogSnapshotJobs.set(key, job);
-  return job;
-}
-
-// Block only on a first-ever fetch. A stale snapshot is served immediately
-// while a single background refresh runs; a provider block never clears it.
-async function ensureCatalogSnapshot(ownerId, source, kind) {
-  const meta = await getProviderCatalogMeta(ownerId, String(source._id)).catch(() => null);
-  const syncedAt = meta?.kinds?.[kind]?.syncedAt ? new Date(meta.kinds[kind].syncedAt).getTime() : 0;
-  if (!syncedAt) { await refreshCatalogSnapshot(ownerId, source, kind); return; }
-  if (Date.now() - syncedAt > CATALOG_SNAPSHOT_TTL_MS) void refreshCatalogSnapshot(ownerId, source, kind);
-}
 
 function clientAddress(req) {
   const forwarded = String(req.get('x-forwarded-for') || '').split(',')[0].trim();
@@ -587,16 +555,14 @@ function displayDuration(value) {
 }
 
 async function getAllXtreamItems(kind) {
-  // The Roku can issue overlapping page/category requests. Coalesce those
-  // requests so only one full provider catalog is mapped at a time.
+  // Always ask the provider for a fresh catalog. No catalog is persisted in
+  // MongoDB; saved/library records contain IDs only.
   if (xtreamItemsInFlight.has(kind)) return xtreamItemsInFlight.get(kind);
   const request = (async () => {
     const sources = await getAllXtreamSources();
     const groups = await Promise.all(sources.map(async source => {
       try {
-        const ownerId = String(source.ownerId || '');
-        await ensureCatalogSnapshot(ownerId, source, kind);
-        const [catalog, categories] = await Promise.all([getProviderCatalogItems(ownerId, String(source._id), kind), getSourceCategories(source, kind)]);
+        const [catalog, categories] = await Promise.all([getSourceCatalog(source, kind), getSourceCategories(source, kind)]);
         const categoryNames = new Map(categories.map(category => [category.id, category.name]));
         return catalog.map(item => {
           const category = categoryNames.get(item.categoryId) || source.name || 'Other';
@@ -1265,18 +1231,22 @@ app.get('/api/roku/series/categories', async (req, res) => {
   try {
     const seen = new Set();
     const items = [];
-    for (const series of await getRokuSelectedItems('series', requestOwner(req), requestAccountOwner(req))) {
-      const category = series.category || 'Other';
+    const sources = await getAllXtreamSources(requestAccountOwner(req));
+    for (const source of sources) {
+      const categories = await getSourceCategories(source, 'series');
+      for (const row of categories) {
+        const category = row.name || 'Other';
       if (seen.has(category)) continue;
       seen.add(category);
       items.push({
-        id: `series-category:${series.sourceId}:${category}`,
+        id: `series-category:${source._id}:${category}`,
         title: category,
-        rokuTitle: series.rokuCategory || rokuText(category),
+        rokuTitle: rokuText(category),
         category,
         language: detectXtreamLanguage({ title: '' }, category),
         contentKind: 'series-category',
       });
+      }
     }
     items.sort((a, b) => a.title.localeCompare(b.title));
     res.json({ items });
@@ -1289,9 +1259,17 @@ app.get('/api/roku/search', async (req, res) => {
     const query = String(req.query.q || '').trim().toLocaleLowerCase();
     if (!['series', 'movie', 'channel'].includes(kind) || !query) return res.status(400).json({ error: 'kind and q are required' });
     const normalizedQuery = normalizeArabicSearch(query);
-    const matches = (await getRokuSelectedItems(kind, requestOwner(req), requestAccountOwner(req)))
-      .filter(item => normalizeArabicSearch(item.title).includes(normalizedQuery))
-      .slice(0, 60);
+    const sources = await getAllXtreamSources(requestAccountOwner(req));
+    const live = (await Promise.all(sources.map(async source => {
+      const categories = await getSourceCategories(source, kind);
+      const categoryNames = new Map(categories.map(row => [String(row.id), String(row.name)]));
+      const items = await getSourceCatalog(source, kind);
+      return items.map(item => selectedXtreamItem(source, {
+        ...item,
+        category: item.category || categoryNames.get(String(item.categoryId)) || 'Other',
+      }));
+    }))).flat();
+    const matches = live.filter(item => normalizeArabicSearch(item.title).includes(normalizedQuery)).slice(0, 60);
     if (kind === 'series') {
       return res.json({ items: matches.map(item => ({
         id: `series-search:${item.sourceId}:${item.id}`,
@@ -1710,8 +1688,7 @@ app.get('/api/xtream/catalog', async (req, res) => {
     const aliases = { live: 'channel', channel: 'channel', movie: 'movie', vod: 'movie', series: 'series' };
     const kind = aliases[String(req.query.kind || '')];
     if (!kind) return res.status(400).json({ error: 'kind must be channel, movie, or series' });
-    await ensureCatalogSnapshot(accountOwner, source, kind);
-    const [allItems, categories] = await Promise.all([getProviderCatalogItems(accountOwner, String(source._id), kind), getSourceCategories(source, kind)]);
+    const [allItems, categories] = await Promise.all([getSourceCatalog(source, kind), getSourceCategories(source, kind)]);
     const selectedSource = { ...source, ...selectionFor(source, ownerId, accountOwner) };
     const enabled = new Set(selectedSource.enabledKeys);
     const query = String(req.query.q || '').trim().toLocaleLowerCase();
@@ -1749,10 +1726,8 @@ async function resolveXtreamEnabledItems(source, enabledKeys) {
     const allowed = enabledKeys.map(String).filter(key => /^(channel|movie|series):[^:]+$/.test(key));
     const allowedSet = new Set(allowed);
     const kinds = [...new Set(allowed.map(key => key.split(':', 1)[0]))];
-    const ownerId = String(source.ownerId || '');
-    await Promise.all(kinds.map(kind => ensureCatalogSnapshot(ownerId, source, kind)));
     const [catalogs, categoryGroups] = await Promise.all([
-      Promise.all(kinds.map(kind => getProviderCatalogItems(ownerId, String(source._id), kind))),
+      Promise.all(kinds.map(kind => getSourceCatalog(source, kind))),
       Promise.all(kinds.map(kind => getSourceCategories(source, kind))),
     ]);
     const categoryNamesByKind = new Map(kinds.map((kind, index) => [
