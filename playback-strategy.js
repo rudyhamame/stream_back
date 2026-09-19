@@ -270,7 +270,10 @@ export function hlsPlaylistProfile({ fastStart = false, preview = false } = {}) 
 }
 
 export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', strategy = '' } = {}) {
-  if (!seekableVod || client !== PlaybackClient.ROKU) return 15_000;
+  // Android and Roku use the same VOD startup policy. A cold full transcode
+  // can need more than 15s to produce the three startup segments; closing the
+  // manifest request early makes the client retry the same HLS job forever.
+  if (!seekableVod || ![PlaybackClient.ROKU, PlaybackClient.ANDROID].includes(client)) return 15_000;
   // A Roku copy/remux that cannot close its first GOP quickly needs the
   // keyframe-controlled transcode fallback. Once that fallback is already in
   // use, however, keep the original request open long enough for providers
