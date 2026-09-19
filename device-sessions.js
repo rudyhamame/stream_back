@@ -8,7 +8,7 @@ const maxPairingSessions = Math.max(50, Number.parseInt(process.env.MAX_PAIRING_
 const tokenTtlMs = 365 * 24 * 60 * 60 * 1000;
 const mongoUri = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017';
 const databaseName = process.env.MONGODB_DB || 'rh_roku';
-const accountCollectionName = process.env.MONGODB_ACCOUNT_COLLECTION || 'accounts';
+const accountCollectionName = 'identity';
 const signingSecret = process.env.DEVICE_AUTH_SECRET || 'local-development-secret-change-before-production';
 let profilesPromise;
 let accountsPromise;
