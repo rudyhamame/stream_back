@@ -17,7 +17,6 @@ import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSerie
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
-import { proxyBrowserDirect } from './browser-direct-proxy.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
 import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
@@ -1900,7 +1899,7 @@ app.post('/api/xtream/playback/release', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// Direct playback means the client (Roku/Android) talks to the
+// Direct playback means the client (Roku/Android/browser) talks to the
 // provider itself. This route only resolves which URL that is and redirects
 // - it does not proxy bytes, gate on a codec pre-check, or hold a provider
 // concurrency lease. The client's own player is the real arbiter of whether
@@ -1910,27 +1909,18 @@ app.post('/api/xtream/playback/release', async (req, res) => {
 // buildXtreamSeriesPayload) and never calls this route at all; it stays here
 // only for Android/browser, which still request this exact path.
 app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
-  let releaseDirectStream;
   try {
     const mediaTicket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
     const source = await getXtreamSource(req.params.sourceId, mediaTicket?.accountOwnerId || requestAccountOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
     const target = playbackTarget(req);
-    if (target.client === PlaybackClient.BROWSER && req.params.kind !== 'channel') {
-      releaseDirectStream = directStreamLimiter.acquire(String(source._id));
-      console.log(`[Media Direct] ${req.params.kind}:${req.params.id} browser byte proxy ext=${String(req.query.ext || '') || 'unknown'}`);
-      await proxyBrowserDirect(req, res, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext), String(req.query.ext || ''));
-      return;
-    }
     console.log(`[Media Direct] ${req.params.kind}:${req.params.id} redirecting to provider ext=${String(req.query.ext || '') || 'unknown'} client=${target.client}`);
     res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
   } catch (error) {
     if (!res.headersSent && !res.destroyed) {
       if (!capacityResponse(res, error)) res.status(502).json({ error: 'The provider could not start this stream.' });
     } else if (!res.destroyed) res.destroy(error);
-  } finally {
-    releaseDirectStream?.();
   }
 });
 
