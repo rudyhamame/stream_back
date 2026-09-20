@@ -17,6 +17,7 @@ import { evictXtreamCache, getXtreamCatalog, getXtreamCategories, getXtreamSerie
 import { evictM3uCache, getM3uCatalog, getM3uCategories, m3uCacheStats, m3uProviderUrl, validateM3uConnection } from './m3u.js';
 import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure } from './media-job-manager.js';
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
+import { proxyBrowserDirect } from './browser-direct-proxy.js';
 import { hasHlsVariants, hlsResourceId, isHlsManifest, normalizeHlsMasterForRoku, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
 import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
@@ -152,7 +153,7 @@ function mediaIdentity(req) {
   const baseViewerId = String(session?.deviceId || session?.ownerId || ticket?.ownerId || req.ip || 'anonymous');
   return {
     userId: String(session?.ownerId || ticket?.ownerId || ''),
-    deviceId: String(session?.deviceId || ''),
+    deviceId: client === PlaybackClient.BROWSER ? '' : String(session?.deviceId || ''),
     viewerId: scopedPlaybackViewerId(baseViewerId, client, req.query.playbackClientId),
     clientIp: clientAddress(req),
     client,
@@ -271,7 +272,7 @@ function playbackTarget(req) {
     reported,
     maxHeight,
     capabilities: getPlaybackCapabilities(client, reported),
-    key: `${client}:${reported.join(',')}${maxHeight ? `:h${maxHeight}` : ''}`,
+    key: `${client}:${reported.join(',')}${maxHeight ? `:h${maxHeight}` : ''}${client === PlaybackClient.BROWSER ? `:viewer:${mediaIdentity(req).viewerId}` : ''}`,
   };
 }
 
@@ -282,7 +283,7 @@ function playbackTarget(req) {
 // next safe recovery rung; this is deliberately limited to the HLS fallback
 // strategies and never changes the normal first-choice decision.
 function requestedHlsFallback(req) {
-  if (forceRokuFullTranscode) return 'full';
+  if (forceRokuFullTranscode && playbackTarget(req).client !== PlaybackClient.BROWSER) return 'full';
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
   if (value === 'full' || value === HlsStrategy.FULL_TRANSCODE.toLowerCase()) return 'full';
   if (value === 'remux' || value === HlsStrategy.REMUX.toLowerCase()) return 'remux';
@@ -660,7 +661,7 @@ function rokuXtreamPlaybackPath(sourceId, kind, id, extension = '') {
 
 // Custom response headers are invisible to browser fetch() across origins
 // unless explicitly exposed - the encode-strategy badge reads these.
-app.use(cors({ exposedHeaders: ['X-RH-Strategy', 'X-RH-Video-Mode', 'X-RH-Audio-Mode'] }));
+app.use(cors({ exposedHeaders: ['X-RH-Strategy', 'X-RH-Video-Mode', 'X-RH-Audio-Mode', 'X-RH-Duration'] }));
 app.use(express.json());
 
 // Unlike the public /api/health endpoint, this verifies the same signed Roku
@@ -1899,7 +1900,7 @@ app.post('/api/xtream/playback/release', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// Direct playback means the client (Roku/Android/browser) talks to the
+// Direct playback means the client (Roku/Android) talks to the
 // provider itself. This route only resolves which URL that is and redirects
 // - it does not proxy bytes, gate on a codec pre-check, or hold a provider
 // concurrency lease. The client's own player is the real arbiter of whether
@@ -1909,16 +1910,27 @@ app.post('/api/xtream/playback/release', async (req, res) => {
 // buildXtreamSeriesPayload) and never calls this route at all; it stays here
 // only for Android/browser, which still request this exact path.
 app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
+  let releaseDirectStream;
   try {
     const mediaTicket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
     const source = await getXtreamSource(req.params.sourceId, mediaTicket?.accountOwnerId || requestAccountOwner(req));
     if (!source) return res.sendStatus(404);
     if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
     const target = playbackTarget(req);
+    if (target.client === PlaybackClient.BROWSER && req.params.kind !== 'channel') {
+      releaseDirectStream = directStreamLimiter.acquire(String(source._id));
+      console.log(`[Media Direct] ${req.params.kind}:${req.params.id} browser byte proxy ext=${String(req.query.ext || '') || 'unknown'}`);
+      await proxyBrowserDirect(req, res, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext), String(req.query.ext || ''));
+      return;
+    }
     console.log(`[Media Direct] ${req.params.kind}:${req.params.id} redirecting to provider ext=${String(req.query.ext || '') || 'unknown'} client=${target.client}`);
     res.redirect(302, await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext));
   } catch (error) {
-    res.status(502).json({ error: error.message });
+    if (!res.headersSent && !res.destroyed) {
+      if (!capacityResponse(res, error)) res.status(502).json({ error: 'The provider could not start this stream.' });
+    } else if (!res.destroyed) res.destroy(error);
+  } finally {
+    releaseDirectStream?.();
   }
 });
 
@@ -2171,7 +2183,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const previewRemux = kind === 'channel' && strategyOverride === 'preview-remux';
   const baseDecision = previewRemux
     ? forceHlsFallback('remux', selectedDecision)
-    : forceHlsFallback('full', selectedDecision);
+    : target.client === PlaybackClient.BROWSER
+      ? (typeof strategyOverride === 'object' && strategyOverride ? strategyOverride : forceHlsFallback(strategyOverride, selectedDecision))
+      : forceHlsFallback('full', selectedDecision);
   // No codec probe for live (avoids extra provider connections), so
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
@@ -2188,7 +2202,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
     persistent: true, sourceId: String(source._id), capacityKey, mediaId: String(id), kind,
-    startSeconds, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
+    startSeconds, durationSeconds: Number(metadata.containerSeconds) || 0, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
     clientIp: identity.clientIp, client: identity.client,
     wwpSessionId: String(identity.wwpSessionId || ''), wwpQuality: String(identity.wwpQuality || ''),
   }, async () => {
@@ -2199,8 +2213,8 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const retainSegments = target.client === PlaybackClient.ROKU;
     // A seek needs its first playable segment quickly. Keep keyframe-safe
     // boundaries and the usual two-second cadence after the opening segment.
-    const fastStart = seekableVod && target.client === PlaybackClient.ROKU && decision.videoMode === 'transcode';
-    const playlistProfile = hlsPlaylistProfile({ fastStart, preview: previewRemux });
+    const fastStart = seekableVod && [PlaybackClient.ROKU, PlaybackClient.BROWSER].includes(target.client) && decision.videoMode === 'transcode';
+    const playlistProfile = hlsPlaylistProfile({ fastStart, preview: previewRemux, client: target.client });
     const args = ['-hide_banner', '-nostats', '-loglevel', 'info', ...hlsHwDeviceArgs({ enabled: hardwareTranscode })];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
     args.push(
@@ -2228,7 +2242,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       generationId, directory, manifest, child, error: '', retainSegments, activeRequests: 0,
       stop: async () => {
         await terminateChild(child);
-        if (retainSegments) retireHlsGeneration(key, created);
+        if (retainSegments || target.client === PlaybackClient.BROWSER) retireHlsGeneration(key, hlsGenerationJobs.get(generationId) || created);
         else {
           hlsGenerationJobs.delete(generationId);
           await fs.rm(directory, { recursive: true, force: true });
@@ -2248,19 +2262,19 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       }
       created.error = appendTail(created.error, chunk);
       const registered = mediaJobs.get(key);
-      if (registered) registered.error = created.error;
+      if (registered?.child === child) registered.error = created.error;
     });
     child.on('error', error => {
       created.error = appendTail(created.error, error.message);
       const registered = mediaJobs.get(key);
-      if (registered) registered.error = created.error;
+      if (registered?.child === child) registered.error = created.error;
     });
     const ffmpegStartedAt = Date.now();
     child.on('close', code => {
       created.finished = true;
       created.completed = seekableVod && code === 0;
       const registered = mediaJobs.get(key);
-      if (registered) {
+      if (registered?.child === child) {
         registered.finished = true;
         registered.completed = created.completed;
       }
@@ -2348,7 +2362,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       ? 'preview-remux'
       : explicitFallback;
     let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback);
-    let playlistProfile = hlsPlaylistProfile({ preview: fastPreview });
+    let playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     let manifestReady = false;
     // At most two bounded fallbacks are allowed. Accurate probe metadata
     // should select the first strategy; retries exist only for an unexpected
@@ -2378,7 +2392,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback);
-      playlistProfile = hlsPlaylistProfile({ preview: fastPreview });
+      playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     }
     if (!manifestReady) {
       const detail = job.error.trim().slice(-240);
@@ -2398,6 +2412,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     // about whether encoding happened at all.
     res.setHeader('X-RH-Strategy', job.hlsStrategy || '');
     res.setHeader('X-RH-Video-Mode', job.hlsVideoMode || '');
+    res.setHeader('X-RH-Duration', String(job.durationSeconds || 0));
     res.setHeader('X-RH-Audio-Mode', job.hlsAudioMode || '');
     // Watch-with-Partner start barrier: for a short window, withhold the real
     // manifest (serve an empty live playlist that clients just keep polling)
@@ -2507,6 +2522,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
 });
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
+  let job;
   try {
     if (!/^segment-\d{6}\.ts$/.test(req.params.segment)) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} invalid segment=${req.params.segment}`);
@@ -2527,14 +2543,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     const key = rokuHlsKey(req.params.sourceId, req.params.kind, req.params.id, req.query.ext,
       wwpSessionId && seekableVod ? 0 : startSeconds, keyedCapability);
     const requestedGeneration = String(req.query.generation || '');
-    let job = (requestedGeneration && hlsGenerationJobs.get(requestedGeneration)) || mediaJobs.get(key);
+    job = requestedGeneration ? hlsGenerationJobs.get(requestedGeneration) : mediaJobs.get(key);
     if (!job) {
       // The other WWP participant may still be creating the shared job - give it
       // a moment rather than rejecting the segment outright.
       const jobDeadline = Date.now() + (wwpSessionId ? 6000 : 1000);
       while (!job && Date.now() < jobDeadline) {
         await new Promise(resolve => setTimeout(resolve, 200));
-        job = (requestedGeneration && hlsGenerationJobs.get(requestedGeneration)) || mediaJobs.get(key);
+        job = requestedGeneration ? hlsGenerationJobs.get(requestedGeneration) : mediaJobs.get(key);
       }
     }
     if (!job) {
@@ -2578,7 +2594,12 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     }
     res.setHeader('Content-Type', 'video/mp2t');
     res.setHeader('Cache-Control', 'no-store');
-    res.sendFile(filename, releaseRequest);
+    res.sendFile(filename, error => {
+      releaseRequest();
+      if (!error || res.destroyed || res.writableEnded) return;
+      if (!res.headersSent) res.sendStatus(error.code === 'ENOENT' ? 404 : 502);
+      else res.destroy(error);
+    });
   } catch (error) {
     if (error?.code === 'ENOENT') {
       let available = [];
@@ -2587,7 +2608,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     } else {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} segment unavailable segment=${req.params.segment}: ${error.code || error.message}`);
     }
-    res.sendStatus(404);
+    if (!res.headersSent && !res.destroyed) res.sendStatus(404);
   }
 });
 

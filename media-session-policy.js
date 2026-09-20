@@ -48,8 +48,8 @@ export function scopedPlaybackViewerId(baseViewerId, client, playbackClientId) {
   const base = String(baseViewerId || 'anonymous');
   const kind = String(client || '').trim().toLowerCase();
   const id = String(playbackClientId || '').trim();
-  if (kind !== 'android' || !/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(id)) return base;
-  return `${base}:android:${id}`;
+  if (!['android', 'browser'].includes(kind) || !/^[a-z0-9][a-z0-9._:-]{0,127}$/i.test(id)) return base;
+  return `${base}:${kind}:${id}`;
 }
 
 export function samePlaybackViewer(job, identity) {

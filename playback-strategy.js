@@ -161,7 +161,7 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
 export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlaybackCapabilities()) {
   const video = videoCompatibility(sourceMetadata, capabilities);
   const audio = audioCompatibility(sourceMetadata, capabilities);
-  return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: 'full-transcode-only policy' };
+  if (capabilities.client !== PlaybackClient.BROWSER) return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: 'full-transcode-only policy' };
   const videoCompatible = video.compatible;
   const audioCompatible = audio.compatible;
   const detail = `${video.reason}; ${audio.reason}`;
@@ -256,7 +256,7 @@ export function strategyUsesEncoding(decision) {
   return decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
 }
 
-export function hlsPlaylistProfile({ fastStart = false, preview = false } = {}) {
+export function hlsPlaylistProfile({ fastStart = false, preview = false, client = '' } = {}) {
   // listSize * segmentSeconds is how many seconds of already-produced segments
   // stay on disk. Roku can briefly keep an older manifest while it recovers
   // from a stall; a short 90-second window then deletes the segment it asks
@@ -266,7 +266,7 @@ export function hlsPlaylistProfile({ fastStart = false, preview = false } = {}) 
   // Do not hand Roku the manifest at the first segment. A rolling HLS job can
   // briefly pause while the provider or encoder catches up; three completed
   // segments give the decoder a real cushion before consumption begins.
-  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview ? 1 : 3 };
+  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview || client === PlaybackClient.BROWSER ? 1 : 3 };
 }
 
 export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', strategy = '' } = {}) {

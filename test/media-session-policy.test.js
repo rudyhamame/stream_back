@@ -62,6 +62,16 @@ test('replacement is scoped to the requesting device or anonymous viewer', () =>
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-2' }), false);
 });
 
+test('browser tabs on one account cannot supersede each other', () => {
+  const first = scopedPlaybackViewerId('account-1', 'browser', 'tab-1');
+  const second = scopedPlaybackViewerId('account-1', 'browser', 'tab-2');
+  const job = { key: 'movie-1', persistent: true, deviceId: '', viewerId: first };
+  assert.notEqual(first, second);
+  assert.equal(isPlaybackSupersededForViewer(job, { viewerId: second }, 'movie-2'), false);
+  assert.equal(isPlaybackSupersededForViewer(job, { viewerId: first }, 'movie-2'), true);
+  assert.equal(hlsChildRequestQuery({ client: 'browser', playbackClientId: 'tab-2' }).get('playbackClientId'), 'tab-2');
+});
+
 test('a new Android episode replaces the prior job for the same account viewer', () => {
   const priorEpisode = { key: 'episode-1', persistent: true, deviceId: '', viewerId: 'account-1', viewers: new Map() };
   assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-1' }, 'episode-2'), true);
