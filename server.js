@@ -2023,11 +2023,11 @@ async function completedHlsManifestAvailable(filename) {
   }
 }
 
-async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null) {
-  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, target, strategyOverride));
+async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '') {
+  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, target, strategyOverride, suppliedProviderURL));
 }
 
-async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null) {
+async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '') {
   const seekableVod = kind === 'movie' || kind === 'series';
   let startSeconds = seekableVod ? hlsStartSeconds(requestedStart) : 0;
   // A manual quality rung forks its own job even for a live channel (folding
@@ -2132,8 +2132,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
 
   const capacityKey = providerLeaseKey(source);
 
-  const inputUrl = await sourceProviderUrl(source, kind, id, extension);
-  const providerCacheKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
+  const resolvedProviderURL = await sourceProviderUrl(source, kind, id, extension);
+  const inputUrl = suppliedProviderURL || resolvedProviderURL;
+  const providerCacheKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
   evictCodecProbeCache();
   const cachedProviderState = codecProbeCache.get(providerCacheKey)?.metadata;
   if (cachedProviderState?.providerUnavailable) {
@@ -2318,12 +2319,18 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const manifestTicket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
     const source = await getXtreamSource(req.params.sourceId, manifestTicket?.accountOwnerId || requestAccountOwner(req));
     if (!source) return res.sendStatus(404);
+    const target = playbackTarget(req);
+    const suppliedProviderURL = String(req.query.providerURL || '');
+    if (target.client === PlaybackClient.BROWSER && !suppliedProviderURL) return res.status(400).json({ error: 'The original provider URL is required for browser streaming.' });
+    if (suppliedProviderURL) {
+      const expectedProviderURL = await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext);
+      if (suppliedProviderURL !== expectedProviderURL) return res.status(400).json({ error: 'The provider URL does not match this media item.' });
+    }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
     const nativeHlsDisabled = String(req.query.native || '') === '0';
     const identity = mediaIdentity(req);
-    const target = playbackTarget(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${fastPreview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
     if (req.params.kind === 'channel') {
       const existingNativeSession = nativeHlsSession(req, identity);
@@ -2351,7 +2358,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const requestedFallback = fastPreview && !target.maxHeight && !explicitFallback
       ? 'preview-remux'
       : explicitFallback;
-    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback);
+    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, suppliedProviderURL);
     let playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     let manifestReady = false;
     // At most two bounded fallbacks are allowed. Accurate probe metadata
@@ -2381,7 +2388,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       }
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
-      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback);
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, suppliedProviderURL);
       playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     }
     if (!manifestReady) {
