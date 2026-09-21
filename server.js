@@ -140,7 +140,7 @@ const getSourceCatalog = (source, kind) => sourceType(source) === 'm3u' ? getM3u
 const getSourceCategories = (source, kind) => sourceType(source) === 'm3u' ? getM3uCategories(source, kind) : getXtreamCategories(source, kind);
 const sourceProviderUrl = (source, kind, id, extension = '') => sourceType(source) === 'm3u' ? m3uProviderUrl(source, kind, id) : xtreamProviderUrl(source, kind, id, extension);
 
-// Android already receives the exact media URL when its provider catalog or
+// Clients already receive the exact media URL when their provider catalog or
 // episode list is fetched. Reuse that transient cached value for playback so
 // Play does not resolve or reconstruct the URL again. The request is already
 // authenticated and scoped to a source owned by that account; the cached URL
@@ -178,7 +178,7 @@ async function requestProviderUrl(req, source, kind, id, extension = '') {
     error.statusCode = 400;
     throw error;
   }
-  return resolved;
+  return supplied || resolved;
 }
 
 // Watch-with-Partner start barrier: distinct viewer ids seen on a session's
@@ -2749,11 +2749,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
 
   const capacityKey = providerLeaseKey(source);
 
-  // Android carries the exact URL from its already-fetched catalog cache.
-  // Other clients retain their existing identity-based resolution behavior.
-  const inputUrl = target.client === PlaybackClient.ANDROID && suppliedProviderURL
-    ? suppliedProviderURL
-    : await sourceProviderUrl(source, kind, id, extension);
+  // Use the exact URL carried by the selected catalog item for every client.
+  // Identity-based resolution remains only as a compatibility fallback for
+  // older builds that do not send providerURL.
+  const inputUrl = suppliedProviderURL || await sourceProviderUrl(source, kind, id, extension);
   const providerCacheKey = providerProbeCacheKey(source._id, kind, id, extension, inputUrl);
   evictCodecProbeCache();
   const cachedProviderState = codecProbeCache.get(providerCacheKey)?.metadata;
@@ -2941,9 +2940,10 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     if (!source) return res.sendStatus(404);
     const target = playbackTarget(req);
     const suppliedProviderURL = String(req.query.providerURL || '');
+    let playbackProviderURL = '';
     if (target.client === PlaybackClient.BROWSER && !suppliedProviderURL) return res.status(400).json({ error: 'The original provider URL is required for browser streaming.' });
     if (suppliedProviderURL || target.client === PlaybackClient.ANDROID) {
-      await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
+      playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
@@ -2961,7 +2961,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       if ([PlaybackClient.ANDROID, PlaybackClient.ROKU].includes(target.client) && !fastPreview && !nativeHlsDisabled && !target.maxHeight) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
-          const upstreamUrl = suppliedProviderURL || session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
+          const upstreamUrl = playbackProviderURL || session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
           await serveNativeHlsManifest(req, res, upstreamUrl, session, requestAbort.signal);
           console.log(`[Native HLS] channel:${req.params.id} ${target.client} passthrough ready startupMs=${Date.now() - manifestRequestStartedAt}`);
           return;
@@ -2994,7 +2994,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const requestedFallback = fastPreview && !target.maxHeight && !explicitFallback
       ? 'preview-remux'
       : explicitFallback;
-    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, suppliedProviderURL);
+    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, playbackProviderURL);
     let playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     let manifestReady = false;
     // At most two bounded fallbacks are allowed. Accurate probe metadata
@@ -3019,7 +3019,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       const fallback = fallbackHlsStrategy(job.hlsDecision);
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
-      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, suppliedProviderURL);
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, playbackProviderURL);
       playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
     }
     if (!manifestReady) {
