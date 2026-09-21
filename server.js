@@ -2005,7 +2005,13 @@ app.get('/api/xtream/direct/:sourceId/:kind/:id', async (req, res) => {
     const inputUrl = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
     const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Android/1.0', connection: 'close' };
+    // Media3's first progressive request does not consistently include Range.
+    // Some Xtream providers delay a whole-file response for tens of seconds,
+    // even though the same media answers an open-ended byte range immediately.
+    // Start VOD as a progressive range response; preserve every client seek
+    // range verbatim once Media3 supplies one.
     if (req.headers.range) headers.range = req.headers.range;
+    else if (req.params.kind === 'movie' || req.params.kind === 'series') headers.range = 'bytes=0-';
     headerTimeout = setTimeout(() => controller.abort(new Error('Provider Direct response timed out')), 15_000);
     headerTimeout.unref?.();
     const upstream = await fetch(inputUrl, { headers, redirect: 'follow', signal: controller.signal });
@@ -2013,6 +2019,7 @@ app.get('/api/xtream/direct/:sourceId/:kind/:id', async (req, res) => {
     headerTimeout = null;
     if (!upstream.ok && upstream.status !== 206) {
       await upstream.body?.cancel().catch(() => {});
+      console.warn(`[Media Direct relay] ${req.params.kind}:${req.params.id} provider status=${upstream.status}`);
       return res.sendStatus(upstream.status || 502);
     }
     for (const name of ['content-length', 'content-range', 'content-type', 'etag', 'last-modified', 'accept-ranges']) {
@@ -2025,6 +2032,7 @@ app.get('/api/xtream/direct/:sourceId/:kind/:id', async (req, res) => {
     if (req.method === 'HEAD' || !upstream.body) return res.end();
     await pipeline(Readable.fromWeb(upstream.body), res);
   } catch (error) {
+    console.warn(`[Media Direct relay] ${req.params.kind}:${req.params.id} failed: ${error.message}`);
     if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) {
       res.status(error.name === 'AbortError' ? 504 : 502).json({ error: error.message });
     }
