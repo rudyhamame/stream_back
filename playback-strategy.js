@@ -141,11 +141,11 @@ export function containerCompatibility(metadata = {}, capabilities = getPlayback
     else if (probedContainers.includes('mov')) ext = 'mov';
     else ext = probedContainers[0];
   }
-  const directContainers = capabilities.client === PlaybackClient.ROKU
-    ? ['mp4', 'm4v', 'mov', 'mkv']
-    : ['mp4', 'm4v', 'mov'];
+  const directContainers = capabilities.client === PlaybackClient.BROWSER
+    ? ['mp4', 'm4v', 'mov']
+    : ['mp4', 'm4v', 'mov', 'mkv'];
   if (!directContainers.includes(ext)) {
-    return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for Roku direct playback` };
+    return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for ${capabilities.client} direct playback` };
   }
   return { compatible: true, reason: `container ${ext} is target-compatible`, container: ext };
 }
@@ -172,12 +172,6 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
 export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlaybackCapabilities()) {
   const video = videoCompatibility(sourceMetadata, capabilities);
   const audio = audioCompatibility(sourceMetadata, capabilities);
-  if (capabilities.client === PlaybackClient.ANDROID) {
-    return {
-      videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels,
-      strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Android HLS policy remains full transcode',
-    };
-  }
   const videoCompatible = video.compatible;
   const audioCompatible = audio.compatible;
   const detail = `${video.reason}; ${audio.reason}`;
@@ -282,14 +276,14 @@ export function hlsPlaylistProfile({ fastStart = false, preview = false, client 
   // Do not hand Roku the manifest at the first segment. A rolling HLS job can
   // briefly pause while the provider or encoder catches up; three completed
   // segments give the decoder a real cushion before consumption begins.
-  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview || client === PlaybackClient.BROWSER ? 1 : 3 };
+  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview ? 1 : 3 };
 }
 
 export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', strategy = '' } = {}) {
-  // Android and Roku use the same VOD startup policy. A cold full transcode
+  // Browser, Android, and Roku use the same VOD startup policy. A cold full transcode
   // can need more than 15s to produce the three startup segments; closing the
   // manifest request early makes the client retry the same HLS job forever.
-  if (!seekableVod || ![PlaybackClient.ROKU, PlaybackClient.ANDROID].includes(client)) return 15_000;
+  if (!seekableVod || ![PlaybackClient.ROKU, PlaybackClient.ANDROID, PlaybackClient.BROWSER].includes(client)) return 15_000;
   // A Roku copy/remux that cannot close its first GOP quickly needs the
   // keyframe-controlled transcode fallback. Once that fallback is already in
   // use, however, keep the original request open long enough for providers

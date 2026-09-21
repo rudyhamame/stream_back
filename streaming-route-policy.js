@@ -15,6 +15,7 @@ const STREAMING_PATH_PATTERNS = [
   // while serving the title (auth'd by loopbackRequest inside the route).
   /^\/internal\/media-duration\/[^/]+\/(?:movie|series)\/[^/]+$/,
   /^\/api\/roku\/playback-decision\/[^/]+\/(?:movie|series)\/[^/]+$/,
+  /^\/api\/xtream\/playback-decision\/[^/]+\/(?:movie|series)\/[^/]+$/,
   /^\/api\/xtream\/play\/[^/]+\/(?:channel|movie|series)\/[^/]+$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/master\.m3u8$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/segment-\d{6}\.ts$/,

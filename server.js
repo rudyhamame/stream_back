@@ -691,10 +691,49 @@ app.get('/api/roku/internet-health', async (req, res) => {
   res.json({ ok: result.online, online: result.online, status: result.status, elapsedMs: result.elapsedMs });
 });
 
-// Decide Roku VOD transport before assigning Video.content. Direct is offered
-// only when a bounded probe supplies every required media fact and the linked
-// Roku reports support for that exact combination. The probe result is cached,
-// so an incompatible source can enter its selected HLS strategy without a second probe.
+// Decide VOD transport before a client assigns media to its player. Direct is
+// offered only when a bounded probe supplies every required media fact and the
+// requesting client supports that exact container/codec combination. The
+// resolved providerURL is returned so Direct never goes through an RH proxy.
+async function playbackDecision(req, source) {
+  const { kind, id } = req.params;
+  const expectedProviderURL = await sourceProviderUrl(source, kind, id, req.query.ext);
+  const suppliedProviderURL = String(req.query.providerURL || '');
+  if (suppliedProviderURL && suppliedProviderURL !== expectedProviderURL) {
+    const error = new Error('The provider URL does not match this media item.');
+    error.statusCode = 400;
+    throw error;
+  }
+  const inputUrl = suppliedProviderURL || expectedProviderURL;
+  const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
+  const metadata = await providerCodecMetadata(cacheKey, inputUrl);
+  if (metadata.providerUnavailable) {
+    const error = new Error(metadata.providerError || 'Playlist provider unavailable');
+    error.statusCode = 502;
+    throw error;
+  }
+  const target = playbackTarget(req);
+  const forceFull = forceRokuFullTranscode && target.client === PlaybackClient.ROKU;
+  const direct = forceFull
+    ? { compatible: false, reason: 'full transcode forced by server policy' }
+    : confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
+  const selectedHlsDecision = determineHlsStrategy(metadata, target.capabilities);
+  const hlsDecision = forceFull ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
+  const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
+  if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
+  return {
+    ok: true,
+    directCompatible: direct.compatible,
+    playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
+    videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
+    audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
+    durationSeconds,
+    providerURL: inputUrl,
+    reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
+  };
+}
+
+// Roku requires a linked Roku token for its capability-bearing decision.
 app.get('/api/roku/playback-decision/:sourceId/:kind/:id', async (req, res) => {
   try {
     const token = String(req.get('x-device-token') || req.query.deviceToken || '');
@@ -706,30 +745,27 @@ app.get('/api/roku/playback-decision/:sourceId/:kind/:id', async (req, res) => {
     if (!['movie', 'series'].includes(kind)) return res.status(400).json({ ok: false, error: 'Roku VOD kind required' });
     const source = await getXtreamSource(sourceId, requestAccountOwner(req));
     if (!source) return res.status(404).json({ ok: false, error: 'Playlist source not found' });
-    const inputUrl = await sourceProviderUrl(source, kind, id, req.query.ext);
-    const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}`;
-    const metadata = await providerCodecMetadata(cacheKey, inputUrl);
-    if (metadata.providerUnavailable) return res.status(502).json({ ok: false, error: metadata.providerError || 'Playlist provider unavailable' });
-    const target = playbackTarget(req);
-    const direct = forceRokuFullTranscode
-      ? { compatible: false, reason: 'full transcode forced by server policy' }
-      : confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
-    const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
-    if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
     res.set('Cache-Control', 'no-store');
-    const selectedHlsDecision = determineHlsStrategy(metadata, target.capabilities);
-    const hlsDecision = forceRokuFullTranscode ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
-    res.json({
-      ok: true,
-      directCompatible: direct.compatible,
-      playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
-      videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
-      audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
-      durationSeconds,
-      reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
-    });
+    res.json(await playbackDecision(req, source));
   } catch (error) {
-    res.status(502).json({ ok: false, error: error.message });
+    res.status(error.statusCode || 502).json({ ok: false, error: error.message });
+  }
+});
+
+// Browser and Android use the same matrix with their own capability profile.
+// A Watch-with-Partner ticket may resolve the host's source just like HLS.
+app.get('/api/xtream/playback-decision/:sourceId/:kind/:id', async (req, res) => {
+  try {
+    const { sourceId, kind, id } = req.params;
+    if (!['movie', 'series'].includes(kind)) return res.status(400).json({ ok: false, error: 'VOD kind required' });
+    const ticket = resolveStreamTicket(requestStreamTicket(req), sourceId, kind, id);
+    const source = await getXtreamSource(sourceId, ticket?.accountOwnerId || requestAccountOwner(req));
+    if (!source) return res.status(404).json({ ok: false, error: 'Playlist source not found' });
+    res.set('Cache-Control', 'no-store');
+    res.json(await playbackDecision(req, source));
+  } catch (error) {
+    console.warn(`[PlaybackDecision] ${req.params.kind}:${req.params.id} client=${String(req.query.client || 'browser')} failed: ${error.message}`);
+    res.status(error.statusCode || 502).json({ ok: false, error: error.message });
   }
 });
 

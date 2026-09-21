@@ -27,8 +27,8 @@ test('HLS codec matrix selects remux, audio, video, and full transcode', () => {
   assert.equal(incompatibleVideo.strategy, HlsStrategy.VIDEO_TRANSCODE);
   assert.equal(determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'hevc', audioCodec: 'dts' }, roku).strategy, HlsStrategy.FULL_TRANSCODE);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.BROWSER)).strategy, HlsStrategy.REMUX);
-  assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.ANDROID)).strategy, HlsStrategy.FULL_TRANSCODE);
-  assert.equal(hlsPlaylistProfile({ client: PlaybackClient.BROWSER }).startupSegments, 1);
+  assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.ANDROID)).strategy, HlsStrategy.REMUX);
+  assert.equal(hlsPlaylistProfile({ client: PlaybackClient.BROWSER }).startupSegments, 3);
   assert.equal(hlsPlaylistProfile({ client: PlaybackClient.ROKU }).startupSegments, 3);
 });
 
@@ -50,4 +50,6 @@ test('direct playback normalizes ffprobe Matroska format names', () => {
   const capabilities = getPlaybackCapabilities(PlaybackClient.ROKU);
   const accepted = confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, capabilities, 'mp4');
   assert.equal(accepted.compatible, true);
+  assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.ANDROID), 'mkv').compatible, true);
+  assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.BROWSER), 'mkv').compatible, false);
 });
