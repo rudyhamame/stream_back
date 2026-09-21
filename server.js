@@ -2135,8 +2135,11 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   res.setHeader('X-RH-Strategy', 'DIRECT');
   res.setHeader('X-RH-Video-Mode', 'copy');
   if (!hasHlsVariants(manifest)) {
-    const mediaPlaylistUri = nativeHlsResourcePath(req, session, upstreamUrl);
-    const responseManifest = rokuSingleVariantMaster(mediaPlaylistUri);
+    // Android's Media3 accepts a media playlist as the root HLS response.
+    // Rewriting it in place avoids a synthetic master -> resource round trip,
+    // which could lose the in-memory resource mapping and return a 404 before
+    // playback ever reached the first provider segment.
+    const responseManifest = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
     session.manifests.set(upstreamUrl, responseManifest);
     res.send(responseManifest);
     return;
@@ -2645,8 +2648,14 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     const identity = mediaIdentity(req);
     const session = nativeHlsSession(req, identity);
     const upstreamUrl = session?.resources.get(req.params.resourceId);
-    if (!session || !upstreamUrl) return res.sendStatus(404);
-    if (session.userId && session.userId !== mediaOwner(req)) return res.sendStatus(404);
+    if (!session || !upstreamUrl) {
+      console.warn(`[Native HLS] channel:${req.params.id} resource miss session=${Boolean(session)} resources=${session?.resources.size || 0} resource=${req.params.resourceId}`);
+      return res.sendStatus(404);
+    }
+    if (session.userId && session.userId !== mediaOwner(req)) {
+      console.warn(`[Native HLS] channel:${req.params.id} resource owner mismatch`);
+      return res.sendStatus(404);
+    }
     releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
     const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Stream/1.0' };
     if (req.headers.range) headers.range = req.headers.range;
