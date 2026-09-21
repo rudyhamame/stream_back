@@ -2310,19 +2310,31 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   // to the authenticated RH resource relay, with no FFmpeg/transcoding.
   res.setHeader('X-RH-Strategy', 'DIRECT');
   res.setHeader('X-RH-Video-Mode', 'copy');
+  // Each player open keeps one load id across normal playlist refreshes. A
+  // reconnect changes it, so discard only start-selection state from the old
+  // rolling window while preserving this viewer's relay session.
+  const loadId = String(req.query.loadId || '');
+  if (loadId && loadId !== session.loadId) {
+    session.loadId = loadId;
+    session.stableStartSequence = undefined;
+    session.resourceBodies.clear();
+  }
   if (!hasHlsVariants(manifest)) {
     // Android's Media3 accepts a media playlist as the root HLS response.
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
-    // A new player load must re-pick its decodable start: the previous load's
-    // stable sequence has usually scrolled out of the provider's window, which
-    // returned the raw manifest and let Media3 start mid-GOP (no SPS/PPS).
-    const loadId = String(req.query.loadId || '');
-    if (loadId && loadId !== session.loadId) {
-      session.loadId = loadId;
-      session.stableStartSequence = undefined;
-      session.resourceBodies.clear();
+    if (String(req.query.client || '') === PlaybackClient.ROKU) {
+      // Roku requires a positive bitrate to choose a rendition. Providers
+      // often expose only a bare media playlist, which Roku rejects with
+      // error -5 "no valid bitrates". Wrap that media playlist in a local
+      // one-variant master; the resource handler performs timeline/start
+      // normalization and relays every provider segment unchanged.
+      const mediaPlaylistPath = nativeHlsResourcePath(req, session, manifestUrl);
+      const responseManifest = rokuSingleVariantMaster(mediaPlaylistPath);
+      session.manifests.set(upstreamUrl, responseManifest);
+      res.send(responseManifest);
+      return;
     }
     const normalizedManifest = normalizeNativeHlsTimeline(manifest, manifestUrl, session);
     const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
@@ -2683,12 +2695,12 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       // segment hosts/ports that the phone's network blocks. Proxy the original
       // HLS playlist and rewrite every child URI through RH. This is still
       // provider-native playback: the media bytes and codecs are unchanged.
-      if (target.client === PlaybackClient.ANDROID && !fastPreview && !nativeHlsDisabled && !target.maxHeight) {
+      if ([PlaybackClient.ANDROID, PlaybackClient.ROKU].includes(target.client) && !fastPreview && !nativeHlsDisabled && !target.maxHeight) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
           const upstreamUrl = suppliedProviderURL || session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
           await serveNativeHlsManifest(req, res, upstreamUrl, session, requestAbort.signal);
-          console.log(`[Native HLS] channel:${req.params.id} Android passthrough ready startupMs=${Date.now() - manifestRequestStartedAt}`);
+          console.log(`[Native HLS] channel:${req.params.id} ${target.client} passthrough ready startupMs=${Date.now() - manifestRequestStartedAt}`);
           return;
         } catch (error) {
           nativeHlsSessions.delete(session.key);
