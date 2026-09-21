@@ -155,6 +155,15 @@ async function requestProviderUrl(req, source, kind, id, extension = '') {
       error.statusCode = 400;
       throw error;
     }
+    // Never turn the public media relay into an arbitrary URL fetcher. The
+    // cached value remains the URL used for playback, but it must identify the
+    // exact media path owned by this authenticated provider source.
+    const expected = await sourceProviderUrl(source, kind, id, extension);
+    if (parsed.href !== new URL(expected).href) {
+      const error = new Error('The cached provider URL does not match this media item. Refresh the playlist and try again.');
+      error.statusCode = 400;
+      throw error;
+    }
     return supplied;
   }
   const resolved = await sourceProviderUrl(source, kind, id, extension);
