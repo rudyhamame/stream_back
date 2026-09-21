@@ -2105,6 +2105,18 @@ function nativeHlsResourcePath(req, session, upstreamUrl) {
   return query ? `${base}?${query}` : base;
 }
 
+function preferStableAndroidLiveStart(manifest) {
+  const text = String(manifest || '');
+  if (!text.startsWith('#EXTM3U') || /#EXT-X-START:/m.test(text)) return text;
+  // Several providers cut their three-second TS segments mid-GOP and repeat
+  // SPS/PPS only every few segments. Media3's normal near-edge selection can
+  // therefore begin on a segment that has samples but no format declaration,
+  // triggering SampleQueue's checkStateNotNull and a reconnect loop. The
+  // oldest segment in the rolling provider window is the safest complete GOP
+  // boundary and also gives Android enough real media to absorb relay jitter.
+  return text.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=NO');
+}
+
 async function fetchNativeHlsManifest(upstreamUrl, session, signal) {
   return nativeHlsResourceLocks.run(session.key, async () => {
     const response = await fetch(upstreamUrl, {
@@ -2153,7 +2165,8 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
-    const responseManifest = rewriteHlsManifest(manifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
+    const stableManifest = preferStableAndroidLiveStart(manifest);
+    const responseManifest = rewriteHlsManifest(stableManifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
     session.manifests.set(upstreamUrl, responseManifest);
     res.send(responseManifest);
     return;
@@ -2700,7 +2713,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     }
     const contentType = upstream.headers.get('content-type') || '';
     if (isHlsManifest(contentType, upstreamUrl, upstream.body.toString('utf8'))) {
-      const manifest = upstream.body.toString('utf8');
+      const manifest = preferStableAndroidLiveStart(upstream.body.toString('utf8'));
       const rewritten = rewriteHlsManifest(manifest, upstream.finalUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
