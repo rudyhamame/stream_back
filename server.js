@@ -99,6 +99,7 @@ function recallVodDuration(sourceId, kind, id) {
   return entry && entry.expiresAt > Date.now() ? entry.seconds : 0;
 }
 const mediaSourceLocks = new KeyedSerialExecutor();
+const nativeHlsResourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
@@ -2094,24 +2095,26 @@ function nativeHlsResourcePath(req, session, upstreamUrl) {
   return query ? `${base}?${query}` : base;
 }
 
-async function fetchNativeHlsManifest(upstreamUrl, signal) {
-  const response = await fetch(upstreamUrl, {
-    headers: { 'user-agent': 'RH-Stream/1.0' },
-    signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+async function fetchNativeHlsManifest(upstreamUrl, session, signal) {
+  return nativeHlsResourceLocks.run(session.key, async () => {
+    const response = await fetch(upstreamUrl, {
+      headers: { 'user-agent': 'RH-Stream/1.0', connection: 'close' },
+      signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+    });
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      throw new Error(`Native HLS manifest returned HTTP ${response.status}`);
+    }
+    const manifest = await response.text();
+    if (!isHlsManifest(response.headers.get('content-type'), upstreamUrl, manifest)) throw new Error('Provider did not return an HLS manifest');
+    return manifest;
   });
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
-    throw new Error(`Native HLS manifest returned HTTP ${response.status}`);
-  }
-  const manifest = await response.text();
-  if (!isHlsManifest(response.headers.get('content-type'), upstreamUrl, manifest)) throw new Error('Provider did not return an HLS manifest');
-  return manifest;
 }
 
 async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   let manifest;
   try {
-    manifest = await fetchNativeHlsManifest(upstreamUrl, signal);
+    manifest = await fetchNativeHlsManifest(upstreamUrl, session, signal);
   } catch (error) {
     const cached = session.manifests?.get(upstreamUrl);
     if (!cached) throw error;
@@ -2647,12 +2650,20 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
     const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Stream/1.0' };
     if (req.headers.range) headers.range = req.headers.range;
-    const upstream = await fetch(upstreamUrl, {
-      headers,
-      signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12_000)]),
+    // Many IPTV lines permit only one provider request at a time. Media3 can
+    // ask for the refreshed playlist and next segment concurrently, which
+    // makes those providers return 403 or stall. Buffer each small HLS child
+    // under a per-session lock, then release the provider connection before
+    // serving it to Android.
+    const upstream = await nativeHlsResourceLocks.run(session.key, async () => {
+      const response = await fetch(upstreamUrl, {
+        headers: { ...headers, connection: 'close' },
+        signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12_000)]),
+      });
+      const body = Buffer.from(await response.arrayBuffer());
+      return { ok: response.ok, status: response.status, headers: response.headers, body };
     });
     if (!upstream.ok && upstream.status !== 206) {
-      await upstream.body?.cancel().catch(() => {});
       const cached = session.manifests?.get(upstreamUrl);
       if (cached) {
         res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -2663,8 +2674,8 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
       return res.sendStatus(upstream.status || 502);
     }
     const contentType = upstream.headers.get('content-type') || '';
-    if (isHlsManifest(contentType, upstreamUrl)) {
-      const manifest = await upstream.text();
+    if (isHlsManifest(contentType, upstreamUrl, upstream.body.toString('utf8'))) {
+      const manifest = upstream.body.toString('utf8');
       const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -2677,8 +2688,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     }
     res.setHeader('Cache-Control', 'no-store');
     res.status(upstream.status);
-    if (!upstream.body) return res.end();
-    await pipeline(Readable.fromWeb(upstream.body), res);
+    res.send(upstream.body);
   } catch (error) {
     if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) {
       res.status(error.name === 'AbortError' ? 499 : 502).json({ error: error.message });
