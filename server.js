@@ -2315,6 +2315,15 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
+    // A new player load must re-pick its decodable start: the previous load's
+    // stable sequence has usually scrolled out of the provider's window, which
+    // returned the raw manifest and let Media3 start mid-GOP (no SPS/PPS).
+    const loadId = String(req.query.loadId || '');
+    if (loadId && loadId !== session.loadId) {
+      session.loadId = loadId;
+      session.stableStartSequence = undefined;
+      session.resourceBodies.clear();
+    }
     const normalizedManifest = normalizeNativeHlsTimeline(manifest, manifestUrl, session);
     const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
     const responseManifest = rewriteHlsManifest(stableManifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
