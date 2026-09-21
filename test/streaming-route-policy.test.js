@@ -9,6 +9,7 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/roku/auth-health?deviceToken=redacted',
     '/api/roku/internet-health?deviceToken=redacted',
     '/api/roku/playback-decision/source-1/movie/42?deviceToken=redacted&ext=mkv&client=roku',
+    '/api/debug/live/155491/bitrate',
     '/api/xtream/playback-decision/source-1/movie/42?deviceToken=redacted&ext=mp4&client=browser',
     '/api/playback/preview?sourceId=source-1&kind=channel&id=42',
     '/api/playback/preview?sourceId=source-1&kind=movie&id=42&at=120',
