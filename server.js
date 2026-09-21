@@ -1986,6 +1986,55 @@ app.get('/api/xtream/play/:sourceId/:kind/:id', async (req, res) => {
   }
 });
 
+// Android public-network DIRECT: relay the provider's original response bytes
+// unchanged through the RH HTTPS streamer. This is not HLS, remux, or
+// transcode. Android supplies its exact transient cached providerURL; the
+// server neither reconstructs nor persists it. Range requests are preserved
+// so Media3 can seek progressive VOD normally.
+app.get('/api/xtream/direct/:sourceId/:kind/:id', async (req, res) => {
+  const controller = new AbortController();
+  const abortUpstream = () => controller.abort(new Error('Direct client disconnected'));
+  res.once('close', abortUpstream);
+  let releaseDirectStream;
+  let headerTimeout;
+  try {
+    if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(400);
+    const mediaTicket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
+    const source = await getXtreamSource(req.params.sourceId, mediaTicket?.accountOwnerId || requestAccountOwner(req));
+    if (!source) return res.sendStatus(404);
+    const inputUrl = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
+    releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
+    const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Android/1.0', connection: 'close' };
+    if (req.headers.range) headers.range = req.headers.range;
+    headerTimeout = setTimeout(() => controller.abort(new Error('Provider Direct response timed out')), 15_000);
+    headerTimeout.unref?.();
+    const upstream = await fetch(inputUrl, { headers, redirect: 'follow', signal: controller.signal });
+    clearTimeout(headerTimeout);
+    headerTimeout = null;
+    if (!upstream.ok && upstream.status !== 206) {
+      await upstream.body?.cancel().catch(() => {});
+      return res.sendStatus(upstream.status || 502);
+    }
+    for (const name of ['content-length', 'content-range', 'content-type', 'etag', 'last-modified', 'accept-ranges']) {
+      const value = upstream.headers.get(name);
+      if (value) res.setHeader(name, value);
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-RH-Strategy', 'DIRECT');
+    res.status(upstream.status);
+    if (req.method === 'HEAD' || !upstream.body) return res.end();
+    await pipeline(Readable.fromWeb(upstream.body), res);
+  } catch (error) {
+    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) {
+      res.status(error.name === 'AbortError' ? 504 : 502).json({ error: error.message });
+    }
+  } finally {
+    if (headerTimeout) clearTimeout(headerTimeout);
+    releaseDirectStream?.();
+    res.off('close', abortUpstream);
+  }
+});
+
 function hlsStartSeconds(value) {
   // Keep tenth-of-a-second precision so a resume-after-interruption lands on
   // (near) the exact frame it stopped at, not the start of a 2s segment. The
