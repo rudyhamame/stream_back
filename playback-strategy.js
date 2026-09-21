@@ -2,14 +2,16 @@ import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
 
 export const HlsStrategy = Object.freeze({
   REMUX: 'HLS_REMUX',
-  PARTIAL_TRANSCODE: 'HLS_PARTIAL_TRANSCODE',
+  AUDIO_TRANSCODE: 'HLS_AUDIO_TRANSCODE',
+  VIDEO_TRANSCODE: 'HLS_VIDEO_TRANSCODE',
   FULL_TRANSCODE: 'HLS_FULL_TRANSCODE',
 });
 
 export const PlaybackStrategy = Object.freeze({
   DIRECT: 'DIRECT',
   REMUX: HlsStrategy.REMUX,
-  PARTIAL_TRANSCODE: HlsStrategy.PARTIAL_TRANSCODE,
+  AUDIO_TRANSCODE: HlsStrategy.AUDIO_TRANSCODE,
+  VIDEO_TRANSCODE: HlsStrategy.VIDEO_TRANSCODE,
   TRANSCODE: HlsStrategy.FULL_TRANSCODE,
 });
 
@@ -130,7 +132,7 @@ function audioCompatibility(metadata, capabilities) {
   return { compatible: true, reason: `${codec.toUpperCase()} stream is target-compatible`, outputChannels: channels || 2 };
 }
 
-export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybackCapabilities(PlaybackClient.ROKU), container = '') {
+export function containerCompatibility(metadata = {}, capabilities = getPlaybackCapabilities(PlaybackClient.ROKU), container = '') {
   const probedContainers = String(metadata.container || '').toLowerCase().split(',').map(value => value.trim()).filter(Boolean);
   let ext = String(container || '').replace(/^\./, '').trim().toLowerCase();
   if (probedContainers.length) {
@@ -139,9 +141,18 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
     else if (probedContainers.includes('mov')) ext = 'mov';
     else ext = probedContainers[0];
   }
-  if (!['mp4', 'm4v', 'mov', 'mkv'].includes(ext)) {
+  const directContainers = capabilities.client === PlaybackClient.ROKU
+    ? ['mp4', 'm4v', 'mov', 'mkv']
+    : ['mp4', 'm4v', 'mov'];
+  if (!directContainers.includes(ext)) {
     return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for Roku direct playback` };
   }
+  return { compatible: true, reason: `container ${ext} is target-compatible`, container: ext };
+}
+
+export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybackCapabilities(PlaybackClient.ROKU), container = '') {
+  const containerResult = containerCompatibility(metadata, capabilities, container);
+  if (!containerResult.compatible) return containerResult;
   const required = [
     ['video codec', metadata.videoCodec], ['video profile', metadata.videoProfile],
     ['video level', metadata.videoLevel], ['pixel format', metadata.pixelFormat],
@@ -161,7 +172,12 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
 export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlaybackCapabilities()) {
   const video = videoCompatibility(sourceMetadata, capabilities);
   const audio = audioCompatibility(sourceMetadata, capabilities);
-  if (capabilities.client !== PlaybackClient.BROWSER) return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: 'full-transcode-only policy' };
+  if (capabilities.client === PlaybackClient.ANDROID) {
+    return {
+      videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels,
+      strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Android HLS policy remains full transcode',
+    };
+  }
   const videoCompatible = video.compatible;
   const audioCompatible = audio.compatible;
   const detail = `${video.reason}; ${audio.reason}`;
@@ -170,10 +186,10 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
     return { videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX, reason: detail };
   }
   if (videoCompatible) {
-    return { videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: detail };
+    return { videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.AUDIO_TRANSCODE, reason: detail };
   }
   if (audioCompatible) {
-    return { videoMode: 'transcode', audioMode: 'copy', strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: detail };
+    return { videoMode: 'transcode', audioMode: 'copy', strategy: HlsStrategy.VIDEO_TRANSCODE, reason: detail };
   }
   return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: detail };
 }
@@ -234,7 +250,7 @@ export function applyQualityCeiling(decision, maxHeight, sourceHeight = 0) {
   const ceiling = Number(maxHeight) || 0;
   if (ceiling <= 0) return decision;
   if (sourceHeight > 0 && sourceHeight <= ceiling + 16) return decision;
-  const strategy = decision.audioMode === 'transcode' ? HlsStrategy.FULL_TRANSCODE : HlsStrategy.PARTIAL_TRANSCODE;
+  const strategy = decision.audioMode === 'transcode' ? HlsStrategy.FULL_TRANSCODE : HlsStrategy.VIDEO_TRANSCODE;
   return { ...decision, videoMode: 'transcode', maxHeight: ceiling, strategy, reason: `${decision.reason}; capped to ${ceiling}p` };
 }
 
@@ -243,7 +259,7 @@ export function fallbackHlsStrategy(decision) {
   if (decision.videoMode === 'copy' && decision.audioMode === 'copy') {
     return {
       videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: 2, maxHeight,
-      strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: 'Bounded fallback after copy/copy muxing failure',
+      strategy: HlsStrategy.AUDIO_TRANSCODE, reason: 'Bounded fallback after copy/copy muxing failure',
     };
   }
   return {

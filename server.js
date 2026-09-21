@@ -286,9 +286,8 @@ function requestedHlsFallback(req) {
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
   if (value === 'full' || value === HlsStrategy.FULL_TRANSCODE.toLowerCase()) return 'full';
   if (value === 'remux' || value === HlsStrategy.REMUX.toLowerCase()) return 'remux';
-  if (value === 'audio') return 'audio';
-  if (value === 'video') return 'video';
-  if (value === 'partial' || value === HlsStrategy.PARTIAL_TRANSCODE.toLowerCase()) return 'partial';
+  if (value === 'audio' || value === HlsStrategy.AUDIO_TRANSCODE.toLowerCase()) return 'audio';
+  if (value === 'video' || value === HlsStrategy.VIDEO_TRANSCODE.toLowerCase()) return 'video';
   return '';
 }
 
@@ -304,12 +303,12 @@ function forceHlsFallback(strategy, decision) {
     };
   }
   if (strategy === 'remux') return { ...decision, videoMode: 'copy', audioMode: 'copy', maxHeight, strategy: HlsStrategy.REMUX, reason: `${decision.reason}; diagnostic remux override` };
-  if (strategy === 'video') return { ...decision, videoMode: 'transcode', audioMode: 'copy', maxHeight, strategy: HlsStrategy.PARTIAL_TRANSCODE, reason: `${decision.reason}; diagnostic video-transcode override` };
+  if (strategy === 'video') return { ...decision, videoMode: 'transcode', audioMode: 'copy', maxHeight, strategy: HlsStrategy.VIDEO_TRANSCODE, reason: `${decision.reason}; video-transcode fallback selected` };
   return {
     ...decision, videoMode: strategy === 'audio' ? 'copy' : (decision.videoMode === 'copy' ? 'copy' : 'transcode'), audioMode: 'transcode',
     outputAudioChannels: Number(decision.outputAudioChannels) || 2,
-    maxHeight, strategy: HlsStrategy.PARTIAL_TRANSCODE,
-    reason: `${decision.reason}; Roku recovery fallback forced partial transcode`,
+    maxHeight, strategy: HlsStrategy.AUDIO_TRANSCODE,
+    reason: `${decision.reason}; audio-transcode fallback selected`,
   };
 }
 
@@ -695,7 +694,7 @@ app.get('/api/roku/internet-health', async (req, res) => {
 // Decide Roku VOD transport before assigning Video.content. Direct is offered
 // only when a bounded probe supplies every required media fact and the linked
 // Roku reports support for that exact combination. The probe result is cached,
-// so an incompatible source can enter Full Transcode without a second probe.
+// so an incompatible source can enter its selected HLS strategy without a second probe.
 app.get('/api/roku/playback-decision/:sourceId/:kind/:id', async (req, res) => {
   try {
     const token = String(req.get('x-device-token') || req.query.deviceToken || '');
@@ -718,14 +717,16 @@ app.get('/api/roku/playback-decision/:sourceId/:kind/:id', async (req, res) => {
     const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
     if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
     res.set('Cache-Control', 'no-store');
+    const selectedHlsDecision = determineHlsStrategy(metadata, target.capabilities);
+    const hlsDecision = forceRokuFullTranscode ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
     res.json({
       ok: true,
       directCompatible: direct.compatible,
-      playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : HlsStrategy.FULL_TRANSCODE,
-      videoMode: direct.compatible ? 'copy' : 'transcode',
-      audioMode: direct.compatible ? 'copy' : 'transcode',
+      playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
+      videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
+      audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
       durationSeconds,
-      reason: direct.reason,
+      reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
     });
   } catch (error) {
     res.status(502).json({ ok: false, error: error.message });
@@ -1904,7 +1905,7 @@ app.post('/api/xtream/playback/release', async (req, res) => {
 // - it does not proxy bytes, gate on a codec pre-check, or hold a provider
 // concurrency lease. The client's own player is the real arbiter of whether
 // the provider's file is playable, and each client already falls back to the
-// existing HLS full-transcode pipeline on a Direct error/timeout. Roku's own
+// compatibility-selected HLS pipeline on a Direct error/timeout. Roku's own
 // catalog now embeds the provider URL directly (see selectedXtreamItem /
 // buildXtreamSeriesPayload) and never calls this route at all; it stays here
 // only for Android/browser, which still request this exact path.
@@ -2164,7 +2165,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const capabilities = target.capabilities || getPlaybackCapabilities(target.client);
   const selectedDecision = seekableVod
     ? determineHlsStrategy(metadata, capabilities)
-    : determineHlsStrategy({ videoCodec: 'h264', audioCodec: 'aac' }, getPlaybackCapabilities(PlaybackClient.ROKU));
+    : forceHlsFallback('full', determineHlsStrategy({ videoCodec: 'h264', audioCodec: 'aac' }, getPlaybackCapabilities(PlaybackClient.ROKU)));
   // The home focused-card preview is a short-lived compatibility stream, not
   // production VOD AUTO playback.  Provider-native manifests are frequently
   // accepted by the proxy but rejected by Roku before it requests a segment.
@@ -2174,9 +2175,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const previewRemux = kind === 'channel' && strategyOverride === 'preview-remux';
   const baseDecision = previewRemux
     ? forceHlsFallback('remux', selectedDecision)
-    : target.client === PlaybackClient.BROWSER
-      ? (typeof strategyOverride === 'object' && strategyOverride ? strategyOverride : forceHlsFallback(strategyOverride, selectedDecision))
-      : forceHlsFallback('full', selectedDecision);
+    : typeof strategyOverride === 'object' && strategyOverride
+      ? strategyOverride
+      : forceHlsFallback(strategyOverride, selectedDecision);
   // No codec probe for live (avoids extra provider connections), so
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
@@ -2186,9 +2187,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
   console.log(`[Media HLS strategy] ${kind}:${id} ${probeSummary} videoMode=${decision.videoMode} audioMode=${decision.audioMode} strategy=${decision.strategy} reason="${decision.reason}"`);
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
-  // Production Roku HLS is the normalization path, so it always encodes video
-  // with VAAPI and audio as AAC. Copy/partial modes remain debug overrides.
-  const hardwareTranscode = seekableVod && target.client === PlaybackClient.ROKU && strategyUsesEncoding(decision);
+  // Every Roku strategy that converts video uses the stable VAAPI path. Remux
+  // and audio-only conversion preserve the original video bitstream.
+  const hardwareTranscode = seekableVod && target.client === PlaybackClient.ROKU && decision.videoMode === 'transcode';
   if (hardwareTranscode) console.log(`[Media HLS strategy] ${kind}:${id} Roku fallback GPU=VAAPI device=${process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'} video=h264_vaapi audio=aac keyframes=2s`);
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
@@ -2380,12 +2381,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         await mediaJobs.remove(job.key, 'provider-refused');
         break;
       }
-      let fallback = fallbackHlsStrategy(job.hlsDecision);
-      if (seekableVod && target.client === PlaybackClient.ROKU && job.hlsDecision.videoMode === 'copy') {
-        // Audio-only conversion cannot create video keyframes. Jump directly
-        // to the keyframe-controlled H.264 fallback after a startup timeout.
-        if (fallback.videoMode === 'copy') fallback = fallbackHlsStrategy(fallback);
-      }
+      const fallback = fallbackHlsStrategy(job.hlsDecision);
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, suppliedProviderURL);
