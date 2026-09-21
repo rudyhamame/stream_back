@@ -134,6 +134,38 @@ const getSourceCatalog = (source, kind) => sourceType(source) === 'm3u' ? getM3u
 const getSourceCategories = (source, kind) => sourceType(source) === 'm3u' ? getM3uCategories(source, kind) : getXtreamCategories(source, kind);
 const sourceProviderUrl = (source, kind, id, extension = '') => sourceType(source) === 'm3u' ? m3uProviderUrl(source, kind, id) : xtreamProviderUrl(source, kind, id, extension);
 
+// Android already receives the exact media URL when its provider catalog or
+// episode list is fetched. Reuse that transient cached value for playback so
+// Play does not resolve or reconstruct the URL again. The request is already
+// authenticated and scoped to a source owned by that account; the cached URL
+// must still be a valid HTTP(S) media URL.
+async function requestProviderUrl(req, source, kind, id, extension = '') {
+  const supplied = String(req.query.providerURL || '').trim();
+  const client = String(req.query.client || '').trim().toLowerCase();
+  if (client === PlaybackClient.ANDROID) {
+    if (!supplied) {
+      const error = new Error('The cached provider URL is unavailable. Refresh the playlist and try again.');
+      error.statusCode = 400;
+      throw error;
+    }
+    let parsed;
+    try { parsed = new URL(supplied); } catch { /* handled below */ }
+    if (!parsed || !['http:', 'https:'].includes(parsed.protocol)) {
+      const error = new Error('The cached provider URL is invalid.');
+      error.statusCode = 400;
+      throw error;
+    }
+    return supplied;
+  }
+  const resolved = await sourceProviderUrl(source, kind, id, extension);
+  if (supplied && supplied !== resolved) {
+    const error = new Error('The provider URL does not match this media item.');
+    error.statusCode = 400;
+    throw error;
+  }
+  return resolved;
+}
+
 // Watch-with-Partner start barrier: distinct viewer ids seen on a session's
 // manifest in the last 15s. The manifest is withheld from BOTH players until
 // this reaches 2 and the shared job has enough segments, so neither can start
@@ -694,18 +726,11 @@ app.get('/api/roku/internet-health', async (req, res) => {
 // Decide VOD transport before a client assigns media to its player. Direct is
 // offered only when a bounded probe supplies every required media fact and the
 // requesting client supports that exact container/codec combination. The
-// provider URL is fetched from the provider using the item identity first;
-// any client URL is validation-only and is never used as the probe input.
+// Android can supply the exact runtime URL from its provider-catalog cache;
+// other clients resolve it from the authenticated source identity here.
 async function playbackDecision(req, source) {
   const { kind, id } = req.params;
-  const fetchedProviderURL = await sourceProviderUrl(source, kind, id, req.query.ext);
-  const suppliedProviderURL = String(req.query.providerURL || '');
-  if (suppliedProviderURL && suppliedProviderURL !== fetchedProviderURL) {
-    const error = new Error('The provider URL does not match this media item.');
-    error.statusCode = 400;
-    throw error;
-  }
-  const inputUrl = fetchedProviderURL;
+  const inputUrl = await requestProviderUrl(req, source, kind, id, req.query.ext);
   const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
   const metadata = await providerCodecMetadata(cacheKey, inputUrl);
   if (metadata.providerUnavailable) {
@@ -729,7 +754,7 @@ async function playbackDecision(req, source) {
     videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
     audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
     durationSeconds,
-    providerURL: fetchedProviderURL,
+    providerURL: inputUrl,
     reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
   };
 }
@@ -2169,11 +2194,11 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
 
   const capacityKey = providerLeaseKey(source);
 
-  // Always fetch the current provider URL from the provider identity before
-  // probing. A client-supplied URL may be checked for consistency, but never
-  // becomes the authoritative input and is never read from persistence.
-  const fetchedProviderURL = await sourceProviderUrl(source, kind, id, extension);
-  const inputUrl = fetchedProviderURL;
+  // Android carries the exact URL from its already-fetched catalog cache.
+  // Other clients retain their existing identity-based resolution behavior.
+  const inputUrl = target.client === PlaybackClient.ANDROID && suppliedProviderURL
+    ? suppliedProviderURL
+    : await sourceProviderUrl(source, kind, id, extension);
   const providerCacheKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
   evictCodecProbeCache();
   const cachedProviderState = codecProbeCache.get(providerCacheKey)?.metadata;
@@ -2362,9 +2387,8 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const target = playbackTarget(req);
     const suppliedProviderURL = String(req.query.providerURL || '');
     if (target.client === PlaybackClient.BROWSER && !suppliedProviderURL) return res.status(400).json({ error: 'The original provider URL is required for browser streaming.' });
-    if (suppliedProviderURL) {
-      const expectedProviderURL = await sourceProviderUrl(source, req.params.kind, req.params.id, req.query.ext);
-      if (suppliedProviderURL !== expectedProviderURL) return res.status(400).json({ error: 'The provider URL does not match this media item.' });
+    if (suppliedProviderURL || target.client === PlaybackClient.ANDROID) {
+      await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
