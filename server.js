@@ -2072,7 +2072,7 @@ function nativeHlsSession(req, identity, create = false) {
   let session = nativeHlsSessions.get(key);
   if (session && session.userId && session.userId !== identity.userId) session = null;
   if (!session && create) {
-    session = { key, userId: identity.userId, viewerId: identity.viewerId, resources: new Map(), expiresAt: Date.now() + nativeHlsSessionTtlMs };
+    session = { key, userId: identity.userId, viewerId: identity.viewerId, resources: new Map(), manifests: new Map(), expiresAt: Date.now() + nativeHlsSessionTtlMs };
     nativeHlsSessions.set(key, session);
     evictNativeHlsSessions();
   }
@@ -2109,7 +2109,19 @@ async function fetchNativeHlsManifest(upstreamUrl, signal) {
 }
 
 async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
-  const manifest = await fetchNativeHlsManifest(upstreamUrl, signal);
+  let manifest;
+  try {
+    manifest = await fetchNativeHlsManifest(upstreamUrl, signal);
+  } catch (error) {
+    const cached = session.manifests?.get(upstreamUrl);
+    if (!cached) throw error;
+    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-RH-Strategy', 'DIRECT');
+    res.setHeader('X-RH-Video-Mode', 'copy');
+    res.send(cached);
+    return;
+  }
   session.rootUrl = upstreamUrl;
   session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -2121,11 +2133,15 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   res.setHeader('X-RH-Video-Mode', 'copy');
   if (!hasHlsVariants(manifest)) {
     const mediaPlaylistUri = nativeHlsResourcePath(req, session, upstreamUrl);
-    res.send(rokuSingleVariantMaster(mediaPlaylistUri));
+    const responseManifest = rokuSingleVariantMaster(mediaPlaylistUri);
+    session.manifests.set(upstreamUrl, responseManifest);
+    res.send(responseManifest);
     return;
   }
   const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
-  res.send(normalizeHlsMasterForRoku(rewritten));
+  const responseManifest = normalizeHlsMasterForRoku(rewritten);
+  session.manifests.set(upstreamUrl, responseManifest);
+  res.send(responseManifest);
 }
 
 async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false, requiredSegments = 1) {
@@ -2637,12 +2653,20 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     });
     if (!upstream.ok && upstream.status !== 206) {
       await upstream.body?.cancel().catch(() => {});
+      const cached = session.manifests?.get(upstreamUrl);
+      if (cached) {
+        res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
+        res.setHeader('Cache-Control', 'no-store');
+        res.setHeader('X-RH-Strategy', 'DIRECT');
+        return res.send(cached);
+      }
       return res.sendStatus(upstream.status || 502);
     }
     const contentType = upstream.headers.get('content-type') || '';
     if (isHlsManifest(contentType, upstreamUrl)) {
       const manifest = await upstream.text();
       const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+      session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control', 'no-store');
       return res.send(rewritten);
