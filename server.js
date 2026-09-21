@@ -2080,6 +2080,8 @@ function nativeHlsSession(req, identity, create = false) {
       resources: new Map(),
       manifests: new Map(),
       resourceBodies: new Map(),
+      timelineSequences: new Map(),
+      nextTimelineSequence: 0,
       cacheBust: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
       expiresAt: Date.now() + nativeHlsSessionTtlMs,
     };
@@ -2151,6 +2153,34 @@ function hasDecodableVideoStart(body) {
     if ((h264Sps && h264Pps && h264Idr) || (hevcVps && hevcSps && hevcPps && hevcIdr)) return true;
   }
   return false;
+}
+
+function normalizeNativeHlsTimeline(manifest, manifestUrl, session) {
+  const text = String(manifest || '');
+  const urls = text.split('\n').filter(line => line.trim() && !line.trim().startsWith('#'))
+    .map(line => new URL(line.trim(), manifestUrl).toString());
+  if (!urls.length) return text;
+  const identities = urls.map(url => {
+    const parsed = new URL(url);
+    return `${parsed.host}${parsed.pathname}`;
+  });
+  let firstSequence = -1;
+  for (let index = 0; index < identities.length; index++) {
+    const known = session.timelineSequences.get(identities[index]);
+    if (Number.isFinite(known)) { firstSequence = known - index; break; }
+  }
+  if (firstSequence < 0) firstSequence = session.nextTimelineSequence || 0;
+  for (let index = 0; index < identities.length; index++) {
+    session.timelineSequences.set(identities[index], firstSequence + index);
+  }
+  session.nextTimelineSequence = Math.max(session.nextTimelineSequence || 0, firstSequence + identities.length);
+  while (session.timelineSequences.size > 512) {
+    session.timelineSequences.delete(session.timelineSequences.keys().next().value);
+  }
+  if (/#EXT-X-MEDIA-SEQUENCE:\d+/m.test(text)) {
+    return text.replace(/#EXT-X-MEDIA-SEQUENCE:\d+/m, `#EXT-X-MEDIA-SEQUENCE:${firstSequence}`);
+  }
+  return text.replace('#EXTM3U', `#EXTM3U\n#EXT-X-MEDIA-SEQUENCE:${firstSequence}`);
 }
 
 async function selectStableAndroidLiveStart(manifest, manifestUrl, session, signal) {
@@ -2238,7 +2268,8 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
-    const stableManifest = await selectStableAndroidLiveStart(manifest, manifestUrl, session, signal);
+    const normalizedManifest = normalizeNativeHlsTimeline(manifest, manifestUrl, session);
+    const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
     const responseManifest = rewriteHlsManifest(stableManifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
     session.manifests.set(upstreamUrl, responseManifest);
     res.send(responseManifest);
@@ -2795,7 +2826,8 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     }
     const contentType = upstream.headers.get('content-type') || '';
     if (isHlsManifest(contentType, upstreamUrl, upstream.body.toString('utf8'))) {
-      const manifest = await selectStableAndroidLiveStart(upstream.body.toString('utf8'), upstream.finalUrl, session, controller.signal);
+      const normalizedManifest = normalizeNativeHlsTimeline(upstream.body.toString('utf8'), upstream.finalUrl, session);
+      const manifest = await selectStableAndroidLiveStart(normalizedManifest, upstream.finalUrl, session, controller.signal);
       const rewritten = rewriteHlsManifest(manifest, upstream.finalUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
