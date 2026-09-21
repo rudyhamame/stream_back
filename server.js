@@ -2079,6 +2079,7 @@ function nativeHlsSession(req, identity, create = false) {
       viewerId: identity.viewerId,
       resources: new Map(),
       manifests: new Map(),
+      resourceBodies: new Map(),
       cacheBust: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
       expiresAt: Date.now() + nativeHlsSessionTtlMs,
     };
@@ -2105,16 +2106,88 @@ function nativeHlsResourcePath(req, session, upstreamUrl) {
   return query ? `${base}?${query}` : base;
 }
 
-function preferStableAndroidLiveStart(manifest) {
+function preferStableAndroidLiveStart(manifest, firstSegmentIndex = 0) {
   const text = String(manifest || '');
-  if (!text.startsWith('#EXTM3U') || /#EXT-X-START:/m.test(text)) return text;
+  if (!text.startsWith('#EXTM3U')) return text;
+  const lines = text.split('\n');
+  const extinf = [];
+  for (let index = 0; index < lines.length; index++) {
+    if (lines[index].startsWith('#EXTINF:')) extinf.push(index);
+  }
+  const selected = Math.max(0, Math.min(extinf.length - 1, Number(firstSegmentIndex) || 0));
+  let stable = text;
+  if (selected > 0 && extinf.length > selected) {
+    stable = [...lines.slice(0, extinf[0]), ...lines.slice(extinf[selected])].join('\n');
+    stable = stable.replace(/#EXT-X-MEDIA-SEQUENCE:(\d+)/, (_line, value) =>
+      `#EXT-X-MEDIA-SEQUENCE:${Number(value) + selected}`);
+  }
+  stable = stable.replace(/^#EXT-X-START:.*\n?/m, '');
   // Several providers cut their three-second TS segments mid-GOP and repeat
   // SPS/PPS only every few segments. Media3's normal near-edge selection can
   // therefore begin on a segment that has samples but no format declaration,
   // triggering SampleQueue's checkStateNotNull and a reconnect loop. The
   // oldest segment in the rolling provider window is the safest complete GOP
   // boundary and also gives Android enough real media to absorb relay jitter.
-  return text.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=NO');
+  return stable.replace('#EXTM3U', '#EXTM3U\n#EXT-X-START:TIME-OFFSET=0,PRECISE=NO');
+}
+
+function hasDecodableVideoStart(body) {
+  let h264Sps = false, h264Pps = false, h264Idr = false;
+  let hevcVps = false, hevcSps = false, hevcPps = false, hevcIdr = false;
+  for (let index = 0; index + 5 < body.length; index++) {
+    let nal = -1;
+    if (body[index] === 0 && body[index + 1] === 0 && body[index + 2] === 1) nal = body[index + 3];
+    else if (body[index] === 0 && body[index + 1] === 0 && body[index + 2] === 0 && body[index + 3] === 1) nal = body[index + 4];
+    if (nal < 0) continue;
+    const h264Type = nal & 0x1f;
+    if (h264Type === 7) h264Sps = true;
+    else if (h264Type === 8) h264Pps = true;
+    else if (h264Type === 5) h264Idr = true;
+    const hevcType = (nal >> 1) & 0x3f;
+    if (hevcType === 32) hevcVps = true;
+    else if (hevcType === 33) hevcSps = true;
+    else if (hevcType === 34) hevcPps = true;
+    else if (hevcType === 19 || hevcType === 20) hevcIdr = true;
+    if ((h264Sps && h264Pps && h264Idr) || (hevcVps && hevcSps && hevcPps && hevcIdr)) return true;
+  }
+  return false;
+}
+
+async function selectStableAndroidLiveStart(manifest, manifestUrl, session, signal) {
+  const lines = String(manifest).split('\n');
+  const segmentUrls = lines.filter(line => line.trim() && !line.trim().startsWith('#'))
+    .map(line => new URL(line.trim(), manifestUrl).toString());
+  const sequence = Number(String(manifest).match(/#EXT-X-MEDIA-SEQUENCE:(\d+)/)?.[1] || 0);
+  if (!segmentUrls.length) return preferStableAndroidLiveStart(manifest);
+  if (Number.isFinite(session.stableStartSequence)) {
+    const index = session.stableStartSequence - sequence;
+    if (index >= 0 && index < segmentUrls.length) return preferStableAndroidLiveStart(manifest, index);
+    return manifest;
+  }
+  const nearEdge = Math.max(0, segmentUrls.length - 4);
+  const order = [];
+  for (let index = nearEdge; index >= 0 && order.length < 7; index--) order.push(index);
+  for (let index = nearEdge + 1; index < segmentUrls.length && order.length < 7; index++) order.push(index);
+  for (const index of order) {
+    try {
+      const url = segmentUrls[index];
+      const prefetched = await nativeHlsResourceLocks.run(session.key, async () => {
+        const response = await fetch(url, {
+          headers: { 'user-agent': 'RH-Stream/1.0', connection: 'close' },
+          signal: AbortSignal.any([signal, AbortSignal.timeout(8_000)]),
+        });
+        if (!response.ok) { await response.body?.cancel().catch(() => {}); return null; }
+        return { body: Buffer.from(await response.arrayBuffer()), contentType: response.headers.get('content-type') || 'video/mp2t' };
+      });
+      if (!prefetched) continue;
+      session.resourceBodies.set(url, prefetched);
+      if (!hasDecodableVideoStart(prefetched.body)) continue;
+      session.stableStartSequence = sequence + index;
+      console.log(`[Native HLS] stable Android start sequence=${session.stableStartSequence} inspected=${order.indexOf(index) + 1}`);
+      return preferStableAndroidLiveStart(manifest, index);
+    } catch { /* inspect the next bounded candidate */ }
+  }
+  return preferStableAndroidLiveStart(manifest);
 }
 
 async function fetchNativeHlsManifest(upstreamUrl, session, signal) {
@@ -2165,7 +2238,7 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
-    const stableManifest = preferStableAndroidLiveStart(manifest);
+    const stableManifest = await selectStableAndroidLiveStart(manifest, manifestUrl, session, signal);
     const responseManifest = rewriteHlsManifest(stableManifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
     session.manifests.set(upstreamUrl, responseManifest);
     res.send(responseManifest);
@@ -2686,6 +2759,15 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
       return res.sendStatus(404);
     }
     releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
+    const prefetched = session.resourceBodies?.get(upstreamUrl);
+    if (prefetched) {
+      session.resourceBodies.delete(upstreamUrl);
+      res.setHeader('Content-Type', prefetched.contentType || 'video/mp2t');
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-RH-Strategy', 'DIRECT');
+      res.setHeader('X-RH-Video-Mode', 'copy');
+      return res.send(prefetched.body);
+    }
     const headers = { 'user-agent': req.headers['user-agent'] || 'RH-Stream/1.0' };
     if (req.headers.range) headers.range = req.headers.range;
     // Many IPTV lines permit only one provider request at a time. Media3 can
@@ -2713,7 +2795,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     }
     const contentType = upstream.headers.get('content-type') || '';
     if (isHlsManifest(contentType, upstreamUrl, upstream.body.toString('utf8'))) {
-      const manifest = preferStableAndroidLiveStart(upstream.body.toString('utf8'));
+      const manifest = await selectStableAndroidLiveStart(upstream.body.toString('utf8'), upstream.finalUrl, session, controller.signal);
       const rewritten = rewriteHlsManifest(manifest, upstream.finalUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
