@@ -2136,6 +2136,7 @@ function preferStableAndroidLiveStart(manifest, firstSegmentIndex = 0) {
 function hasDecodableVideoStart(body) {
   let h264Sps = false, h264Pps = false, h264Idr = false;
   let hevcVps = false, hevcSps = false, hevcPps = false, hevcIdr = false;
+  let h264SamplesBeforeFormat = false, hevcSamplesBeforeFormat = false;
   for (let index = 0; index + 5 < body.length; index++) {
     let nal = -1;
     if (body[index] === 0 && body[index + 1] === 0 && body[index + 2] === 1) nal = body[index + 3];
@@ -2144,13 +2145,20 @@ function hasDecodableVideoStart(body) {
     const h264Type = nal & 0x1f;
     if (h264Type === 7) h264Sps = true;
     else if (h264Type === 8) h264Pps = true;
-    else if (h264Type === 5) h264Idr = true;
+    else if (h264Type >= 1 && h264Type <= 5) {
+      if (!h264Sps || !h264Pps) h264SamplesBeforeFormat = true;
+      if (h264Type === 5) h264Idr = true;
+    }
     const hevcType = (nal >> 1) & 0x3f;
     if (hevcType === 32) hevcVps = true;
     else if (hevcType === 33) hevcSps = true;
     else if (hevcType === 34) hevcPps = true;
-    else if (hevcType === 19 || hevcType === 20) hevcIdr = true;
-    if ((h264Sps && h264Pps && h264Idr) || (hevcVps && hevcSps && hevcPps && hevcIdr)) return true;
+    else if (hevcType <= 31) {
+      if (!hevcVps || !hevcSps || !hevcPps) hevcSamplesBeforeFormat = true;
+      if (hevcType === 19 || hevcType === 20) hevcIdr = true;
+    }
+    if (!h264SamplesBeforeFormat && h264Sps && h264Pps && h264Idr) return true;
+    if (!hevcSamplesBeforeFormat && hevcVps && hevcSps && hevcPps && hevcIdr) return true;
   }
   return false;
 }
