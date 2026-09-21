@@ -2114,6 +2114,11 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
   res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
   res.setHeader('Cache-Control', 'no-store');
+  // Native HLS is a provider-byte passthrough. Android uses this so its
+  // connection only needs to reach RH; every provider segment URI is rewritten
+  // to the authenticated RH resource relay, with no FFmpeg/transcoding.
+  res.setHeader('X-RH-Strategy', 'DIRECT');
+  res.setHeader('X-RH-Video-Mode', 'copy');
   if (!hasHlsVariants(manifest)) {
     const mediaPlaylistUri = nativeHlsResourcePath(req, session, upstreamUrl);
     res.send(rokuSingleVariantMaster(mediaPlaylistUri));
@@ -2465,6 +2470,23 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     if (req.params.kind === 'channel') {
       const existingNativeSession = nativeHlsSession(req, identity);
       if ((nativeHlsDisabled || target.maxHeight) && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
+      // Android can reach RH over HTTPS but some provider playlists point at
+      // segment hosts/ports that the phone's network blocks. Proxy the original
+      // HLS playlist and rewrite every child URI through RH. This is still
+      // provider-native playback: the media bytes and codecs are unchanged.
+      if (target.client === PlaybackClient.ANDROID && !fastPreview && !nativeHlsDisabled && !target.maxHeight) {
+        const session = existingNativeSession || nativeHlsSession(req, identity, true);
+        try {
+          const upstreamUrl = suppliedProviderURL || session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
+          await serveNativeHlsManifest(req, res, upstreamUrl, session, requestAbort.signal);
+          console.log(`[Native HLS] channel:${req.params.id} Android passthrough ready startupMs=${Date.now() - manifestRequestStartedAt}`);
+          return;
+        } catch (error) {
+          nativeHlsSessions.delete(session.key);
+          if (res.headersSent || res.destroyed) return;
+          console.warn(`[Native HLS] channel:${req.params.id} Android passthrough unavailable; using HLS pipeline: ${error.message}`);
+        }
+      }
       // A manual quality rung means transcode-to-that-height; the native
       // passthrough just relays the provider's own manifest unmodified, so it
       // can never honor a rung and must be skipped in favor of the ffmpeg path.
