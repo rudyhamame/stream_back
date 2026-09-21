@@ -2116,15 +2116,19 @@ async function fetchNativeHlsManifest(upstreamUrl, session, signal) {
       throw new Error(`Native HLS manifest returned HTTP ${response.status}`);
     }
     const manifest = await response.text();
-    if (!isHlsManifest(response.headers.get('content-type'), upstreamUrl, manifest)) throw new Error('Provider did not return an HLS manifest');
-    return manifest;
+    const manifestUrl = response.url || upstreamUrl;
+    if (!isHlsManifest(response.headers.get('content-type'), manifestUrl, manifest)) throw new Error('Provider did not return an HLS manifest');
+    // fetch follows redirects. Relative HLS child URIs are relative to the
+    // final response URL, which some providers move to a different host/port.
+    return { manifest, manifestUrl };
   });
 }
 
 async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   let manifest;
+  let manifestUrl = upstreamUrl;
   try {
-    manifest = await fetchNativeHlsManifest(upstreamUrl, session, signal);
+    ({ manifest, manifestUrl } = await fetchNativeHlsManifest(upstreamUrl, session, signal));
   } catch (error) {
     const cached = session.manifests?.get(upstreamUrl);
     if (!cached) throw error;
@@ -2149,12 +2153,12 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
     // Rewriting it in place avoids a synthetic master -> resource round trip,
     // which could lose the in-memory resource mapping and return a 404 before
     // playback ever reached the first provider segment.
-    const responseManifest = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+    const responseManifest = rewriteHlsManifest(manifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
     session.manifests.set(upstreamUrl, responseManifest);
     res.send(responseManifest);
     return;
   }
-  const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+  const rewritten = rewriteHlsManifest(manifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
   const responseManifest = normalizeHlsMasterForRoku(rewritten);
   session.manifests.set(upstreamUrl, responseManifest);
   res.send(responseManifest);
@@ -2682,7 +2686,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
         signal: AbortSignal.any([controller.signal, AbortSignal.timeout(12_000)]),
       });
       const body = Buffer.from(await response.arrayBuffer());
-      return { ok: response.ok, status: response.status, headers: response.headers, body };
+      return { ok: response.ok, status: response.status, headers: response.headers, body, finalUrl: response.url || upstreamUrl };
     });
     if (!upstream.ok && upstream.status !== 206) {
       const cached = session.manifests?.get(upstreamUrl);
@@ -2697,7 +2701,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     const contentType = upstream.headers.get('content-type') || '';
     if (isHlsManifest(contentType, upstreamUrl, upstream.body.toString('utf8'))) {
       const manifest = upstream.body.toString('utf8');
-      const rewritten = rewriteHlsManifest(manifest, upstreamUrl, url => nativeHlsResourcePath(req, session, url));
+      const rewritten = rewriteHlsManifest(manifest, upstream.finalUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
       res.setHeader('Cache-Control', 'no-store');
