@@ -2163,6 +2163,41 @@ function hasDecodableVideoStart(body) {
   return false;
 }
 
+function sanitizeH264TransportStreamStart(body) {
+  if (!Buffer.isBuffer(body) || body.length < 188 || body[0] !== 0x47) return null;
+  let spsOffset = -1;
+  for (let index = 0; index + 5 < body.length; index++) {
+    let nalOffset = -1;
+    if (body[index] === 0 && body[index + 1] === 0 && body[index + 2] === 1) nalOffset = index + 3;
+    else if (body[index] === 0 && body[index + 1] === 0 && body[index + 2] === 0 && body[index + 3] === 1) nalOffset = index + 4;
+    if (nalOffset >= 0 && (body[nalOffset] & 0x1f) === 7) { spsOffset = index; break; }
+  }
+  if (spsOffset < 0) return null;
+  const tail = body.subarray(spsOffset);
+  const hasPps = tail.includes(Buffer.from([0, 0, 1, 0x68])) || tail.includes(Buffer.from([0, 0, 0, 1, 0x68]));
+  const hasIdr = tail.includes(Buffer.from([0, 0, 1, 0x65])) || tail.includes(Buffer.from([0, 0, 0, 1, 0x65]));
+  if (!hasPps || !hasIdr) return null;
+  const firstMediaPacket = Math.floor(spsOffset / 188) * 188;
+  let pat = null, pmt = null;
+  for (let offset = 0; offset < firstMediaPacket; offset += 188) {
+    if (body[offset] !== 0x47 || offset + 188 > body.length) break;
+    const pid = ((body[offset + 1] & 0x1f) << 8) | body[offset + 2];
+    const payloadControl = (body[offset + 3] >> 4) & 0x03;
+    if (!(payloadControl & 0x01)) continue;
+    let payload = offset + 4;
+    if (payloadControl & 0x02) payload += 1 + body[payload];
+    if (payload >= offset + 188) continue;
+    if (pid === 0) pat = Buffer.from(body.subarray(offset, offset + 188));
+    if (body[offset + 1] & 0x40) {
+      const pointer = body[payload] || 0;
+      const table = payload + 1 + pointer;
+      if (table < offset + 188 && body[table] === 0x02) pmt = Buffer.from(body.subarray(offset, offset + 188));
+    }
+  }
+  if (!pat || !pmt) return null;
+  return Buffer.concat([pat, pmt, body.subarray(firstMediaPacket)]);
+}
+
 function normalizeNativeHlsTimeline(manifest, manifestUrl, session) {
   const text = String(manifest || '');
   const urls = text.split('\n').filter(line => line.trim() && !line.trim().startsWith('#'))
@@ -2218,8 +2253,12 @@ async function selectStableAndroidLiveStart(manifest, manifestUrl, session, sign
         return { body: Buffer.from(await response.arrayBuffer()), contentType: response.headers.get('content-type') || 'video/mp2t' };
       });
       if (!prefetched) continue;
+      const cleanStart = hasDecodableVideoStart(prefetched.body)
+        ? prefetched.body
+        : sanitizeH264TransportStreamStart(prefetched.body);
+      if (!cleanStart) continue;
+      prefetched.body = cleanStart;
       session.resourceBodies.set(url, prefetched);
-      if (!hasDecodableVideoStart(prefetched.body)) continue;
       session.stableStartSequence = sequence + index;
       console.log(`[Native HLS] stable Android start sequence=${session.stableStartSequence} inspected=${order.indexOf(index) + 1}`);
       return preferStableAndroidLiveStart(manifest, index);
