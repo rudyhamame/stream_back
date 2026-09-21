@@ -2830,6 +2830,16 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     }
     const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
+    if (target.client === PlaybackClient.ROKU && String(req.query.media || '') !== '1' && !hasHlsVariants(manifestText)) {
+      // FFmpeg writes a media playlist directly to master.m3u8. Roku may
+      // reject a bare media playlist with error -5 (no valid bitrates), just
+      // as it does for provider-native bare playlists. Return a one-rendition
+      // master with a positive BANDWIDTH and let its child request retrieve
+      // the already-authenticated media playlist from this same generation.
+      const mediaPlaylistUrl = new URL(req.originalUrl, 'http://localhost');
+      mediaPlaylistUrl.searchParams.set('media', '1');
+      return res.send(rokuSingleVariantMaster(`${mediaPlaylistUrl.pathname}${mediaPlaylistUrl.search}`));
+    }
     res.send(manifestText);
   } catch (error) {
     console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} manifest failed: ${error.message}`);
