@@ -42,6 +42,63 @@ function normalizedAccountLibrary(library) {
     if (value instanceof Date || value._bsontype) return value;
     return Object.fromEntries(Object.entries(value).filter(([key]) => !['providerURL', 'providerUrl'].includes(key)).map(([key, child]) => [key, withoutProviderUrls(child)]));
   };
+  const rawHistory = library?.streaming_history || {};
+  const rows = Array.isArray(rawHistory)
+    ? rawHistory
+    : [
+      ...(Array.isArray(rawHistory.series) ? rawHistory.series.flatMap(group =>
+        (Array.isArray(group?.episodes) ? group.episodes : []).map(episode => ({
+          ...episode,
+          providerIdentity: {
+            ...group.providerIdentity,
+            ...episode?.providerIdentity,
+            kind: 'series',
+            seriesId: episode?.providerIdentity?.seriesId || group.providerIdentity?.seriesId || '',
+          },
+        }))
+      ) : []),
+      ...(Array.isArray(rawHistory.episodes) ? rawHistory.episodes : []),
+      ...(Array.isArray(rawHistory.movies) ? rawHistory.movies : []),
+      ...(Array.isArray(rawHistory.live) ? rawHistory.live : []),
+    ];
+  const historyByIdentity = new Map();
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue;
+    const identity = row.providerIdentity || (row.providerURL && typeof row.providerURL === 'object' ? row.providerURL : {});
+    const sourceId = String(identity.sourceId || row.sourceId || '');
+    const itemId = String(identity.itemId || row.itemId || '');
+    if (!sourceId || !itemId) continue;
+    const rawKind = String(identity.kind || row.kind || 'movie').toLowerCase();
+    const kind = ['live', 'channel'].includes(rawKind) ? 'channel' : (['series', 'episode'].includes(rawKind) ? 'series' : 'movie');
+    const { itemId: _itemId, kind: _kind, sourceId: _sourceId, seriesId: _seriesId, providerIdentity: _providerIdentity, providerURL: _providerURL, providerUrl: _providerUrl, ...metadata } = row;
+    const normalized = {
+      ...withoutProviderUrls(metadata),
+      lastWatched: String(row.lastWatched || '00:00:00'),
+      providerIdentity: {
+        itemId,
+        kind,
+        sourceId,
+        ...(kind === 'series' && (identity.seriesId || row.seriesId) ? { seriesId: String(identity.seriesId || row.seriesId) } : {}),
+      },
+    };
+    const key = `${sourceId}:${kind}:${itemId}`;
+    const previous = historyByIdentity.get(key);
+    if (!previous || new Date(normalized.updatedAt || 0) >= new Date(previous.updatedAt || 0)) historyByIdentity.set(key, normalized);
+  }
+  const streamingHistory = { series: [], movies: [], live: [] };
+  for (const row of historyByIdentity.values()) {
+    const identity = row.providerIdentity;
+    if (identity.kind === 'channel') streamingHistory.live.push(row);
+    else if (identity.kind === 'series') {
+      const seriesId = identity.seriesId || '';
+      let group = streamingHistory.series.find(entry => entry.providerIdentity.sourceId === identity.sourceId && entry.providerIdentity.seriesId === seriesId);
+      if (!group) {
+        group = { providerIdentity: { sourceId: identity.sourceId, kind: 'series', seriesId }, episodes: [] };
+        streamingHistory.series.push(group);
+      }
+      group.episodes.push({ ...row, providerIdentity: { itemId: identity.itemId } });
+    } else streamingHistory.movies.push(row);
+  }
   return {
     favorites: Array.isArray(library?.favorites) ? withoutProviderUrls(library.favorites) : [],
     savedSelections: {
@@ -49,12 +106,7 @@ function normalizedAccountLibrary(library) {
       movies: Array.isArray(library?.savedSelections?.movies) ? withoutProviderUrls(library.savedSelections.movies) : [],
       live: Array.isArray(library?.savedSelections?.live) ? withoutProviderUrls(library.savedSelections.live) : [],
     },
-    series_last_watched: Array.isArray(library?.series_last_watched) ? withoutProviderUrls(library.series_last_watched) : [],
-    last_kinds_watched: {
-      episode: withoutProviderUrls(library?.last_kinds_watched?.episode || null),
-      movie: withoutProviderUrls(library?.last_kinds_watched?.movie || null),
-      live: withoutProviderUrls(library?.last_kinds_watched?.live || null),
-    },
+    streaming_history: streamingHistory,
   };
 }
 
