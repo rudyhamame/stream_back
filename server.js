@@ -2808,7 +2808,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   // Every Roku strategy that converts video uses the stable VAAPI path. Remux
   // and audio-only conversion preserve the original video bitstream.
-  const hardwareTranscode = seekableVod && target.client === PlaybackClient.ROKU && decision.videoMode === 'transcode';
+  const hardwareTranscode = target.client === PlaybackClient.ROKU && decision.videoMode === 'transcode';
   if (hardwareTranscode) console.log(`[Media HLS strategy] ${kind}:${id} Roku fallback GPU=VAAPI device=${process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'} video=h264_vaapi audio=aac keyframes=2s`);
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
