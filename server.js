@@ -2073,7 +2073,15 @@ function nativeHlsSession(req, identity, create = false) {
   let session = nativeHlsSessions.get(key);
   if (session && session.userId && session.userId !== identity.userId) session = null;
   if (!session && create) {
-    session = { key, userId: identity.userId, viewerId: identity.viewerId, resources: new Map(), manifests: new Map(), expiresAt: Date.now() + nativeHlsSessionTtlMs };
+    session = {
+      key,
+      userId: identity.userId,
+      viewerId: identity.viewerId,
+      resources: new Map(),
+      manifests: new Map(),
+      cacheBust: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+      expiresAt: Date.now() + nativeHlsSessionTtlMs,
+    };
     nativeHlsSessions.set(key, session);
     evictNativeHlsSessions();
   }
@@ -2090,7 +2098,9 @@ function nativeHlsResourcePath(req, session, upstreamUrl) {
   session.resources.delete(id);
   session.resources.set(id, upstreamUrl);
   while (session.resources.size > 512) session.resources.delete(session.resources.keys().next().value);
-  const query = hlsChildRequestQuery(req.query, 0).toString();
+  const childQuery = hlsChildRequestQuery(req.query, 0);
+  childQuery.set('liveSession', session.cacheBust);
+  const query = childQuery.toString();
   const base = `/api/xtream/hls/${encodeURIComponent(req.params.sourceId)}/channel/${encodeURIComponent(req.params.id)}/resource/${id}`;
   return query ? `${base}?${query}` : base;
 }
@@ -2650,10 +2660,12 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     const upstreamUrl = session?.resources.get(req.params.resourceId);
     if (!session || !upstreamUrl) {
       console.warn(`[Native HLS] channel:${req.params.id} resource miss session=${Boolean(session)} resources=${session?.resources.size || 0} resource=${req.params.resourceId}`);
+      res.setHeader('Cache-Control', 'no-store');
       return res.sendStatus(404);
     }
     if (session.userId && session.userId !== mediaOwner(req)) {
       console.warn(`[Native HLS] channel:${req.params.id} resource owner mismatch`);
+      res.setHeader('Cache-Control', 'no-store');
       return res.sendStatus(404);
     }
     releaseDirectStream = directStreamLimiter.acquire(req.params.sourceId);
