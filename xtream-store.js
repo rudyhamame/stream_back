@@ -5,34 +5,30 @@ import { xtreamProviderUrl } from './xtream.js';
 
 const savedKinds = ['series', 'movies', 'live'];
 const kindFor = value => String(value || '').toLowerCase() === 'channel' || String(value || '').toLowerCase() === 'live' ? 'live' : (String(value || '').toLowerCase() === 'movie' || String(value || '').toLowerCase() === 'movies' ? 'movies' : 'series');
-const savedShape = value => {
-  const next = Object.fromEntries(savedKinds.map(kind => [kind, Array.isArray(value?.[kind]) ? value[kind].map(String).filter(Boolean) : []]));
-  if (!savedKinds.some(kind => next[kind].length) && Array.isArray(value?.enabledItems)) for (const item of value.enabledItems) {
-    const url = String(item?.providerUrl || ''); if (url) next[kindFor(item.kind)].push(url);
-  }
-  return next;
-};
-function sourceUrl(source, kind, id, extension = '') { return xtreamProviderUrl(source, kind === 'live' ? 'channel' : kind.slice(0, -1), id, extension); }
-function urlsForSource(source, saved) {
+const identityKindFor = bucket => bucket === 'live' ? 'channel' : bucket === 'movies' ? 'movie' : 'series';
+const normalizeIdentity = (entry, bucket) => entry && typeof entry === 'object' && entry.sourceId != null && entry.itemId != null
+  ? { sourceId: String(entry.sourceId), kind: String(entry.kind || identityKindFor(bucket)), itemId: String(entry.itemId) }
+  : null;
+const savedShape = value => Object.fromEntries(savedKinds.map(bucket => [bucket,
+  (Array.isArray(value?.[bucket]) ? value[bucket] : []).map(entry => normalizeIdentity(entry, bucket)).filter(Boolean),
+]));
+function sourceUrl(source, kind, id, extension = '') { return xtreamProviderUrl(source, kind === 'live' ? 'channel' : (kind === 'movies' ? 'movie' : 'series'), id, extension); }
+function identitiesForSource(source, saved) {
   const result = savedShape(saved);
-  for (const kind of savedKinds) result[kind] = result[kind].filter(url => String(url).startsWith(String(source.baseUrl || '').replace(/\/$/, '') + '/'));
+  for (const bucket of savedKinds) result[bucket] = result[bucket].filter(identity => identity.sourceId === String(source._id));
   return result;
 }
-function itemFromUrl(url, source) {
-  const text = String(url || '');
-  const match = text.match(/\/(series|movie|live)\/[^/]+\/[^/]+\/([^/?#]+?)(?:\.[a-z0-9]+)?(?:[?#].*)?$/i);
-  if (!match) return null;
-  const kind = match[1].toLowerCase() === 'live' ? 'channel' : match[1].toLowerCase();
-  const id = match[2];
-  return { key: `${kind}:${id}`, id, kind, providerUrl: text, sourceId: String(source._id), title: id, extension: text.split('.').pop()?.split('?')[0] || '' };
+function itemFromIdentity(identity) {
+  const kind = identity.kind === 'channel' ? 'channel' : identity.kind === 'movie' ? 'movie' : 'series';
+  return { key: `${kind}:${identity.itemId}`, id: identity.itemId, kind, sourceId: identity.sourceId, title: identity.itemId };
 }
 
 export function selectionFor(source, ownerId, accountOwner) {
   void accountOwner;
   const raw = source?.selections?.[String(ownerId)] || source?.savedSelections || {};
   if (!Array.isArray(raw.series) && !Array.isArray(raw.movies) && !Array.isArray(raw.live) && Array.isArray(raw.enabledKeys)) return { enabledKeys: raw.enabledKeys, enabledItems: raw.enabledItems || [], archivedKeys: raw.archivedKeys || [], archivedItems: raw.archivedItems || [] };
-  const saved = urlsForSource(source, raw);
-  const enabledItems = savedKinds.flatMap(kind => saved[kind].map(url => itemFromUrl(url, source)).filter(Boolean));
+  const saved = identitiesForSource(source, raw);
+  const enabledItems = savedKinds.flatMap(kind => saved[kind].map(itemFromIdentity));
   return { enabledKeys: enabledItems.map(item => item.key), enabledItems, archivedKeys: [], archivedItems: [], savedSelections: saved };
 }
 
@@ -105,7 +101,8 @@ export async function createXtreamSource({ name, type = 'xtream', baseUrl, usern
 export async function updateXtreamSource(id, changes, ownerId) {
   const located = await locateSource(id, ownerId);
   if (!located) return null;
-  const next = { ...located.source, ...changes, _id: located.source._id, updatedAt: new Date() };
+  const { providerURL: _providerURL, providerUrl: _providerUrl, ...safeChanges } = changes || {};
+  const next = { ...located.source, ...safeChanges, _id: located.source._id, updatedAt: new Date() };
   await located.collection.updateOne({ _id: located.account._id, 'providers._id': located.source._id }, { $set: { 'providers.$': next, updatedAt: new Date() } });
   return publicXtreamSource({ ...next, selections: {} }, ownerId || located.accountOwner, located.accountOwner);
 }
@@ -116,12 +113,12 @@ export async function updateXtreamSelection(id, selection, accountOwner, profile
   if (!located) return null;
   const prior = savedShape((await accountForLibraryOwner(profileOwner)).account?.profiles?.find(profile => String(profile.ownerId) === String(profileOwner))?.library?.savedSelections);
   const next = savedShape(prior);
-  for (const kind of savedKinds) next[kind] = next[kind].filter(url => !String(url).startsWith(String(located.source.baseUrl || '').replace(/\/$/, '') + '/'));
+  for (const kind of savedKinds) next[kind] = next[kind].filter(identity => identity.sourceId !== String(located.source._id));
   const items = Array.isArray(selection?.enabledItems) ? selection.enabledItems : [];
   for (const item of items) {
     const kind = kindFor(item.kind);
-    const url = String(item.providerUrl || sourceUrl(located.source, kind, item.id, item.extension));
-    if (url) next[kind].push(url);
+    const itemId = String(item.id || item.itemId || '');
+    if (itemId) next[kind].push({ sourceId: String(located.source._id), kind: identityKindFor(kind), itemId });
   }
   await updateAccountLibrary(profileOwner, library => { library.savedSelections = next; return library; });
   return publicXtreamSource({ ...located.source, selections: { [String(profileOwner)]: next } }, profileOwner, accountOwner);

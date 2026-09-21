@@ -694,17 +694,18 @@ app.get('/api/roku/internet-health', async (req, res) => {
 // Decide VOD transport before a client assigns media to its player. Direct is
 // offered only when a bounded probe supplies every required media fact and the
 // requesting client supports that exact container/codec combination. The
-// resolved providerURL is returned so Direct never goes through an RH proxy.
+// provider URL is fetched from the provider using the item identity first;
+// any client URL is validation-only and is never used as the probe input.
 async function playbackDecision(req, source) {
   const { kind, id } = req.params;
-  const expectedProviderURL = await sourceProviderUrl(source, kind, id, req.query.ext);
+  const fetchedProviderURL = await sourceProviderUrl(source, kind, id, req.query.ext);
   const suppliedProviderURL = String(req.query.providerURL || '');
-  if (suppliedProviderURL && suppliedProviderURL !== expectedProviderURL) {
+  if (suppliedProviderURL && suppliedProviderURL !== fetchedProviderURL) {
     const error = new Error('The provider URL does not match this media item.');
     error.statusCode = 400;
     throw error;
   }
-  const inputUrl = suppliedProviderURL || expectedProviderURL;
+  const inputUrl = fetchedProviderURL;
   const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
   const metadata = await providerCodecMetadata(cacheKey, inputUrl);
   if (metadata.providerUnavailable) {
@@ -728,7 +729,7 @@ async function playbackDecision(req, source) {
     videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
     audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
     durationSeconds,
-    providerURL: inputUrl,
+    providerURL: fetchedProviderURL,
     reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
   };
 }
@@ -1519,7 +1520,6 @@ app.put('/api/playback/roku/save', async (req, res) => {
       kind: String(req.query?.kind ?? req.body?.kind ?? ''),
       poster: String(req.query?.poster ?? req.body?.poster ?? ''),
       source: String(req.query?.source ?? req.body?.source ?? 'roku'),
-      url: itemId,
       position: Number(req.query?.position ?? req.body?.position ?? 0),
       duration: Number(req.query?.duration ?? req.body?.duration ?? 0),
       completed: completedValue === 'true' || completedValue === '1',
@@ -2169,8 +2169,11 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
 
   const capacityKey = providerLeaseKey(source);
 
-  const resolvedProviderURL = await sourceProviderUrl(source, kind, id, extension);
-  const inputUrl = suppliedProviderURL || resolvedProviderURL;
+  // Always fetch the current provider URL from the provider identity before
+  // probing. A client-supplied URL may be checked for consistency, but never
+  // becomes the authoritative input and is never read from persistence.
+  const fetchedProviderURL = await sourceProviderUrl(source, kind, id, extension);
+  const inputUrl = fetchedProviderURL;
   const providerCacheKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
   evictCodecProbeCache();
   const cachedProviderState = codecProbeCache.get(providerCacheKey)?.metadata;
