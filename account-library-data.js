@@ -72,8 +72,7 @@ function normalizedAccountLibrary(library) {
     const kind = ['live', 'channel'].includes(rawKind) ? 'channel' : (['series', 'episode'].includes(rawKind) ? 'series' : 'movie');
     const { itemId: _itemId, kind: _kind, sourceId: _sourceId, seriesId: _seriesId, providerIdentity: _providerIdentity, providerURL: _providerURL, providerUrl: _providerUrl, ...metadata } = row;
     const normalized = {
-      ...(kind === 'series' ? withoutProviderUrls(metadata) : {}),
-      ...(kind === 'movie' ? { lastWatched: String(row.lastWatched || '00:00:00') } : {}),
+      ...(kind === 'movie' || kind === 'series' ? { lastWatched: String(row.lastWatched || '00:00:00') } : {}),
       providerIdentity: {
         itemId,
         kind,
