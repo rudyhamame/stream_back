@@ -296,7 +296,10 @@ export async function recordDeviceHeartbeat(deviceId, streaming = false, clientI
   }
 }
 
-export async function getActiveRokuPlaybackHeartbeats(windowMs = 15_000) {
+// Heartbeats are intentionally rate-limited to 30 seconds. Keep the query
+// window longer than that interval so a healthy Direct Roku stream does not
+// disappear from the operations dashboard between heartbeat writes.
+export async function getActiveRokuPlaybackHeartbeats(windowMs = 90_000) {
   try {
     const since = new Date(Date.now() - Math.max(5_000, Number(windowMs) || 15_000));
     return (await (await profiles()).find(
