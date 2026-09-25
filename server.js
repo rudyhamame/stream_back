@@ -19,7 +19,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { DEFAULT_ROKU_FALLBACK_BITRATE, HlsBitrateSource, HlsPlaylistType, classifyHlsPlaylist, createHlsSegmentBitrateSample, hasHlsVariants, hlsResourceId, isHlsManifest, measuredHlsBitrateMetadata, normalizeHlsMasterForRoku, parseHlsMediaSegments, providerMasterBitrateMetadata, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
-import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding, AUDIO_TRANSCODING_ENABLED } from './playback-strategy.js';
+import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -334,7 +334,7 @@ function requestedHlsFallback(req) {
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
   if (value === 'full' || value === HlsStrategy.FULL_TRANSCODE.toLowerCase()) return 'full';
   if (value === 'remux' || value === HlsStrategy.REMUX.toLowerCase()) return 'remux';
-  if (value === 'audio' || value === HlsStrategy.AUDIO_TRANSCODE.toLowerCase()) return 'audio';
+  if (value === 'audio') return 'remux'; // legacy client value; audio transcoding was removed
   if (value === 'video' || value === HlsStrategy.VIDEO_TRANSCODE.toLowerCase()) return 'video';
   return '';
 }
@@ -342,19 +342,15 @@ function requestedHlsFallback(req) {
 function forceHlsFallback(strategy, decision) {
   if (!strategy || !decision) return decision;
   const maxHeight = Number(decision.maxHeight) || 0;
-  // Keep legacy query values accepted for client compatibility. Audio-only
-  // conversion is allowed when video remains stream-copied; video conversion
-  // and full transcode remain disabled by policy.
-  const audioOnly = strategy === 'audio'
-    && decision.videoMode === 'copy'
-    && AUDIO_TRANSCODING_ENABLED;
+  // Legacy query values stay accepted for client compatibility; every
+  // encoding strategy is disabled by policy, so all of them resolve to remux.
   return {
     ...decision,
     videoMode: 'copy',
-    audioMode: audioOnly ? 'transcode' : 'copy',
+    audioMode: 'copy',
     maxHeight,
-    strategy: audioOnly ? HlsStrategy.AUDIO_TRANSCODE : HlsStrategy.REMUX,
-    reason: `${decision.reason}; ${strategy} requested${audioOnly ? ' with audio-only transcoding' : ' but video transcoding is disabled by server policy'}`,
+    strategy: HlsStrategy.REMUX,
+    reason: `${decision.reason}; ${strategy} requested but encoding is disabled by server policy`,
   };
 }
 

@@ -2,7 +2,6 @@ import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
 
 export const HlsStrategy = Object.freeze({
   REMUX: 'HLS_REMUX',
-  AUDIO_TRANSCODE: 'HLS_AUDIO_TRANSCODE',
   VIDEO_TRANSCODE: 'HLS_VIDEO_TRANSCODE',
   FULL_TRANSCODE: 'HLS_FULL_TRANSCODE',
 });
@@ -10,16 +9,13 @@ export const HlsStrategy = Object.freeze({
 export const PlaybackStrategy = Object.freeze({
   DIRECT: 'DIRECT',
   REMUX: HlsStrategy.REMUX,
-  AUDIO_TRANSCODE: HlsStrategy.AUDIO_TRANSCODE,
   VIDEO_TRANSCODE: HlsStrategy.VIDEO_TRANSCODE,
   TRANSCODE: HlsStrategy.FULL_TRANSCODE,
 });
 
-// Production policy: video transcoding remains disabled. Audio-only conversion
-// is intentionally allowed because downmixing/normalizing an incompatible
-// audio track is small CPU work and lets compatible video remain stream-copied.
+// Production policy: no encoding at all. Playback is DIRECT first, HLS_REMUX
+// (stream copy) second; the HLS_AUDIO_TRANSCODE strategy was removed.
 export const TRANSCODING_ENABLED = false;
-export const AUDIO_TRANSCODING_ENABLED = true;
 
 const normalizedCodec = value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
@@ -185,12 +181,6 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
   if (videoCompatible && audioCompatible) {
     return { videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX, reason: detail };
   }
-  if (videoCompatible && AUDIO_TRANSCODING_ENABLED) {
-    return {
-      videoMode: 'copy', audioMode: 'transcode', strategy: HlsStrategy.AUDIO_TRANSCODE,
-      reason: `${detail}; audio-only transcode enabled because video is target-compatible`,
-    };
-  }
   return {
     videoMode: 'copy',
     audioMode: 'copy',
@@ -211,14 +201,12 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
 
 export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
   const videoTranscodeAllowed = TRANSCODING_ENABLED && decision.videoMode === 'transcode';
-  const audioTranscodeAllowed = AUDIO_TRANSCODING_ENABLED && decision.audioMode === 'transcode';
-  if ((decision.videoMode === 'transcode' && !videoTranscodeAllowed)
-      || (decision.audioMode === 'transcode' && !audioTranscodeAllowed)) {
+  if (decision.videoMode === 'transcode' && !videoTranscodeAllowed || decision.audioMode === 'transcode') {
     decision = {
       ...decision,
       videoMode: videoTranscodeAllowed ? 'transcode' : 'copy',
-      audioMode: audioTranscodeAllowed ? 'transcode' : 'copy',
-      strategy: videoTranscodeAllowed ? decision.strategy : audioTranscodeAllowed ? HlsStrategy.AUDIO_TRANSCODE : HlsStrategy.REMUX,
+      audioMode: 'copy',
+      strategy: videoTranscodeAllowed ? decision.strategy : HlsStrategy.REMUX,
     };
   }
   const maxHeight = Number(decision.maxHeight) || 0;
@@ -271,12 +259,6 @@ export function applyQualityCeiling(decision, maxHeight, sourceHeight = 0) {
 
 export function fallbackHlsStrategy(decision) {
   const maxHeight = Number(decision.maxHeight) || 0;
-  if (decision.videoMode === 'copy' && decision.audioMode === 'transcode' && AUDIO_TRANSCODING_ENABLED) {
-    return {
-      videoMode: 'copy', audioMode: 'transcode', maxHeight,
-      strategy: HlsStrategy.AUDIO_TRANSCODE, reason: 'Bounded audio transcode retry; video remains stream-copied',
-    };
-  }
   return {
     videoMode: 'copy', audioMode: 'copy', maxHeight,
     strategy: HlsStrategy.REMUX, reason: 'Bounded remux retry; transcoding is disabled by server policy',

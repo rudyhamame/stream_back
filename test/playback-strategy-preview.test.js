@@ -14,13 +14,13 @@ const rokuCompatibleMedia = {
   audioCodec: 'aac', audioChannels: 2, audioSampleRate: 48000,
 };
 
-test('HLS codec matrix audio-transcodes only when video remains compatible', () => {
+test('HLS codec matrix never encodes: incompatible audio still remuxes with copy', () => {
   const roku = getPlaybackCapabilities(PlaybackClient.ROKU);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, roku).strategy, HlsStrategy.REMUX);
   const surround = determineHlsStrategy({ ...rokuCompatibleMedia, audioChannels: 6 }, roku);
   assert.equal(surround.videoMode, 'copy');
-  assert.equal(surround.audioMode, 'transcode');
-  assert.equal(surround.strategy, HlsStrategy.AUDIO_TRANSCODE);
+  assert.equal(surround.audioMode, 'copy');
+  assert.equal(surround.strategy, HlsStrategy.REMUX);
   const incompatibleVideo = determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'mpeg2video' }, roku);
   assert.equal(incompatibleVideo.videoMode, 'copy');
   assert.equal(incompatibleVideo.audioMode, 'copy');
@@ -40,12 +40,12 @@ test('Roku bounded HLS fallback remains remux-only', () => {
   assert.equal(retry.audioMode, 'copy');
 });
 
-test('audio fallback preserves video copy and requests AAC output', () => {
+test('fallback for incompatible audio is remux with copy (no audio transcode)', () => {
   const decision = determineHlsStrategy({ ...rokuCompatibleMedia, audioChannels: 6 }, getPlaybackCapabilities(PlaybackClient.BROWSER));
   const retry = fallbackHlsStrategy(decision);
-  assert.equal(retry.strategy, HlsStrategy.AUDIO_TRANSCODE);
+  assert.equal(retry.strategy, HlsStrategy.REMUX);
   assert.equal(retry.videoMode, 'copy');
-  assert.equal(retry.audioMode, 'transcode');
+  assert.equal(retry.audioMode, 'copy');
 });
 
 test('direct playback trusts the probed container over a misleading catalog extension', () => {
