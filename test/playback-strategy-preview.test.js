@@ -28,7 +28,7 @@ test('HLS codec matrix permits only remux when direct playback is unavailable', 
   assert.equal(determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'hevc', audioCodec: 'dts' }, roku).strategy, HlsStrategy.REMUX);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.BROWSER)).strategy, HlsStrategy.REMUX);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.ANDROID)).strategy, HlsStrategy.REMUX);
-  assert.equal(hlsPlaylistProfile({ client: PlaybackClient.BROWSER }).startupSegments, 3);
+  assert.equal(hlsPlaylistProfile({ client: PlaybackClient.BROWSER }).startupSegments, 2);
   assert.equal(hlsPlaylistProfile({ client: PlaybackClient.ROKU }).startupSegments, 3);
 });
 

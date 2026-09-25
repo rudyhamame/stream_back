@@ -273,10 +273,12 @@ export function hlsPlaylistProfile({ fastStart = false, preview = false, client 
   // for and causes another restart/back-jump. Keep six minutes by default so
   // recovery requests remain available. Env-tunable for disk-constrained hosts.
   const listSize = Math.min(600, Math.max(12, Number.parseInt(process.env.HLS_VOD_LIST_SIZE || '', 10) || 180));
-  // Do not hand Roku the manifest at the first segment. A rolling HLS job can
-  // briefly pause while the provider or encoder catches up; three completed
-  // segments give the decoder a real cushion before consumption begins.
-  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments: preview ? 1 : 3 };
+  // Do not hand a VOD manifest to a client at the first segment. A rolling
+  // HLS job can briefly pause while the provider catches up. Browsers can
+  // safely start with two completed copy/remux segments; Roku and Android
+  // keep the deeper three-segment startup cushion.
+  const startupSegments = preview ? 1 : client === PlaybackClient.BROWSER ? 2 : 3;
+  return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments };
 }
 
 export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', strategy = '' } = {}) {
