@@ -2651,9 +2651,17 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // target.key in), so one viewer picking 480p never disturbs another
   // viewer's Auto stream of the same channel. Auto-only channel viewers keep
   // sharing one job exactly as before (empty capabilityKey).
+  // A live channel's encoded HLS output is reusable across Browser, Android,
+  // and Roku. Do not put the client type/capability report into the live job
+  // key: that would start one FFmpeg process per device for the same output.
+  // Quality remains part of the key because 1080p and 480p are different
+  // encoded outputs. VOD keeps its per-target key because its compatibility
+  // and seek state are client-specific.
   const capabilityKey = identity.wwpSessionId
     ? `wwp:${identity.wwpSessionId}`
-    : (seekableVod || target.maxHeight) ? String(target.key || target.client || PlaybackClient.BROWSER) : '';
+    : seekableVod
+      ? String(target.key || target.client || PlaybackClient.BROWSER)
+      : (target.maxHeight ? `live:h${target.maxHeight}` : '');
   const recoveryKey = typeof strategyOverride === 'string' && strategyOverride
     ? `:hls-fallback-${strategyOverride}`
     : '';
@@ -2952,13 +2960,28 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const identity = mediaIdentity(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${fastPreview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
     if (req.params.kind === 'channel') {
+      // If another device already caused a shared live transcode to start,
+      // attach to that HLS output instead of opening a separate provider-native
+      // session. Native playback is still used when no shared transcode exists.
+      const requestedLiveHeight = Number(target.maxHeight) || 0;
+      const sharedLiveJob = [...mediaJobs.values()].find(candidate => (
+        candidate?.persistent
+        && candidate.kind === 'channel'
+        && String(candidate.sourceId) === String(req.params.sourceId)
+        && String(candidate.mediaId) === String(req.params.id)
+        && candidate.mode === 'transcode'
+        && Number(candidate.hlsDecision?.maxHeight || 0) === requestedLiveHeight
+        && !candidate.finished
+        && candidate.child?.exitCode === null
+      ));
+      const sharedLiveTranscode = Boolean(sharedLiveJob);
       const existingNativeSession = nativeHlsSession(req, identity);
-      if ((nativeHlsDisabled || target.maxHeight) && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
+      if ((nativeHlsDisabled || target.maxHeight || sharedLiveTranscode) && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
       // Android can reach RH over HTTPS but some provider playlists point at
       // segment hosts/ports that the phone's network blocks. Proxy the original
       // HLS playlist and rewrite every child URI through RH. This is still
       // provider-native playback: the media bytes and codecs are unchanged.
-      if ([PlaybackClient.ANDROID, PlaybackClient.ROKU].includes(target.client) && !fastPreview && !nativeHlsDisabled && !target.maxHeight) {
+      if ([PlaybackClient.ANDROID, PlaybackClient.ROKU].includes(target.client) && !fastPreview && !nativeHlsDisabled && !target.maxHeight && !sharedLiveTranscode) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
           const upstreamUrl = playbackProviderURL || session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
@@ -2974,7 +2997,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       // A manual quality rung means transcode-to-that-height; the native
       // passthrough just relays the provider's own manifest unmodified, so it
       // can never honor a rung and must be skipped in favor of the ffmpeg path.
-      if (!fastPreview && !nativeHlsDisabled && !target.maxHeight && existingNativeSession) {
+      if (!fastPreview && !nativeHlsDisabled && !target.maxHeight && existingNativeSession && !sharedLiveTranscode) {
         const session = existingNativeSession || nativeHlsSession(req, identity, true);
         try {
           const upstreamUrl = session.rootUrl || await sourceProviderUrl(source, 'channel', req.params.id, req.query.ext);
@@ -3240,7 +3263,9 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     // no matter which slightly-different -ss their manifest URL carries.
     const capabilityKey = wwpSessionId
       ? `wwp:${wwpSessionId}`
-      : (seekableVod || target.maxHeight) ? target.key : '';
+      : seekableVod
+        ? target.key
+        : (target.maxHeight ? `live:h${target.maxHeight}` : '');
     const recoveryFallback = requestedHlsFallback(req);
     const keyedCapability = `${capabilityKey}${recoveryFallback ? `:hls-fallback-${recoveryFallback}` : ''}`;
     const key = rokuHlsKey(req.params.sourceId, req.params.kind, req.params.id, req.query.ext,
