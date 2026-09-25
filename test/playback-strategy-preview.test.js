@@ -14,29 +14,30 @@ const rokuCompatibleMedia = {
   audioCodec: 'aac', audioChannels: 2, audioSampleRate: 48000,
 };
 
-test('HLS codec matrix selects remux, audio, video, and full transcode', () => {
+test('HLS codec matrix permits only remux when direct playback is unavailable', () => {
   const roku = getPlaybackCapabilities(PlaybackClient.ROKU);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, roku).strategy, HlsStrategy.REMUX);
   const surround = determineHlsStrategy({ ...rokuCompatibleMedia, audioChannels: 6 }, roku);
   assert.equal(surround.videoMode, 'copy');
-  assert.equal(surround.audioMode, 'transcode');
-  assert.equal(surround.strategy, HlsStrategy.AUDIO_TRANSCODE);
+  assert.equal(surround.audioMode, 'copy');
+  assert.equal(surround.strategy, HlsStrategy.REMUX);
   const incompatibleVideo = determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'mpeg2video' }, roku);
-  assert.equal(incompatibleVideo.videoMode, 'transcode');
+  assert.equal(incompatibleVideo.videoMode, 'copy');
   assert.equal(incompatibleVideo.audioMode, 'copy');
-  assert.equal(incompatibleVideo.strategy, HlsStrategy.VIDEO_TRANSCODE);
-  assert.equal(determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'hevc', audioCodec: 'dts' }, roku).strategy, HlsStrategy.FULL_TRANSCODE);
+  assert.equal(incompatibleVideo.strategy, HlsStrategy.REMUX);
+  assert.equal(determineHlsStrategy({ ...rokuCompatibleMedia, videoCodec: 'hevc', audioCodec: 'dts' }, roku).strategy, HlsStrategy.REMUX);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.BROWSER)).strategy, HlsStrategy.REMUX);
   assert.equal(determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.ANDROID)).strategy, HlsStrategy.REMUX);
   assert.equal(hlsPlaylistProfile({ client: PlaybackClient.BROWSER }).startupSegments, 3);
   assert.equal(hlsPlaylistProfile({ client: PlaybackClient.ROKU }).startupSegments, 3);
 });
 
-test('Roku bounded HLS fallback advances remux to audio transcode to full transcode', () => {
+test('Roku bounded HLS fallback remains remux-only', () => {
   const remux = determineHlsStrategy(rokuCompatibleMedia, getPlaybackCapabilities(PlaybackClient.ROKU));
-  const audio = fallbackHlsStrategy(remux);
-  assert.equal(audio.strategy, HlsStrategy.AUDIO_TRANSCODE);
-  assert.equal(fallbackHlsStrategy(audio).strategy, HlsStrategy.FULL_TRANSCODE);
+  const retry = fallbackHlsStrategy(remux);
+  assert.equal(retry.strategy, HlsStrategy.REMUX);
+  assert.equal(retry.videoMode, 'copy');
+  assert.equal(retry.audioMode, 'copy');
 });
 
 test('direct playback trusts the probed container over a misleading catalog extension', () => {

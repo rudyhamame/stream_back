@@ -15,6 +15,11 @@ export const PlaybackStrategy = Object.freeze({
   TRANSCODE: HlsStrategy.FULL_TRANSCODE,
 });
 
+// Production policy: the laptop/server must never decode and encode media.
+// Unsupported codecs are still offered through an HLS stream-copy/remux so
+// the client can reject them cleanly instead of consuming CPU/GPU resources.
+export const TRANSCODING_ENABLED = false;
+
 const normalizedCodec = value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
 
 export const PlaybackClient = Object.freeze({
@@ -179,13 +184,12 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
   if (videoCompatible && audioCompatible) {
     return { videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX, reason: detail };
   }
-  if (videoCompatible) {
-    return { videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.AUDIO_TRANSCODE, reason: detail };
-  }
-  if (audioCompatible) {
-    return { videoMode: 'transcode', audioMode: 'copy', strategy: HlsStrategy.VIDEO_TRANSCODE, reason: detail };
-  }
-  return { videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: audio.outputChannels, strategy: HlsStrategy.FULL_TRANSCODE, reason: detail };
+  return {
+    videoMode: 'copy',
+    audioMode: 'copy',
+    strategy: HlsStrategy.REMUX,
+    reason: `${detail}; transcoding disabled by server policy`,
+  };
 }
 
 // Approximate H.264 ceilings per rung — capped VBR (CRF floor + -maxrate) so a
@@ -199,6 +203,9 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
 }
 
 export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
+  if (!TRANSCODING_ENABLED && (decision.videoMode === 'transcode' || decision.audioMode === 'transcode')) {
+    decision = { ...decision, videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX };
+  }
   const maxHeight = Number(decision.maxHeight) || 0;
   const rungKbps = QUALITY_RUNGS[maxHeight] || 0;
   // Diagnostic Roku VOD transcodes use a fixed two-second keyframe cadence.
@@ -244,26 +251,19 @@ export function applyQualityCeiling(decision, maxHeight, sourceHeight = 0) {
   const ceiling = Number(maxHeight) || 0;
   if (ceiling <= 0) return decision;
   if (sourceHeight > 0 && sourceHeight <= ceiling + 16) return decision;
-  const strategy = decision.audioMode === 'transcode' ? HlsStrategy.FULL_TRANSCODE : HlsStrategy.VIDEO_TRANSCODE;
-  return { ...decision, videoMode: 'transcode', maxHeight: ceiling, strategy, reason: `${decision.reason}; capped to ${ceiling}p` };
+  return { ...decision, maxHeight: ceiling, reason: `${decision.reason}; quality ceiling ignored because transcoding is disabled` };
 }
 
 export function fallbackHlsStrategy(decision) {
   const maxHeight = Number(decision.maxHeight) || 0;
-  if (decision.videoMode === 'copy' && decision.audioMode === 'copy') {
-    return {
-      videoMode: 'copy', audioMode: 'transcode', outputAudioChannels: 2, maxHeight,
-      strategy: HlsStrategy.AUDIO_TRANSCODE, reason: 'Bounded fallback after copy/copy muxing failure',
-    };
-  }
   return {
-    videoMode: 'transcode', audioMode: 'transcode', outputAudioChannels: 2, maxHeight,
-    strategy: HlsStrategy.FULL_TRANSCODE, reason: 'Bounded compatibility fallback after partial strategy failure',
+    videoMode: 'copy', audioMode: 'copy', maxHeight,
+    strategy: HlsStrategy.REMUX, reason: 'Bounded remux retry; transcoding is disabled by server policy',
   };
 }
 
 export function strategyUsesEncoding(decision) {
-  return decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
+  return false;
 }
 
 export function hlsPlaylistProfile({ fastStart = false, preview = false, client = '' } = {}) {

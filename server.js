@@ -342,21 +342,11 @@ function requestedHlsFallback(req) {
 function forceHlsFallback(strategy, decision) {
   if (!strategy || !decision) return decision;
   const maxHeight = Number(decision.maxHeight) || 0;
-  if (strategy === 'full') {
-    return {
-      ...decision, videoMode: 'transcode', audioMode: 'transcode',
-      outputAudioChannels: Number(decision.outputAudioChannels) || 2,
-      maxHeight, strategy: HlsStrategy.FULL_TRANSCODE,
-      reason: `${decision.reason}; full transcode explicitly selected`,
-    };
-  }
-  if (strategy === 'remux') return { ...decision, videoMode: 'copy', audioMode: 'copy', maxHeight, strategy: HlsStrategy.REMUX, reason: `${decision.reason}; diagnostic remux override` };
-  if (strategy === 'video') return { ...decision, videoMode: 'transcode', audioMode: 'copy', maxHeight, strategy: HlsStrategy.VIDEO_TRANSCODE, reason: `${decision.reason}; video-transcode fallback selected` };
+  // Keep legacy query values accepted for client compatibility, but never let
+  // them enable video/audio/full encoding on this server.
   return {
-    ...decision, videoMode: strategy === 'audio' ? 'copy' : (decision.videoMode === 'copy' ? 'copy' : 'transcode'), audioMode: 'transcode',
-    outputAudioChannels: Number(decision.outputAudioChannels) || 2,
-    maxHeight, strategy: HlsStrategy.AUDIO_TRANSCODE,
-    reason: `${decision.reason}; audio-transcode fallback selected`,
+    ...decision, videoMode: 'copy', audioMode: 'copy', maxHeight, strategy: HlsStrategy.REMUX,
+    reason: `${decision.reason}; ${strategy} requested but transcoding is disabled by server policy`,
   };
 }
 
@@ -2815,8 +2805,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   // Every Roku strategy that converts video uses the stable VAAPI path. Remux
   // and audio-only conversion preserve the original video bitstream.
-  const hardwareTranscode = [PlaybackClient.ROKU, PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client) && decision.videoMode === 'transcode';
-  if (hardwareTranscode) console.log(`[Media HLS strategy] ${kind}:${id} ${target.client} fallback GPU=VAAPI device=${process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'} video=h264_vaapi audio=aac keyframes=2s`);
+  const hardwareTranscode = false;
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
     persistent: true, sourceId: String(source._id), capacityKey, mediaId: String(id), kind,
@@ -2831,7 +2820,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const retainSegments = target.client === PlaybackClient.ROKU;
     // A seek needs its first playable segment quickly. Keep keyframe-safe
     // boundaries and the usual two-second cadence after the opening segment.
-    const fastStart = seekableVod && [PlaybackClient.ROKU, PlaybackClient.BROWSER].includes(target.client) && decision.videoMode === 'transcode';
+    const fastStart = false;
     const playlistProfile = hlsPlaylistProfile({ fastStart, preview: previewRemux, client: target.client });
     const args = ['-hide_banner', '-nostats', '-loglevel', 'info', ...hlsHwDeviceArgs({ enabled: hardwareTranscode })];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
