@@ -76,7 +76,7 @@ async function updateLinkedDevice(filter, update, options = {}) {
 
 async function accounts() {
   if (!accountsPromise) {
-    accountsPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 }).connect()
+    accountsPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 }).connect()
       .then(async client => {
         const collection = client.db(databaseName).collection(accountCollectionName);
         await collection.createIndex({ email: 1 }, { unique: true });

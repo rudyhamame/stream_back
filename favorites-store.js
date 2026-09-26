@@ -7,7 +7,7 @@ let collectionPromise;
 
 async function favoritesCollection() {
   if (!collectionPromise) {
-    collectionPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000 })
+    collectionPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 })
       .connect()
       .then(async client => {
         const collection = client.db(databaseName).collection(collectionName);
