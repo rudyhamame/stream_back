@@ -273,7 +273,8 @@ async function inspectProviderCodecs(inputUrl) {
         const probe = JSON.parse(output);
         const streams = probe.streams || [];
         const video = streams.find(stream => stream.codec_type === 'video') || {};
-        const audio = streams.find(stream => stream.codec_type === 'audio') || {};
+        const audioStreams = streams.filter(stream => stream.codec_type === 'audio');
+        const audio = audioStreams[0] || {};
         finish(null, {
           container: String(probe.format?.format_name || ''),
           containerSeconds: Math.max(0, Math.round(Number(probe.format?.duration) || 0)),
@@ -291,6 +292,11 @@ async function inspectProviderCodecs(inputUrl) {
           audioSampleRate: Number(audio.sample_rate) || 0,
           audioChannels: Number(audio.channels) || 0,
           audioChannelLayout: String(audio.channel_layout || ''),
+          audioTracks: audioStreams.map((stream, index) => ({
+            index, codec: String(stream.codec_name || ''), profile: String(stream.profile || ''),
+            sampleRate: Number(stream.sample_rate) || 0, channels: Number(stream.channels) || 0,
+            channelLayout: String(stream.channel_layout || ''),
+          })),
         });
       } catch { finish(new Error('Codec probe returned invalid metadata')); }
     });
@@ -311,7 +317,7 @@ function playbackTarget(req) {
   // Manual quality rung (YouTube-style). "auto"/absent keeps the native
   // strategy; a numeric rung forces a downscale transcode and forks its own
   // ffmpeg job so switching quality does not disturb other viewers.
-  const maxHeight = Object.hasOwn(QUALITY_RUNGS, String(req.query.quality || '').trim())
+  const maxHeight = client !== PlaybackClient.BROWSER && Object.hasOwn(QUALITY_RUNGS, String(req.query.quality || '').trim())
     ? Number(String(req.query.quality).trim())
     : 0;
   return {
@@ -330,6 +336,7 @@ function playbackTarget(req) {
 // next safe recovery rung; this is deliberately limited to the HLS fallback
 // strategies and never changes the normal first-choice decision.
 function requestedHlsFallback(req) {
+  if (playbackTarget(req).client === PlaybackClient.BROWSER) return '';
   if (forceRokuFullTranscode && playbackTarget(req).client !== PlaybackClient.BROWSER) return 'full';
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
   if (value === 'full' || value === HlsStrategy.FULL_TRANSCODE.toLowerCase()) return 'full';
@@ -774,6 +781,9 @@ async function playbackDecision(req, source) {
     audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
     durationSeconds,
     providerURL: inputUrl,
+    // Browser performs its own environment-specific feature detection; return
+    // the normalized ffprobe facts so it can distinguish container from codecs.
+    ...([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client) ? { media: metadata } : {}),
     reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision.reason}`,
   };
 }
@@ -2956,6 +2966,13 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
+    if (target.client === PlaybackClient.BROWSER && seekableVod) {
+      if (!playbackProviderURL) playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
+      const cacheKey = `${source._id}:${req.params.kind}:${req.params.id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(playbackProviderURL).digest('hex').slice(0, 16)}`;
+      const metadata = await providerCodecMetadata(cacheKey, playbackProviderURL);
+      const codecs = codecCompatibility(metadata, getPlaybackCapabilities(PlaybackClient.BROWSER));
+      if (codecs.known && !codecs.compatible) return res.status(415).json({ error: `Unsupported media: ${codecs.reason}. Stream-copy remux cannot change codecs.` });
+    }
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
     const nativeHlsDisabled = String(req.query.native || '') === '0';
