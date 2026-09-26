@@ -309,6 +309,11 @@ export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', 
   // can need more than 15s to produce the three startup segments; closing the
   // manifest request early makes the client retry the same HLS job forever.
   if (!seekableVod || ![PlaybackClient.ROKU, PlaybackClient.ANDROID, PlaybackClient.BROWSER].includes(client)) return 15_000;
+  // Browser stream-copy segments cannot close until the source's next keyframe.
+  // Long GOPs produce 5–10s segments, so the two-segment browser startup
+  // cushion can take over 16s. Keep that healthy FFmpeg job alive to avoid
+  // killing it and starting an identical remux at the timeout boundary.
+  if (client === PlaybackClient.BROWSER && strategy !== HlsStrategy.FULL_TRANSCODE) return 35_000;
   // A Roku copy/remux that cannot close its first GOP quickly needs the
   // keyframe-controlled transcode fallback. Once that fallback is already in
   // use, however, keep the original request open long enough for providers
