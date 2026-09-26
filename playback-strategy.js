@@ -297,10 +297,10 @@ export function hlsPlaylistProfile({ fastStart = false, preview = false, client 
   // HLS job can briefly pause while the provider catches up. Browsers can
   // safely start with two completed copy/remux segments; Roku and Android
   // keep the deeper three-segment startup cushion.
-  // Browser MSE playback is more sensitive to small network/decoder pauses
-  // than the native clients. Four paced segments gives it an ~8s cushion
-  // without changing the steady-state read rate or transcoding policy.
-  const startupSegments = preview ? 1 : client === PlaybackClient.BROWSER ? 4 : 3;
+  // Browser MSE can start reliably with two completed segments. Waiting for
+  // four can exceed the bounded startup window on sources with sparse keyframes;
+  // the manifest request then tears down a healthy rolling remux job.
+  const startupSegments = preview ? 1 : client === PlaybackClient.BROWSER ? 2 : 3;
   return { segmentSeconds: 2, initialSegmentSeconds: fastStart ? 1 : 0, listSize, startupSegments };
 }
 
