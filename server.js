@@ -2853,7 +2853,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds, hlsVodReadrate), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
-    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode }), '-sn', '-dn',
+    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode }),
+    // Browser stream-copy can preserve duplicate DTS values when the
+    // Matroska track time base is coarser than its frame cadence. Keep the
+    // demuxer's finer time base so HLS carries ordered video timestamps.
+    ...(target.client === PlaybackClient.BROWSER && decision.videoMode === 'copy' ? ['-copytb', '1'] : []),
+    '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
                   '-hls_time', String(playlistProfile.segmentSeconds), '-hls_list_size', String(playlistProfile.listSize),
