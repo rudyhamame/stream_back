@@ -317,7 +317,7 @@ function playbackTarget(req) {
   // Manual quality rung (YouTube-style). "auto"/absent keeps the native
   // strategy; a numeric rung forces a downscale transcode and forks its own
   // ffmpeg job so switching quality does not disturb other viewers.
-  const maxHeight = client !== PlaybackClient.BROWSER && Object.hasOwn(QUALITY_RUNGS, String(req.query.quality || '').trim())
+  const maxHeight = client === PlaybackClient.ROKU && Object.hasOwn(QUALITY_RUNGS, String(req.query.quality || '').trim())
     ? Number(String(req.query.quality).trim())
     : 0;
   return {
@@ -336,7 +336,7 @@ function playbackTarget(req) {
 // next safe recovery rung; this is deliberately limited to the HLS fallback
 // strategies and never changes the normal first-choice decision.
 function requestedHlsFallback(req) {
-  if (playbackTarget(req).client === PlaybackClient.BROWSER) return '';
+  if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(playbackTarget(req).client)) return '';
   if (forceRokuFullTranscode && playbackTarget(req).client !== PlaybackClient.BROWSER) return 'full';
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
   if (value === 'full' || value === HlsStrategy.FULL_TRANSCODE.toLowerCase()) return 'full';
@@ -2966,13 +2966,6 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
-    if (target.client === PlaybackClient.BROWSER && seekableVod) {
-      if (!playbackProviderURL) playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
-      const cacheKey = `${source._id}:${req.params.kind}:${req.params.id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(playbackProviderURL).digest('hex').slice(0, 16)}`;
-      const metadata = await providerCodecMetadata(cacheKey, playbackProviderURL);
-      const codecs = codecCompatibility(metadata, getPlaybackCapabilities(PlaybackClient.BROWSER));
-      if (codecs.known && !codecs.compatible) return res.status(415).json({ error: `Unsupported media: ${codecs.reason}. Stream-copy remux cannot change codecs.` });
-    }
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
     const nativeHlsDisabled = String(req.query.native || '') === '0';
