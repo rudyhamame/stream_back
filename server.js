@@ -19,7 +19,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { DEFAULT_ROKU_FALLBACK_BITRATE, HlsBitrateSource, HlsPlaylistType, classifyHlsPlaylist, createHlsSegmentBitrateSample, hasHlsVariants, hlsResourceId, isHlsManifest, measuredHlsBitrateMetadata, normalizeHlsMasterForRoku, parseHlsMediaSegments, providerMasterBitrateMetadata, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
-import { applyQualityCeiling, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { applyQualityCeiling, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, needsHlsVideoTimestampRepair, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -2821,24 +2821,19 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
   let decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
-  // Matroska H.264 copied into MPEG-TS can keep valid-looking packet clocks
-  // while producing unstable frame pacing in browser MSE. Rebuild only the
-  // browser video timeline; preserve AAC packets byte-for-byte. Roku and
-  // Android continue through their existing compatibility-selected ladder.
-  const browserTimestampRepair = target.client === PlaybackClient.BROWSER
-    && seekableVod
-    && !containerCompatibility(metadata, capabilities, extension).compatible
-    && String(metadata.videoCodec || '').toLowerCase() === 'h264'
-    && String(metadata.audioCodec || '').toLowerCase() === 'aac'
-    && decision.videoMode === 'copy'
-    && decision.audioMode === 'copy';
-  if (browserTimestampRepair) {
+  // Browser and Android HLS rebuild H.264 frame timing while retaining AAC.
+  // This runs only after entering HLS; Android's native Direct path stays
+  // governed by the existing device compatibility decision.
+  const videoTimestampRepair = needsHlsVideoTimestampRepair({
+    client: target.client, seekableVod, metadata, capabilities, extension, decision,
+  });
+  if (videoTimestampRepair) {
     decision = {
       ...decision,
       videoMode: 'transcode',
       audioMode: 'copy',
       strategy: HlsStrategy.VIDEO_TRANSCODE,
-      reason: `${decision.reason}; browser video timestamps normalized while preserving AAC audio`,
+      reason: `${decision.reason}; ${target.client} video timestamps normalized while preserving AAC audio`,
     };
   }
   const probeSummary = seekableVod
@@ -2873,7 +2868,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds, hlsVodReadrate), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
-    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode, allowBrowserTimestampRepair: browserTimestampRepair }),
+    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode, allowVideoTimestampRepair: videoTimestampRepair }),
     '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),

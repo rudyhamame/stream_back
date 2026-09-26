@@ -13,8 +13,8 @@ export const PlaybackStrategy = Object.freeze({
   TRANSCODE: HlsStrategy.FULL_TRANSCODE,
 });
 
-// Production policy: no encoding at all. Playback is DIRECT first, HLS_REMUX
-// (stream copy) second; the HLS_AUDIO_TRANSCODE strategy was removed.
+// Default policy is DIRECT first, then HLS_REMUX. Browser/Android HLS may
+// explicitly rebuild video timing; audio encoding remains disabled.
 export const TRANSCODING_ENABLED = false;
 
 const normalizedCodec = value => String(value || '').trim().toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -216,8 +216,17 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
   return ['-vaapi_device', process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'];
 }
 
-export function hlsCodecArgs(decision, { fastStart = false, hardware = false, allowBrowserTimestampRepair = false } = {}) {
-  const videoTranscodeAllowed = (TRANSCODING_ENABLED || allowBrowserTimestampRepair) && decision.videoMode === 'transcode';
+export function needsHlsVideoTimestampRepair({ client, seekableVod, metadata, capabilities, extension, decision }) {
+  const eligibleClient = client === PlaybackClient.ANDROID
+    || (client === PlaybackClient.BROWSER && !containerCompatibility(metadata, capabilities, extension).compatible);
+  return eligibleClient && Boolean(seekableVod)
+    && String(metadata.videoCodec || '').toLowerCase() === 'h264'
+    && String(metadata.audioCodec || '').toLowerCase() === 'aac'
+    && decision.videoMode === 'copy' && decision.audioMode === 'copy';
+}
+
+export function hlsCodecArgs(decision, { fastStart = false, hardware = false, allowVideoTimestampRepair = false } = {}) {
+  const videoTranscodeAllowed = (TRANSCODING_ENABLED || allowVideoTimestampRepair) && decision.videoMode === 'transcode';
   if (decision.videoMode === 'transcode' && !videoTranscodeAllowed || decision.audioMode === 'transcode') {
     decision = {
       ...decision,
@@ -314,6 +323,9 @@ export function hlsManifestStartupTimeoutMs({ seekableVod = false, client = '', 
   // cushion can take over 16s. Keep that healthy FFmpeg job alive to avoid
   // killing it and starting an identical remux at the timeout boundary.
   if (client === PlaybackClient.BROWSER && strategy !== HlsStrategy.FULL_TRANSCODE) return 35_000;
+  // Android's video timing repair also needs room for input probing, decoder
+  // startup, and its three complete segments before the manifest is ready.
+  if (client === PlaybackClient.ANDROID && strategy === HlsStrategy.VIDEO_TRANSCODE) return 35_000;
   // A Roku copy/remux that cannot close its first GOP quickly needs the
   // keyframe-controlled transcode fallback. Once that fallback is already in
   // use, however, keep the original request open long enough for providers
