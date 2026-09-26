@@ -7,14 +7,14 @@ let collectionPromise;
 
 async function favoritesCollection() {
   if (!collectionPromise) {
-    collectionPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 })
-      .connect()
-      .then(async client => {
+    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 });
+    collectionPromise = client.connect()
+      .then(async () => {
         const collection = client.db(databaseName).collection(collectionName);
         await collection.createIndex({ ownerId: 1, itemId: 1 }, { unique: true });
         return collection;
       })
-      .catch(error => { collectionPromise = undefined; throw error; });
+      .catch(error => { collectionPromise = undefined; client.close().catch(() => {}); throw error; });
   }
   return collectionPromise;
 }

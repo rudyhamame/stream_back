@@ -76,14 +76,16 @@ async function updateLinkedDevice(filter, update, options = {}) {
 
 async function accounts() {
   if (!accountsPromise) {
-    accountsPromise = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 }).connect()
-      .then(async client => {
+    const client = new MongoClient(mongoUri, { serverSelectionTimeoutMS: 5000, maxPoolSize: 10, maxIdleTimeMS: 30_000 });
+    accountsPromise = client.connect()
+      .then(async () => {
         const collection = client.db(databaseName).collection(accountCollectionName);
-        await collection.createIndex({ email: 1 }, { unique: true });
+        // Same name as library_backend's index; an unnamed duplicate is IndexOptionsConflict.
+        await collection.createIndex({ email: 1 }, { unique: true, name: 'identity_auth_email' });
         await collection.createIndex({ 'devices.deviceId': 1 }, { name: 'account_device_id', unique: true, sparse: true });
         return collection;
       })
-      .catch(error => { accountsPromise = undefined; throw error; });
+      .catch(error => { accountsPromise = undefined; client.close().catch(() => {}); throw error; });
   }
   return accountsPromise;
 }
