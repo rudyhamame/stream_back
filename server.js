@@ -2820,7 +2820,27 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // No codec probe for live (avoids extra provider connections), so
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
-  const decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
+  let decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
+  // Matroska H.264 copied into MPEG-TS can keep valid-looking packet clocks
+  // while producing unstable frame pacing in browser MSE. Rebuild only the
+  // browser video timeline; preserve AAC packets byte-for-byte. Roku and
+  // Android continue through their existing compatibility-selected ladder.
+  const browserTimestampRepair = target.client === PlaybackClient.BROWSER
+    && seekableVod
+    && !containerCompatibility(metadata, capabilities, extension).compatible
+    && String(metadata.videoCodec || '').toLowerCase() === 'h264'
+    && String(metadata.audioCodec || '').toLowerCase() === 'aac'
+    && decision.videoMode === 'copy'
+    && decision.audioMode === 'copy';
+  if (browserTimestampRepair) {
+    decision = {
+      ...decision,
+      videoMode: 'transcode',
+      audioMode: 'copy',
+      strategy: HlsStrategy.VIDEO_TRANSCODE,
+      reason: `${decision.reason}; browser video timestamps normalized while preserving AAC audio`,
+    };
+  }
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
@@ -2853,11 +2873,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds, hlsVodReadrate), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
-    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode }),
-    // Browser stream-copy can preserve duplicate DTS values when the
-    // Matroska track time base is coarser than its frame cadence. Keep the
-    // demuxer's finer time base so HLS carries ordered video timestamps.
-    ...(target.client === PlaybackClient.BROWSER && decision.videoMode === 'copy' ? ['-copytb', '1'] : []),
+    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode, allowBrowserTimestampRepair: browserTimestampRepair }),
     '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),

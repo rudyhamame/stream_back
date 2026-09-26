@@ -216,8 +216,8 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
   return ['-vaapi_device', process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'];
 }
 
-export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
-  const videoTranscodeAllowed = TRANSCODING_ENABLED && decision.videoMode === 'transcode';
+export function hlsCodecArgs(decision, { fastStart = false, hardware = false, allowBrowserTimestampRepair = false } = {}) {
+  const videoTranscodeAllowed = (TRANSCODING_ENABLED || allowBrowserTimestampRepair) && decision.videoMode === 'transcode';
   if (decision.videoMode === 'transcode' && !videoTranscodeAllowed || decision.audioMode === 'transcode') {
     decision = {
       ...decision,
