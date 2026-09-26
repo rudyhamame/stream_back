@@ -171,6 +171,23 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
   return { compatible: true, reason: 'roku-compatible-source' };
 }
 
+// Strict device-compatibility gate shared by every client. Codecs are
+// compatible only when the video AND (present) audio stream both fit the
+// target; a source the probe could not read at all stays "unknown" so it is
+// still attempted instead of being rejected on missing facts.
+export function codecCompatibility(metadata = {}, capabilities = getPlaybackCapabilities()) {
+  const videoKnown = Boolean(normalizedCodec(metadata.videoCodec || metadata.codecVideo || metadata.codec));
+  if (!videoKnown) return { known: false, compatible: false, reason: 'video codec unavailable' };
+  const video = videoCompatibility(metadata, capabilities);
+  const hasAudio = Boolean(normalizedCodec(metadata.audioCodec || metadata.codecAudio));
+  const audio = hasAudio ? audioCompatibility(metadata, capabilities) : { compatible: true, reason: 'no audio stream' };
+  return {
+    known: true,
+    compatible: video.compatible && audio.compatible,
+    reason: [video, audio].filter(part => !part.compatible).map(part => part.reason).join('; ') || `${video.reason}; ${audio.reason}`,
+  };
+}
+
 export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlaybackCapabilities()) {
   const video = videoCompatibility(sourceMetadata, capabilities);
   const audio = audioCompatibility(sourceMetadata, capabilities);

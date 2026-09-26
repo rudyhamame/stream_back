@@ -19,7 +19,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { DEFAULT_ROKU_FALLBACK_BITRATE, HlsBitrateSource, HlsPlaylistType, classifyHlsPlaylist, createHlsSegmentBitrateSample, hasHlsVariants, hlsResourceId, isHlsManifest, measuredHlsBitrateMetadata, normalizeHlsMasterForRoku, parseHlsMediaSegments, providerMasterBitrateMetadata, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
-import { applyQualityCeiling, confidentDirectPlayback, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { applyQualityCeiling, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -757,8 +757,17 @@ async function playbackDecision(req, source) {
   const hlsDecision = forceFull ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
   const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
   if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
+  // Ordered client hints: (2) container, (3) codecs. Incompatible codecs are
+  // never playable - transcoding is disabled, so the client closes the player.
+  const container = containerCompatibility(metadata, target.capabilities, req.query.ext);
+  const codecs = codecCompatibility(metadata, target.capabilities);
+  const playable = !codecs.known || codecs.compatible;
   return {
     ok: true,
+    containerCompatible: container.compatible,
+    codecsCompatible: codecs.known ? codecs.compatible : true,
+    playable,
+    incompatibleReason: playable ? '' : codecs.reason,
     directCompatible: direct.compatible,
     playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
     videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
