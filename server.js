@@ -960,7 +960,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
       const start = BigInt(singleRange[1]);
       const limit = start + BigInt(directChunkBytes) - 1n;
       const requestedEnd = singleRange[2] ? BigInt(singleRange[2]) : limit;
-      if (requestedEnd > limit) requestHeaders.range = `bytes=${start}-${limit}`;
+      if (!singleRange[2] || requestedEnd > limit) requestHeaders.range = `bytes=${start}-${limit}`;
     } else if (!requestHeaders.range && req.method === 'GET') {
       requestHeaders.range = `bytes=0-${directChunkBytes - 1}`;
     }
@@ -1020,7 +1020,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     if (!upstreamResponse.headers['cache-control']) res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-RH-Strategy', 'DIRECT');
     res.setHeader('X-RH-Delivery', 'RH_HTTPS_PROXY');
-    if (!boundedBytes) res.status(status);
+    res.status(boundedBytes ? 206 : status);
     // HEAD/304 are bodyless by HTTP definition. Keep upstream status and body
     // for 416/401/403/404/429/5xx so range and provider failures stay visible.
     if (req.method === 'HEAD' || status === 304 || status < 200) {
