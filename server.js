@@ -1011,7 +1011,7 @@ app.get('/internal/stream-strategies', (req, res) => {
   getStreamStrategyPolicy().then(policy => res.json(policy)).catch(error => res.status(503).json({ error: error.message }));
 });
 
-app.put('/internal/stream-strategies', (req, res) => {
+app.post('/internal/stream-strategies', (req, res) => {
   if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
   saveStreamStrategyPolicy(req.body?.devices).then(policy => res.json(policy))
     .catch(error => res.status(400).json({ error: error.message }));

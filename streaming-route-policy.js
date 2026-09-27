@@ -8,6 +8,7 @@ const EXACT_STREAMING_PATHS = new Set([
   '/api/playback/preview',
   '/internal/media-health',
   '/internal/active-streams',
+  '/internal/stream-strategies',
 ]);
 
 const STREAMING_PATH_PATTERNS = [
@@ -42,6 +43,7 @@ const STREAMING_PATH_PATTERNS = [
 // signalling relay, whose payload (an SDP blob) is too large for a query
 // string. Session-scoped and auth'd inside the route, same as the rest.
 const WRITE_STREAMING_PATTERNS = [
+  /^\/internal\/stream-strategies$/,
   /^\/api\/xtream\/wwp-call\/[^/]+\/signal$/,
   /^\/api\/xtream\/wwp-end\/[^/]+$/,
   // Account handoff coordinator: loopback-only and limited by the route to
