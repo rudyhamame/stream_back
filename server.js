@@ -31,7 +31,7 @@ import { wwpCallPageHtml } from './wwp-call-page.js';
 import { accountOwnerId } from './account-library-owner.js';
 import { checkInternetConnection } from './internet-health.js';
 import { getStreamStrategyPolicy, saveStreamStrategyPolicy } from './stream-strategy-policy.js';
-import { copyMediaHeaders, openProviderMedia, pipeProviderMedia } from './direct-media-proxy.js';
+import { copyMediaHeaders, openProviderMedia } from './direct-media-proxy.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -146,7 +146,7 @@ function evictBrowserDirectSessions(now = Date.now()) {
   }
 }
 
-function createBrowserDirectSession(req, source, kind, id, extension, providerUrl) {
+function createBrowserDirectSession(req, source, kind, id, extension, providerUrl, metadata) {
   evictBrowserDirectSessions();
   const ticket = resolveStreamTicket(requestStreamTicket(req), String(source._id), kind, id);
   const device = resolveDeviceToken(String(req.get('x-device-token') || req.query.deviceToken || ''));
@@ -158,6 +158,8 @@ function createBrowserDirectSession(req, source, kind, id, extension, providerUr
   const token = randomBytes(32).toString('base64url');
   const idHash = createHash('sha256').update(token).digest('hex').slice(0, 12);
   const parsed = new URL(providerUrl);
+  const probeContainer = String(metadata?.container || '').toLowerCase();
+  const rhMime = /matroska|webm/.test(probeContainer) ? 'mkv' : /mp4|mov|3gp/.test(probeContainer) ? 'mp4' : 'bin';
   const configuredRedirectHosts = String(process.env.DIRECT_PROXY_ALLOWED_REDIRECT_HOSTS || '')
     .split(',').map(host => host.trim().toLowerCase()).filter(Boolean);
   const sourceHost = new URL(source.baseUrl || providerUrl).hostname.toLowerCase();
@@ -175,11 +177,12 @@ function createBrowserDirectSession(req, source, kind, id, extension, providerUr
     providerHost: parsed.hostname.toLowerCase(),
     allowedRedirectHosts: [...new Set([sourceHost, ...configuredRedirectHosts])],
     sourceProtocol: parsed.protocol,
+    rhMime,
     createdAt: Date.now(),
     expiresAt: Date.now() + browserDirectSessionTtlMs,
   });
   evictBrowserDirectSessions();
-  return `/api/xtream/direct-session/${token}`;
+  return `/api/xtream/direct-session/${token}?rhMime=${rhMime}`;
 }
 
 // Android's ExoPlayer attaches auth as a global HTTP header (DefaultHttpDataSource
@@ -772,7 +775,7 @@ const allowedBrowserOrigins = new Set([
 ].map(origin => origin.trim()).filter(Boolean));
 app.use(cors({
   origin(origin, callback) { callback(null, !origin || allowedBrowserOrigins.has(origin)); },
-  exposedHeaders: ['X-RH-Strategy', 'X-RH-Delivery', 'X-RH-Video-Mode', 'X-RH-Audio-Mode', 'X-RH-Duration', 'Accept-Ranges', 'Content-Range'],
+  exposedHeaders: ['X-RH-Strategy', 'X-RH-Delivery', 'X-RH-Media-Type', 'X-RH-Video-Mode', 'X-RH-Audio-Mode', 'X-RH-Duration', 'Accept-Ranges', 'Content-Range'],
   methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
 }));
 app.use(express.json());
@@ -844,7 +847,7 @@ async function playbackDecision(req, source) {
   let browserDirectProxyUrl = '';
   const sourceProtocol = new URL(inputUrl).protocol;
   if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:') {
-    browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl);
+    browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl, metadata);
   }
   const transportLog = target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible
     ? 'DIRECT_PROXY' : direct.compatible ? 'DIRECT_PROVIDER' : hlsDecision.strategy;
@@ -917,6 +920,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
   const session = browserDirectSessions.get(token);
   if (!session || session.expiresAt <= Date.now()) return res.sendStatus(404);
   if (req.query.playbackClientId !== session.playbackClientId) return res.sendStatus(404);
+  if (req.query.rhMime !== session.rhMime) return res.sendStatus(404);
   const source = await getXtreamSource(session.sourceId, session.accountOwner).catch(() => null);
   if (!source || String(source.ownerId || '') !== session.accountOwner) {
     browserDirectSessions.delete(token);
@@ -951,14 +955,22 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     upstreamResponse = result.response;
     const status = Number(upstreamResponse.statusCode) || 502;
     copyMediaHeaders(upstreamResponse, res);
+    const tunneledMediaType = upstreamResponse.headers['content-type'] || 'application/octet-stream';
+    if (String(process.env.DIRECT_PROXY_CLOUDFLARE_TUNNEL_SSE || '').toLowerCase() === 'true') {
+      // Cloudflare Tunnel streams event-stream responses live. A narrow
+      // Response Header Transform Rule must restore the real media MIME using
+      // this session's rhMime query before the response reaches the browser.
+      res.setHeader('X-RH-Media-Type', tunneledMediaType);
+      res.setHeader('Content-Type', 'text/event-stream');
+    }
     if (!upstreamResponse.headers['content-type'] && status >= 200 && status < 300) res.setHeader('Content-Type', 'application/octet-stream');
     if (!upstreamResponse.headers['cache-control']) res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-RH-Strategy', 'DIRECT');
     res.setHeader('X-RH-Delivery', 'RH_HTTPS_PROXY');
     res.status(status);
-    // Do not relay provider error-page bodies into a successful media path.
-    // Status and range metadata stay intact for 401/403/404/416/429/5xx.
-    if (req.method === 'HEAD' || status === 304 || status === 416 || status < 200 || status >= 300) {
+    // HEAD/304 are bodyless by HTTP definition. Keep upstream status and body
+    // for 416/401/403/404/429/5xx so range and provider failures stay visible.
+    if (req.method === 'HEAD' || status === 304 || status < 200) {
       upstreamResponse.destroy();
       return res.end();
     }

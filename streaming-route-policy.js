@@ -9,6 +9,7 @@ const EXACT_STREAMING_PATHS = new Set([
   '/internal/media-health',
   '/internal/active-streams',
   '/internal/stream-strategies',
+  '/api/xtream/playback/release',
 ]);
 
 const STREAMING_PATH_PATTERNS = [

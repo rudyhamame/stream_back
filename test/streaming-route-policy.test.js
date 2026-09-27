@@ -15,11 +15,14 @@ test('allows only health and media delivery GET surfaces', () => {
     '/api/playback/preview?sourceId=source-1&kind=movie&id=42&at=120',
     '/internal/media-health',
     '/api/xtream/play/source-1/channel/42',
+    '/api/xtream/direct-session/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA',
     '/api/xtream/hls/source-1/movie/42/master.m3u8',
     '/api/xtream/hls/source-1/series/episode-3/segment-000001.ts',
     '/api/xtream/hls/source-1/channel/42/resource/0123456789abcdef01234567',
   ];
   for (const path of allowed) assert.equal(isStreamingRoute('GET', path), true, path);
+  assert.equal(isStreamingRoute('HEAD', '/api/xtream/direct-session/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'), true);
+  assert.equal(isStreamingRoute('GET', '/api/xtream/direct-session/short'), false);
 });
 
 test('blocks all control-plane and data-management routes', () => {
@@ -56,6 +59,12 @@ test('allows only the Android handoff POST under /internal/streams', () => {
   assert.equal(isStreamingRoute('GET', '/internal/streams/stop'), false);
   assert.equal(isStreamingRoute('GET', '/internal/streams/android-handoff'), false);
   assert.equal(isStreamingRoute('POST', '/internal/streams/stop/extra'), false);
+});
+
+test('permits the browser release preflight and session cleanup POST only', () => {
+  assert.equal(isStreamingRoute('OPTIONS', '/api/xtream/playback/release'), true);
+  assert.equal(isStreamingRoute('POST', '/api/xtream/playback/release'), true);
+  assert.equal(isStreamingRoute('PUT', '/api/xtream/playback/release'), false);
 });
 
 test('rejects prefix and traversal lookalikes', () => {
