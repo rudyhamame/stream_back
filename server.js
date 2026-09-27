@@ -862,6 +862,7 @@ async function playbackDecision(req, source) {
     // flag communicates the RH Control Panel gate without treating the
     // server's conservative container profile as the browser's verdict.
     directEnabled: Boolean(enabled.DIRECT),
+    remuxEnabled: Boolean(enabled.HLS_REMUX),
     incompatibleReason: playable ? '' : codecs.reason,
     directCompatible: direct.compatible,
     playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
@@ -3026,6 +3027,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
   let decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
+  if (target.client === PlaybackClient.BROWSER && strategyUsesEncoding(decision)) {
+    throw Object.assign(new Error('This item cannot be remuxed without transcoding.'), { statusCode: 415 });
+  }
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
@@ -3265,6 +3269,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         await mediaJobs.remove(job.key, 'provider-refused');
         break;
       }
+      if (target.client === PlaybackClient.BROWSER) break;
       const fallback = fallbackHlsStrategy(job.hlsDecision);
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
