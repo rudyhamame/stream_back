@@ -6,7 +6,7 @@ import cors from 'cors';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { spawn } from 'node:child_process';
-import { createHash, createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { promises as fs, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,6 +31,7 @@ import { wwpCallPageHtml } from './wwp-call-page.js';
 import { accountOwnerId } from './account-library-owner.js';
 import { checkInternetConnection } from './internet-health.js';
 import { getStreamStrategyPolicy, saveStreamStrategyPolicy } from './stream-strategy-policy.js';
+import { copyMediaHeaders, openProviderMedia, pipeProviderMedia } from './direct-media-proxy.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -102,6 +103,10 @@ function recallVodDuration(sourceId, kind, id) {
 const mediaSourceLocks = new KeyedSerialExecutor();
 const nativeHlsResourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
+const browserDirectSessions = new Map();
+const activeBrowserDirectRequests = new Map();
+const browserDirectSessionTtlMs = 8 * 60 * 60 * 1000;
+const browserDirectSessionMaxEntries = 2000;
 const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
 const nativeHlsSessionMaxEntries = 16;
@@ -123,6 +128,58 @@ function resolveStreamTicket(token, sourceId, kind, id) {
     const data = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
     return data.ownerId && data.exp > Date.now() && data.sourceId === sourceId && data.kind === kind && data.id === id ? data : null;
   } catch { return null; }
+}
+
+function evictBrowserDirectSessions(now = Date.now()) {
+  for (const [id, session] of browserDirectSessions) {
+    if (session.expiresAt <= now) {
+      browserDirectSessions.delete(id);
+      for (const controller of activeBrowserDirectRequests.get(id) || []) controller.abort(new Error('playback session expired'));
+      activeBrowserDirectRequests.delete(id);
+    }
+  }
+  while (browserDirectSessions.size > browserDirectSessionMaxEntries) {
+    const id = browserDirectSessions.keys().next().value;
+    browserDirectSessions.delete(id);
+    for (const controller of activeBrowserDirectRequests.get(id) || []) controller.abort(new Error('playback session evicted'));
+    activeBrowserDirectRequests.delete(id);
+  }
+}
+
+function createBrowserDirectSession(req, source, kind, id, extension, providerUrl) {
+  evictBrowserDirectSessions();
+  const ticket = resolveStreamTicket(requestStreamTicket(req), String(source._id), kind, id);
+  const device = resolveDeviceToken(String(req.get('x-device-token') || req.query.deviceToken || ''));
+  const accountOwner = String(ticket?.accountOwnerId || requestAccountOwner(req) || '');
+  const ownerId = String(ticket?.ownerId || device?.ownerId || '');
+  if (!accountOwner || !ownerId || String(source.ownerId || accountOwner) !== accountOwner) {
+    throw Object.assign(new Error('Authentication required'), { statusCode: 401 });
+  }
+  const token = randomBytes(32).toString('base64url');
+  const idHash = createHash('sha256').update(token).digest('hex').slice(0, 12);
+  const parsed = new URL(providerUrl);
+  const configuredRedirectHosts = String(process.env.DIRECT_PROXY_ALLOWED_REDIRECT_HOSTS || '')
+    .split(',').map(host => host.trim().toLowerCase()).filter(Boolean);
+  const sourceHost = new URL(source.baseUrl || providerUrl).hostname.toLowerCase();
+  browserDirectSessions.set(token, {
+    idHash,
+    sourceId: String(source._id),
+    accountOwner,
+    ownerId,
+    viewerId: mediaIdentity(req).viewerId,
+    playbackClientId: String(req.query.playbackClientId || ''),
+    kind,
+    itemId: String(id),
+    extension: String(extension || ''),
+    providerUrl,
+    providerHost: parsed.hostname.toLowerCase(),
+    allowedRedirectHosts: [...new Set([sourceHost, ...configuredRedirectHosts])],
+    sourceProtocol: parsed.protocol,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + browserDirectSessionTtlMs,
+  });
+  evictBrowserDirectSessions();
+  return `/api/xtream/direct-session/${token}`;
 }
 
 // Android's ExoPlayer attaches auth as a global HTTP header (DefaultHttpDataSource
@@ -377,7 +434,7 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
       return metadata;
     })
     .catch(error => {
-      console.warn(`[Media probe] ${cacheKey} unavailable: ${error.message}`);
+      console.warn(`[Media probe] cache=${cacheKey} unavailable type=${error.name || 'Error'}`);
       // A hard provider refusal (expired line / no VOD / IP block) will fail
       // ffmpeg the same way - surface it so the caller can stop fast instead
       // of burning the whole startup window on transcode retries. Cache it
@@ -387,7 +444,7 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
         // Auth/geo blocks stay cached longer; rate limits clear faster so a
         // recovered line becomes playable again without a long dead window.
         const hardBlock = /\b(401|403|404)\b|forbidden|access denied|not found/i.test(String(error.message || ''));
-        markProviderUnavailable(cacheKey, error.message, hardBlock ? 60_000 : 25_000);
+        markProviderUnavailable(cacheKey, hardBlock ? 'Provider refused media access' : 'Provider is temporarily unavailable', hardBlock ? 60_000 : 25_000);
         return codecProbeCache.get(cacheKey).metadata;
       }
       return {};
@@ -709,7 +766,15 @@ function rokuXtreamPlaybackPath(sourceId, kind, id, extension = '') {
 
 // Custom response headers are invisible to browser fetch() across origins
 // unless explicitly exposed - the encode-strategy badge reads these.
-app.use(cors({ exposedHeaders: ['X-RH-Strategy', 'X-RH-Video-Mode', 'X-RH-Audio-Mode', 'X-RH-Duration'] }));
+const allowedBrowserOrigins = new Set([
+  process.env.FRONTEND_URL || '',
+  ...String(process.env.BROWSER_FRONTEND_URL || 'https://iptv.mctoshs.ca,https://rabbithole.mctoshs.ca').split(','),
+].map(origin => origin.trim()).filter(Boolean));
+app.use(cors({
+  origin(origin, callback) { callback(null, !origin || allowedBrowserOrigins.has(origin)); },
+  exposedHeaders: ['X-RH-Strategy', 'X-RH-Delivery', 'X-RH-Video-Mode', 'X-RH-Audio-Mode', 'X-RH-Duration', 'Accept-Ranges', 'Content-Range'],
+  methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
+}));
 app.use(express.json());
 
 // Unlike the public /api/health endpoint, this verifies the same signed Roku
@@ -776,6 +841,14 @@ async function playbackDecision(req, source) {
   const container = containerCompatibility(metadata, target.capabilities, req.query.ext);
   const codecs = codecCompatibility(metadata, target.capabilities);
   const playable = !codecs.known || codecs.compatible;
+  let browserDirectProxyUrl = '';
+  const sourceProtocol = new URL(inputUrl).protocol;
+  if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:') {
+    browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl);
+  }
+  const transportLog = target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible
+    ? 'DIRECT_PROXY' : direct.compatible ? 'DIRECT_PROVIDER' : hlsDecision.strategy;
+  console.info(`[BrowserTransport] client=${target.client} item=${kind}:${id} protocol=${sourceProtocol.slice(0, -1)} container=${metadata.container || 'unknown'} video=${metadata.videoCodec || 'unknown'} audio=${metadata.audioCodec || 'unknown'} directCompatible=${direct.compatible} transport=${transportLog}${browserDirectProxyUrl ? ' deliveryReason=mixed_content_bridge' : ''}`);
   return {
     ok: true,
     containerCompatible: container.compatible,
@@ -788,7 +861,9 @@ async function playbackDecision(req, source) {
     videoMode: direct.compatible ? 'copy' : hlsDecision.videoMode,
     audioMode: direct.compatible ? 'copy' : hlsDecision.audioMode,
     durationSeconds,
-    providerURL: inputUrl,
+    ...((target.client !== PlaybackClient.BROWSER || sourceProtocol === 'https:') ? { providerURL: inputUrl } : {}),
+    ...(target.client === PlaybackClient.BROWSER ? { sourceProtocol } : {}),
+    ...(browserDirectProxyUrl ? { directProxyUrl: browserDirectProxyUrl } : {}),
     // Browser performs its own environment-specific feature detection; return
     // the normalized ffprobe facts so it can distinguish container from codecs.
     ...([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client) ? { media: metadata } : {}),
@@ -827,8 +902,85 @@ app.get('/api/xtream/playback-decision/:sourceId/:kind/:id', async (req, res) =>
     res.set('Cache-Control', 'no-store');
     res.json(await playbackDecision(req, source));
   } catch (error) {
-    console.warn(`[PlaybackDecision] ${req.params.kind}:${req.params.id} client=${String(req.query.client || 'browser')} failed: ${error.message}`);
-    res.status(error.statusCode || 502).json({ ok: false, error: error.message });
+    console.warn(`[PlaybackDecision] ${req.params.kind}:${req.params.id} client=${String(req.query.client || 'browser')} failed type=${error.name || 'Error'}`);
+    res.status(error.statusCode || 502).json({ ok: false, error: String(req.query.client || '').toLowerCase() === PlaybackClient.BROWSER ? 'Could not determine Browser playback compatibility.' : error.message });
+  }
+});
+
+// Browser-only, session-keyed byte relay. The opaque id is created by the
+// authenticated compatibility decision and maps to the original URL only in
+// this process. It is intentionally separate from the Android path-based API.
+app.all('/api/xtream/direct-session/:token', async (req, res) => {
+  if (!['GET', 'HEAD'].includes(req.method)) return res.sendStatus(405);
+  evictBrowserDirectSessions();
+  const token = String(req.params.token || '');
+  const session = browserDirectSessions.get(token);
+  if (!session || session.expiresAt <= Date.now()) return res.sendStatus(404);
+  if (req.query.playbackClientId !== session.playbackClientId) return res.sendStatus(404);
+  const source = await getXtreamSource(session.sourceId, session.accountOwner).catch(() => null);
+  if (!source || String(source.ownerId || '') !== session.accountOwner) {
+    browserDirectSessions.delete(token);
+    return res.sendStatus(404);
+  }
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  let releaseDirectStream;
+  let upstreamResponse;
+  let bytesTransferred = 0;
+  const requestSet = activeBrowserDirectRequests.get(token) || new Set();
+  requestSet.add(controller);
+  activeBrowserDirectRequests.set(token, requestSet);
+  const abort = () => {
+    if (!res.writableEnded) controller.abort(new Error('browser disconnected or sought'));
+  };
+  req.once('aborted', abort);
+  res.once('close', abort);
+  try {
+    releaseDirectStream = directStreamLimiter.acquire(session.sourceId);
+    const result = await openProviderMedia({
+      url: session.providerUrl,
+      method: req.method,
+      requestHeaders: req.headers,
+      allowedRedirectHosts: session.allowedRedirectHosts,
+      signal: controller.signal,
+      connectTimeoutMs: Number(process.env.DIRECT_PROXY_CONNECT_TIMEOUT_MS) || 10_000,
+      firstByteTimeoutMs: Number(process.env.DIRECT_PROXY_FIRST_BYTE_TIMEOUT_MS) || 25_000,
+      idleTimeoutMs: Number(process.env.DIRECT_PROXY_IDLE_TIMEOUT_MS) || mediaStreamIdleTimeoutMs,
+      maxRedirects: 5,
+    });
+    upstreamResponse = result.response;
+    const status = Number(upstreamResponse.statusCode) || 502;
+    copyMediaHeaders(upstreamResponse, res);
+    if (!upstreamResponse.headers['content-type'] && status >= 200 && status < 300) res.setHeader('Content-Type', 'application/octet-stream');
+    if (!upstreamResponse.headers['cache-control']) res.setHeader('Cache-Control', 'private, no-store');
+    res.setHeader('X-RH-Strategy', 'DIRECT');
+    res.setHeader('X-RH-Delivery', 'RH_HTTPS_PROXY');
+    res.status(status);
+    // Do not relay provider error-page bodies into a successful media path.
+    // Status and range metadata stay intact for 401/403/404/416/429/5xx.
+    if (req.method === 'HEAD' || status === 304 || status === 416 || status < 200 || status >= 300) {
+      upstreamResponse.destroy();
+      return res.end();
+    }
+    const counter = new Transform({ transform(chunk, encoding, callback) { bytesTransferred += chunk.length; callback(null, chunk); } });
+    await pipeline(upstreamResponse, counter, res);
+  } catch (error) {
+    if (!controller.signal.aborted) {
+      const code = error.message.includes('timeout') ? 504 : error.message.includes('private') || error.message.includes('redirect') ? 403 : 502;
+      console.warn(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} status=${code} reason=${error.message.includes('timeout') ? 'timeout' : error.message.includes('redirect') || error.message.includes('private') ? 'destination_rejected' : 'upstream_error'}`);
+      if (!res.headersSent && !res.destroyed) res.status(code).end();
+      else if (!res.destroyed) res.destroy(error);
+    }
+  } finally {
+    releaseDirectStream?.();
+    requestSet.delete(controller);
+    if (!requestSet.size) activeBrowserDirectRequests.delete(token);
+    req.off('aborted', abort);
+    res.off('close', abort);
+    const rangeRequest = req.headers.range || 'none';
+    const rangeResponse = upstreamResponse?.headers['content-range'] || 'none';
+    const httpStatus = upstreamResponse?.statusCode || res.statusCode;
+    console.info(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} host=${session.providerHost} status=${httpStatus} range=${rangeRequest} returned=${rangeResponse} bytes=${bytesTransferred} startupMs=${upstreamResponse ? 'ready' : 'failed'} durationMs=${Date.now() - startedAt} disconnect=${controller.signal.aborted}`);
   }
 });
 
@@ -2025,6 +2177,15 @@ app.post('/api/xtream/sources/:id/archive/:key/restore', async (req, res) => {
 // later Android navigation cannot stop a stream already owned by Roku.
 app.post('/api/xtream/playback/release', async (req, res) => {
   try {
+    const proxyToken = String(req.body?.directProxyToken || req.query.directProxyToken || '').trim();
+    if (proxyToken) {
+      const session = browserDirectSessions.get(proxyToken);
+      if (session && session.playbackClientId === String(req.query.playbackClientId || '')) {
+        browserDirectSessions.delete(proxyToken);
+        for (const controller of activeBrowserDirectRequests.get(proxyToken) || []) controller.abort(new Error('playback session released'));
+        activeBrowserDirectRequests.delete(proxyToken);
+      }
+    }
     const sourceId = String(req.body?.sourceId || req.query.sourceId || '').trim();
     const kind = String(req.body?.kind || req.query.kind || '').trim();
     const id = String(req.body?.id || req.query.id || '').trim();
@@ -2990,8 +3151,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const target = playbackTarget(req);
     const suppliedProviderURL = String(req.query.providerURL || '');
     let playbackProviderURL = '';
-    if (target.client === PlaybackClient.BROWSER && !suppliedProviderURL) return res.status(400).json({ error: 'The original provider URL is required for browser streaming.' });
-    if (suppliedProviderURL || target.client === PlaybackClient.ANDROID) {
+    if (suppliedProviderURL || [PlaybackClient.ANDROID, PlaybackClient.BROWSER].includes(target.client)) {
       playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';

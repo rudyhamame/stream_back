@@ -19,6 +19,7 @@ const STREAMING_PATH_PATTERNS = [
   /^\/api\/debug\/live\/[^/]+\/bitrate$/,
   /^\/api\/xtream\/playback-decision\/[^/]+\/(?:movie|series)\/[^/]+$/,
   /^\/api\/xtream\/direct\/[^/]+\/(?:channel|movie|series)\/[^/]+$/,
+  /^\/api\/xtream\/direct-session\/[A-Za-z0-9_-]{40,60}$/,
   /^\/api\/xtream\/play\/[^/]+\/(?:channel|movie|series)\/[^/]+$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/master\.m3u8$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/segment-\d{6}\.ts$/,
