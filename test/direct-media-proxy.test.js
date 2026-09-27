@@ -2,7 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { isPublicAddress, openProviderMedia, validateMediaUrl } from '../direct-media-proxy.js';
+import { createPinnedLookup, isPublicAddress, openProviderMedia, validateMediaUrl } from '../direct-media-proxy.js';
+
+test('pinned DNS lookup matches both legacy and Node all-address callback forms', () => {
+  const lookup = createPinnedLookup({ address: '203.0.113.7', family: 4 });
+  let legacy;
+  lookup('provider.example', {}, (...args) => { legacy = args; });
+  assert.deepEqual(legacy, [null, '203.0.113.7', 4]);
+  let all;
+  lookup('provider.example', { all: true }, (...args) => { all = args; });
+  assert.deepEqual(all, [null, [{ address: '203.0.113.7', family: 4 }]]);
+});
 
 async function withServer(handler, run) {
   const server = http.createServer(handler);

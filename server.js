@@ -930,6 +930,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
   const startedAt = Date.now();
   let releaseDirectStream;
   let upstreamResponse;
+  let probedMediaType = '';
   let bytesTransferred = 0;
   const requestSet = activeBrowserDirectRequests.get(token) || new Set();
   requestSet.add(controller);
@@ -955,7 +956,13 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     upstreamResponse = result.response;
     const status = Number(upstreamResponse.statusCode) || 502;
     copyMediaHeaders(upstreamResponse, res);
-    const tunneledMediaType = upstreamResponse.headers['content-type'] || 'application/octet-stream';
+    probedMediaType = session.rhMime === 'mkv' ? 'video/x-matroska' : session.rhMime === 'mp4' ? 'video/mp4' : '';
+    const tunneledMediaType = probedMediaType || upstreamResponse.headers['content-type'] || 'application/octet-stream';
+    // Xtream hosts frequently label all media as application/octet-stream or
+    // return an unrelated MIME type. The authenticated probe established the
+    // container for this opaque session, so expose its canonical media MIME
+    // while preserving the upstream bytes and all range semantics unchanged.
+    if (probedMediaType && status >= 200 && status < 300) res.setHeader('Content-Type', probedMediaType);
     if (String(process.env.DIRECT_PROXY_CLOUDFLARE_TUNNEL_SSE || '').toLowerCase() === 'true') {
       // Cloudflare Tunnel streams event-stream responses live. A narrow
       // Response Header Transform Rule must restore the real media MIME using
@@ -979,7 +986,9 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
   } catch (error) {
     if (!controller.signal.aborted) {
       const code = error.message.includes('timeout') ? 504 : error.message.includes('private') || error.message.includes('redirect') ? 403 : 502;
-      console.warn(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} status=${code} reason=${error.message.includes('timeout') ? 'timeout' : error.message.includes('redirect') || error.message.includes('private') ? 'destination_rejected' : 'upstream_error'}`);
+      const errorCode = /^[A-Z][A-Z0-9_]{1,40}$/.test(String(error.code || '')) ? error.code : 'UNKNOWN';
+      const destinationHost = /^[a-z0-9.:[\]-]{1,253}$/i.test(String(error.destinationHost || '')) ? ` destinationHost=${error.destinationHost}` : '';
+      console.warn(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} status=${code} code=${errorCode}${destinationHost} reason=${error.message.includes('timeout') ? 'timeout' : error.message.includes('redirect') || error.message.includes('private') ? 'destination_rejected' : 'upstream_error'}`);
       if (!res.headersSent && !res.destroyed) res.status(code).end();
       else if (!res.destroyed) res.destroy(error);
     }
@@ -992,7 +1001,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     const rangeRequest = req.headers.range || 'none';
     const rangeResponse = upstreamResponse?.headers['content-range'] || 'none';
     const httpStatus = upstreamResponse?.statusCode || res.statusCode;
-    console.info(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} host=${session.providerHost} status=${httpStatus} range=${rangeRequest} returned=${rangeResponse} bytes=${bytesTransferred} startupMs=${upstreamResponse ? 'ready' : 'failed'} durationMs=${Date.now() - startedAt} disconnect=${controller.signal.aborted}`);
+    console.info(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} host=${session.providerHost} status=${httpStatus} upstreamMime=${String(upstreamResponse?.headers['content-type'] || 'none').replace(/[^a-z0-9.+/-]/gi, '').slice(0, 80)} browserMime=${probedMediaType || 'upstream'} range=${rangeRequest} returned=${rangeResponse} bytes=${bytesTransferred} startupMs=${upstreamResponse ? 'ready' : 'failed'} durationMs=${Date.now() - startedAt} disconnect=${controller.signal.aborted}`);
   }
 });
 

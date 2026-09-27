@@ -11,6 +11,10 @@ const RESPONSE_HEADERS = [
 ];
 const REQUEST_HEADERS = ['range', 'if-range', 'if-none-match', 'if-modified-since'];
 const normalizedHostname = value => String(value || '').replace(/^\[|\]$/g, '').toLowerCase();
+const destinationError = (message, code, hostname) => Object.assign(new Error(message), {
+  code,
+  destinationHost: normalizedHostname(hostname),
+});
 
 function ipv4Number(address) {
   const parts = address.split('.').map(Number);
@@ -89,9 +93,11 @@ export function validateMediaUrl(value, allowPrivateHosts = new Set()) {
   }
   if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost') || hostname.endsWith('.local')) {
     if (allowPrivateHosts.has(hostname)) return target;
-    throw new Error('private media destination');
+    throw destinationError('private media destination', 'DIRECT_PROXY_PRIVATE_DESTINATION', hostname);
   }
-  if (net.isIP(hostname) && !isPublicAddress(hostname) && !allowPrivateHosts.has(hostname)) throw new Error('private media destination');
+  if (net.isIP(hostname) && !isPublicAddress(hostname) && !allowPrivateHosts.has(hostname)) {
+    throw destinationError('private media destination', 'DIRECT_PROXY_PRIVATE_DESTINATION', hostname);
+  }
   return target;
 }
 
@@ -105,7 +111,9 @@ async function resolvePublic(hostname, allowPrivateHosts) {
   const rows = net.isIP(hostname)
     ? [{ address: hostname, family: net.isIP(hostname) }]
     : await dns.lookup(hostname, { all: true, verbatim: true });
-  if (!rows.length || rows.some(row => !isPublicAddress(row.address))) throw new Error('private media destination');
+  if (!rows.length || rows.some(row => !isPublicAddress(row.address))) {
+    throw destinationError('private media destination', 'DIRECT_PROXY_PRIVATE_DESTINATION', hostname);
+  }
   return rows;
 }
 
@@ -144,7 +152,11 @@ function requestOnce(url, method, headers, addresses, { connectTimeoutMs, firstB
       headers,
       auth: url.username || url.password ? `${decodeURIComponent(url.username)}:${decodeURIComponent(url.password)}` : undefined,
       servername: net.isIP(normalizedHostname(url.hostname)) ? undefined : normalizedHostname(url.hostname),
-      lookup: (_hostname, _options, callback) => callback(null, address.address, address.family),
+      // Newer Node releases may call the custom lookup with `all: true`
+      // (notably when auto-selecting address families). Match dns.lookup's
+      // callback shape in both modes or Node rejects the pinned address with
+      // ERR_INVALID_IP_ADDRESS before it opens the provider connection.
+      lookup: createPinnedLookup(address),
     }, response => {
       clearTimeout(firstByteTimer);
       if (settled) { response.destroy(); return; }
@@ -169,6 +181,12 @@ function requestOnce(url, method, headers, addresses, { connectTimeoutMs, firstB
   });
 }
 
+export function createPinnedLookup(address) {
+  return (_hostname, options, callback) => options?.all
+    ? callback(null, [{ address: address.address, family: address.family }])
+    : callback(null, address.address, address.family);
+}
+
 export async function openProviderMedia({ url, method = 'GET', requestHeaders = {}, allowedRedirectHosts = [], signal, connectTimeoutMs = 10_000, firstByteTimeoutMs = 25_000, idleTimeoutMs = 45_000, maxRedirects = 5, allowPrivateHosts = [] }) {
   const allowedHosts = new Set(allowedRedirectHosts.map(normalizedHostname));
   const privateHosts = new Set(allowPrivateHosts.map(host => String(host).toLowerCase()));
@@ -179,7 +197,9 @@ export async function openProviderMedia({ url, method = 'GET', requestHeaders = 
   for (const name of REQUEST_HEADERS) if (requestHeaders[name]) headers[name] = requestHeaders[name];
 
   for (let redirects = 0; ; redirects += 1) {
-    if (!allowedHosts.has(normalizedHostname(target.hostname))) throw new Error('provider redirect host is not allowed');
+    if (!allowedHosts.has(normalizedHostname(target.hostname))) {
+      throw destinationError('provider redirect host is not allowed', 'DIRECT_PROXY_REDIRECT_HOST_NOT_ALLOWED', target.hostname);
+    }
     const addresses = await resolveWithTimeout(target.hostname, privateHosts, connectTimeoutMs);
     const { response } = await requestOnce(target, method, headers, addresses, { connectTimeoutMs, firstByteTimeoutMs, signal });
     response.socket?.setTimeout(idleTimeoutMs, () => response.destroy(new Error('upstream idle timeout')));
@@ -188,7 +208,9 @@ export async function openProviderMedia({ url, method = 'GET', requestHeaders = 
     response.destroy();
     if (!location || redirects >= maxRedirects) throw new Error('provider redirect limit exceeded');
     target = validateMediaUrl(new URL(location, target).href, privateHosts);
-    if (!allowedHosts.has(normalizedHostname(target.hostname))) throw new Error('provider redirect host is not allowed');
+    if (!allowedHosts.has(normalizedHostname(target.hostname))) {
+      throw destinationError('provider redirect host is not allowed', 'DIRECT_PROXY_REDIRECT_HOST_NOT_ALLOWED', target.hostname);
+    }
   }
 }
 
