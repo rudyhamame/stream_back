@@ -3112,7 +3112,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // Browser remux jobs use fragmented MP4 HLS instead: the tracks are still
   // copied byte-for-byte at the codec level, while MSE receives its native
   // ISO-BMFF container. Roku keeps its established MPEG-TS output.
-  const browserFmp4Remux = target.client === PlaybackClient.BROWSER && mode === 'remux';
+  // Browser hls.js is more reliable with its native MPEG-TS transmuxer for
+  // stream-copy output. The previous fMP4 copy could parse the manifest but
+  // stall before BUFFER_APPENDED.
+  const browserFmp4Remux = false;
   // Every Roku strategy that converts video uses the stable VAAPI path. Remux
   // and audio-only conversion preserve the original video bitstream.
   const hardwareTranscode = false;
