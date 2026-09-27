@@ -86,7 +86,7 @@ function codecLevel(value, codec) {
   return raw / 10;
 }
 
-function videoCompatibility(metadata, capabilities) {
+export function videoCompatibility(metadata, capabilities) {
   const codec = normalizedCodec(metadata.videoCodec || metadata.codecVideo || metadata.codec);
   if (!codec) return { compatible: false, reason: 'video codec unavailable' };
   const profile = normalizedCodec(metadata.videoProfile || metadata.profile);
@@ -123,7 +123,7 @@ function videoCompatibility(metadata, capabilities) {
   return { compatible: false, reason: `video codec ${codec} requires H.264 conversion` };
 }
 
-function audioCompatibility(metadata, capabilities) {
+export function audioCompatibility(metadata, capabilities) {
   const codec = normalizedCodec(metadata.audioCodec || metadata.codecAudio);
   if (!codec) return { compatible: false, reason: 'audio codec unavailable', outputChannels: 2 };
   const channels = Math.max(0, Number(metadata.audioChannels || metadata.channels) || 0);
