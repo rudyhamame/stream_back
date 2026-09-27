@@ -849,8 +849,10 @@ async function playbackDecision(req, source) {
   if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:') {
     browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl, metadata);
   }
-  const transportLog = target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible
-    ? 'DIRECT_PROXY' : direct.compatible ? 'DIRECT_PROVIDER' : hlsDecision.strategy;
+  const browserDirectAttempt = target.client === PlaybackClient.BROWSER && enabled.DIRECT;
+  const transportLog = browserDirectAttempt
+    ? sourceProtocol === 'http:' ? 'DIRECT_PROXY' : 'DIRECT_PROVIDER'
+    : direct.compatible ? 'DIRECT_PROVIDER' : hlsDecision.strategy;
   console.info(`[BrowserTransport] client=${target.client} item=${kind}:${id} protocol=${sourceProtocol.slice(0, -1)} container=${metadata.container || 'unknown'} video=${metadata.videoCodec || 'unknown'} audio=${metadata.audioCodec || 'unknown'} directCompatible=${direct.compatible} transport=${transportLog}${browserDirectProxyUrl ? ' deliveryReason=mixed_content_bridge' : ''}`);
   return {
     ok: true,
