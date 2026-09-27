@@ -19,7 +19,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { DEFAULT_ROKU_FALLBACK_BITRATE, HlsBitrateSource, HlsPlaylistType, classifyHlsPlaylist, createHlsSegmentBitrateSample, hasHlsVariants, hlsResourceId, isHlsManifest, measuredHlsBitrateMetadata, normalizeHlsMasterForRoku, parseHlsMediaSegments, providerMasterBitrateMetadata, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
-import { applyQualityCeiling, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, needsHlsVideoTimestampRepair, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
+import { applyQualityCeiling, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding } from './playback-strategy.js';
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
@@ -30,6 +30,7 @@ import { applyWwpControl, appendWwpCallSignal, endWwpSession, getWwpSession, not
 import { wwpCallPageHtml } from './wwp-call-page.js';
 import { accountOwnerId } from './account-library-owner.js';
 import { checkInternetConnection } from './internet-health.js';
+import { getStreamStrategyPolicy, saveStreamStrategyPolicy } from './stream-strategy-policy.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -756,12 +757,18 @@ async function playbackDecision(req, source) {
     throw error;
   }
   const target = playbackTarget(req);
+  const strategyPolicy = await getStreamStrategyPolicy();
+  const enabled = strategyPolicy.devices[target.client];
   const forceFull = forceRokuFullTranscode && target.client === PlaybackClient.ROKU;
   const direct = forceFull
     ? { compatible: false, reason: 'full transcode forced by server policy' }
     : confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
+  if (!enabled.DIRECT) direct.compatible = false;
   const selectedHlsDecision = determineHlsStrategy(metadata, target.capabilities);
   const hlsDecision = forceFull ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
+  const selectedEnabled = hlsDecision.strategy === HlsStrategy.REMUX ? enabled.HLS_REMUX
+    : hlsDecision.strategy === HlsStrategy.VIDEO_TRANSCODE ? enabled.HLS_VIDEO_TRANSCODE
+      : enabled.HLS_FULL_TRANSCODE;
   const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
   if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
   // Ordered client hints: (2) container, (3) codecs. Incompatible codecs are
@@ -773,7 +780,8 @@ async function playbackDecision(req, source) {
     ok: true,
     containerCompatible: container.compatible,
     codecsCompatible: codecs.known ? codecs.compatible : true,
-    playable,
+    playable: playable && (direct.compatible || selectedEnabled),
+    strategyUnavailable: playable && !direct.compatible && !selectedEnabled,
     incompatibleReason: playable ? '' : codecs.reason,
     directCompatible: direct.compatible,
     playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
@@ -958,7 +966,7 @@ function diagnosticsAuthorized(req) {
   // unauthenticated debug surface or requiring a secret in source control.
   const expected = String(process.env.INTERNAL_DIAGNOSTICS_TOKEN || process.env.DEVICE_AUTH_SECRET || '');
   if (!expected) return false;
-  const supplied = String(req.get('x-internal-token') || req.get('authorization')?.replace(/^Bearer\s+/i, '') || '');
+  const supplied = String(req.get('x-internal-token') || req.get('x-device-token') || req.get('authorization')?.replace(/^Bearer\s+/i, '') || '');
   const left = Buffer.from(supplied);
   const right = Buffer.from(expected);
   return left.length === right.length && timingSafeEqual(left, right);
@@ -996,6 +1004,17 @@ app.get('/api/debug/live/:channelId/bitrate', (req, res) => {
     measuredAt: entry.measuredAt,
     expiresAt: new Date(entry.expiresAt).toISOString(),
   });
+});
+
+app.get('/internal/stream-strategies', (req, res) => {
+  if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
+  getStreamStrategyPolicy().then(policy => res.json(policy)).catch(error => res.status(503).json({ error: error.message }));
+});
+
+app.put('/internal/stream-strategies', (req, res) => {
+  if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
+  saveStreamStrategyPolicy(req.body?.devices).then(policy => res.json(policy))
+    .catch(error => res.status(400).json({ error: error.message }));
 });
 
 async function mediaHealthSnapshot() {
@@ -2006,10 +2025,10 @@ app.post('/api/xtream/sources/:id/archive/:key/restore', async (req, res) => {
 // later Android navigation cannot stop a stream already owned by Roku.
 app.post('/api/xtream/playback/release', async (req, res) => {
   try {
-    const sourceId = String(req.body?.sourceId || '').trim();
-    const kind = String(req.body?.kind || '').trim();
-    const id = String(req.body?.id || '').trim();
-    const extension = String(req.body?.extension || '').trim();
+    const sourceId = String(req.body?.sourceId || req.query.sourceId || '').trim();
+    const kind = String(req.body?.kind || req.query.kind || '').trim();
+    const id = String(req.body?.id || req.query.id || '').trim();
+    const extension = String(req.body?.extension || req.query.extension || '').trim();
     if (!sourceId || !['channel', 'movie', 'series'].includes(kind) || !id) {
       return res.status(400).json({ error: 'sourceId, kind, and id are required' });
     }
@@ -2821,25 +2840,19 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
   let decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
-  // Browser and Android HLS rebuild H.264 frame timing while retaining AAC.
-  // This runs only after entering HLS; Android's native Direct path stays
-  // governed by the existing device compatibility decision.
-  const videoTimestampRepair = needsHlsVideoTimestampRepair({
-    client: target.client, seekableVod, metadata, capabilities, extension, decision,
-  });
-  if (videoTimestampRepair) {
-    decision = {
-      ...decision,
-      videoMode: 'transcode',
-      audioMode: 'copy',
-      strategy: HlsStrategy.VIDEO_TRANSCODE,
-      reason: `${decision.reason}; ${target.client} video timestamps normalized while preserving AAC audio`,
-    };
-  }
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
   console.log(`[Media HLS strategy] ${kind}:${id} ${probeSummary} videoMode=${decision.videoMode} audioMode=${decision.audioMode} strategy=${decision.strategy} reason="${decision.reason}"`);
+  const enabledStrategies = (await getStreamStrategyPolicy()).devices[target.client];
+  const strategyEnabled = decision.strategy === HlsStrategy.REMUX ? enabledStrategies.HLS_REMUX
+    : decision.strategy === HlsStrategy.VIDEO_TRANSCODE ? enabledStrategies.HLS_VIDEO_TRANSCODE
+      : enabledStrategies.HLS_FULL_TRANSCODE;
+  if (!strategyEnabled) {
+    const error = new Error(`${decision.strategy} is disabled for ${target.client} in the RH IPTV Control Panel.`);
+    error.statusCode = 409;
+    throw error;
+  }
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
   // Every Roku strategy that converts video uses the stable VAAPI path. Remux
   // and audio-only conversion preserve the original video bitstream.
@@ -2868,7 +2881,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // Normal playback stays near playback speed. Preview startup is allowed to
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds, hlsVodReadrate), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
-    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode, allowVideoTimestampRepair: videoTimestampRepair }),
+    '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode }),
     '-sn', '-dn',
                   '-f', 'hls',
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
