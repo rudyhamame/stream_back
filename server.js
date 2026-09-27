@@ -866,6 +866,17 @@ async function playbackDecision(req, source) {
     videoCompatible: video ? video.compatible : false,
     audioCodecKnown,
     audioCompatible: audio ? audio.compatible : false,
+    containerValue: String(container.container || metadata.container || req.query.ext || ''),
+    videoCodecValue: String(metadata.videoCodec || ''),
+    audioCodecValue: String(metadata.audioCodec || ''),
+    // Keep the raw facts produced by this compatibility probe available to
+    // Roku previews alongside the decision flags. These are the detected
+    // stream/container values, not values inferred from a catalog title.
+    media: {
+      container: String(metadata.container || ''),
+      videoCodec: String(metadata.videoCodec || ''),
+      audioCodec: String(metadata.audioCodec || ''),
+    },
     playable: playable && (direct.compatible || selectedEnabled),
     strategyUnavailable: playable && !direct.compatible && !selectedEnabled,
     // Browser capability detection is performed in the browser itself. This
