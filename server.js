@@ -547,7 +547,7 @@ async function enforceHlsFileBound(job) {
   if (!job?.directory) return;
   try {
     const segments = (await fs.readdir(job.directory))
-      .filter(name => /^segment-\d{6}\.ts$/.test(name))
+      .filter(name => /^segment-\d{6}\.(?:ts|m4s)$/.test(name))
       .sort();
     // Never prune a segment still advertised by the manifest. Roku HLS keeps
     // FFmpeg's delete_segments flag off so an old manifest cannot race an
@@ -1501,7 +1501,7 @@ app.use('/api/xtream', (req, res, next) => {
   // The "someone else is streaming" clip carries no provider content or
   // per-user data, so it is exempt the same way /logo is - the manifest route
   // redirects here with no streamTicket/deviceToken of its own to forward.
-  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|init\.mp4|resource\/[a-f0-9]{24})$/);
+  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.(?:ts|m4s)|init\.mp4|resource\/[a-f0-9]{24})$/);
   if (hls && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
   const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
   if (direct && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
@@ -2839,7 +2839,7 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinish
     if (signal?.aborted) throw signal.reason || new Error('Manifest request cancelled');
     try {
       const manifest = await fs.readFile(filename, 'utf8');
-      const segmentCount = manifest.split('\n').filter(line => /^segment-\d{6}\.ts$/.test(line.trim())).length;
+      const segmentCount = manifest.split('\n').filter(line => /^segment-\d{6}\.(?:ts|m4s)$/.test(line.trim())).length;
       // A deep restart at the end of a VOD may legitimately contain only its
       // final short segment. ENDLIST makes that one segment a complete,
       // playable response; waiting for the normal three-segment startup
@@ -2855,7 +2855,7 @@ async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinish
 async function completedHlsManifestAvailable(filename) {
   try {
     const manifest = await fs.readFile(filename, 'utf8');
-    return manifest.includes('#EXT-X-ENDLIST') && /^segment-\d{6}\.ts$/m.test(manifest);
+    return manifest.includes('#EXT-X-ENDLIST') && /^segment-\d{6}\.(?:ts|m4s)$/m.test(manifest);
   } catch {
     return false;
   }
@@ -3088,7 +3088,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
                   '-hls_time', String(playlistProfile.segmentSeconds), '-hls_list_size', String(playlistProfile.listSize),
                   ...(retainSegments ? [] : ['-hls_delete_threshold', '6']),
                   '-hls_flags', hlsMuxerFlags({ deleteSegments: !retainSegments }), '-flush_packets', '1',
-    '-hls_segment_filename', path.join(directory, 'segment-%06d.ts'), manifest,
+    '-hls_segment_filename', path.join(directory, browserFmp4Remux ? 'segment-%06d.m4s' : 'segment-%06d.ts'), manifest,
     );
     const child = spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     const safeCommand = [ffmpegBin, ...args].map(value => value === inputUrl ? '[provider URL]' : String(value)).join(' ');
@@ -3319,7 +3319,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       const sessionAgeMs = Date.now() - (wwpSession?.createdAt || manifestRequestStartedAt);
       let readySegments = 0;
       try {
-        readySegments = (await fs.readFile(job.manifest, 'utf8')).match(/^segment-\d{6}\.ts/gm)?.length || 0;
+        readySegments = (await fs.readFile(job.manifest, 'utf8')).match(/^segment-\d{6}\.(?:ts|m4s)/gm)?.length || 0;
       } catch { /* manifest not written yet */ }
       // Hold the real manifest back only until both partners are polling the
       // session AND a couple of segments exist - or WWP_BARRIER_MS elapses,
@@ -3341,7 +3341,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     if ([...segmentQuery].length > 0) {
       const query = segmentQuery.toString();
       manifestText = manifestText.split('\n').map(line => (
-        /^segment-\d{6}\.ts$/.test(line.trim())
+        /^segment-\d{6}\.(?:ts|m4s)$/.test(line.trim())
           ? `${line}?${query}`
           : line.replace(/^(#EXT-X-MAP:URI=")init\.mp4(".*)$/, `$1init.mp4?${query}$2`)
       )).join('\n');
@@ -3358,7 +3358,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       const liveStartOffset = -(playlistProfile.segmentSeconds * 3);
       manifestText = manifestText.replace('#EXTM3U', `#EXTM3U\n#EXT-X-START:TIME-OFFSET=${liveStartOffset},PRECISE=NO`);
     }
-    const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.ts(?:\?|$)/.test(line.trim())).length;
+    const segmentCount = manifestText.split('\n').filter(line => /^segment-\d{6}\.(?:ts|m4s)(?:\?|$)/.test(line.trim())).length;
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest ready segments=${segmentCount} mode=${job.mode || 'unknown'} preview=${fastPreview} startupMs=${Date.now() - manifestRequestStartedAt}`);
     if (target.client === PlaybackClient.ROKU && String(req.query.media || '') !== '1' && !hasHlsVariants(manifestText)) {
       // FFmpeg writes a media playlist directly to master.m3u8. Roku may
@@ -3495,7 +3495,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
   let job;
   const segmentStartedAt = Date.now();
   try {
-    if (!/^(?:segment-\d{6}\.ts|init\.mp4)$/.test(req.params.segment)) {
+    if (!/^(?:segment-\d{6}\.(?:ts|m4s)|init\.mp4)$/.test(req.params.segment)) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} invalid segment=${req.params.segment}`);
       return res.sendStatus(404);
     }
@@ -3578,7 +3578,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
   } catch (error) {
     if (error?.code === 'ENOENT') {
       let available = [];
-      try { available = (await fs.readdir(job?.directory || '')).filter(name => /^segment-\d{6}\.ts$/.test(name)).sort(); } catch {}
+      try { available = (await fs.readdir(job?.directory || '')).filter(name => /^segment-\d{6}\.(?:ts|m4s)$/.test(name)).sort(); } catch {}
       console.error(`[Media HLS] invariant ENOENT viewer=${mediaIdentity(req).viewerId || 'unknown'} session=${mediaIdentity(req).wwpSessionId || 'none'} generation=${job?.generationId || 'unknown'} state=${job?.state || 'unknown'} segment=${req.params.segment} requestedPath=${job?.directory || 'unknown'} oldestAvailableSegment=${available[0] || 'none'} latestProducedSegment=${available.at(-1) || 'none'} cleanupReason=${job?.stopReason || 'none'}`);
     } else {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} segment unavailable segment=${req.params.segment}: ${error.code || error.message}`);

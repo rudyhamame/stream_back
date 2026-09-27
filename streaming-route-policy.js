@@ -24,6 +24,8 @@ const STREAMING_PATH_PATTERNS = [
   /^\/api\/xtream\/play\/[^/]+\/(?:channel|movie|series)\/[^/]+$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/master\.m3u8$/,
   /^\/api\/xtream\/hls\/[^/]+\/(?:channel|movie|series)\/[^/]+\/segment-\d{6}\.ts$/,
+  // Browser-only fragmented MP4 media segment.
+  /^\/api\/xtream\/hls\/[^/]+\/(?:movie|series)\/[^/]+\/segment-\d{6}\.m4s$/,
   // Browser-only fragmented MP4 HLS initialization segment. Roku continues
   // to use MPEG-TS and never requests this route.
   /^\/api\/xtream\/hls\/[^/]+\/(?:movie|series)\/[^/]+\/init\.mp4$/,
