@@ -978,6 +978,30 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     upstreamResponse = result.response;
     const status = Number(upstreamResponse.statusCode) || 502;
     copyMediaHeaders(upstreamResponse, res);
+    const requestedRange = /^bytes=(\d+)-(\d+)$/.exec(String(requestHeaders.range || ''));
+    const returnedRange = /^bytes (\d+)-(\d+)\/(\d+)$/.exec(String(upstreamResponse.headers['content-range'] || ''));
+    let boundedBytes = 0;
+    if (req.method === 'GET' && requestedRange && status === 206 && returnedRange
+        && BigInt(returnedRange[1]) === BigInt(requestedRange[1])) {
+      const start = BigInt(returnedRange[1]);
+      const end = [BigInt(returnedRange[2]), BigInt(requestedRange[2]), start + BigInt(directChunkBytes) - 1n]
+        .reduce((smallest, value) => value < smallest ? value : smallest);
+      boundedBytes = Number(end - start + 1n);
+      res.setHeader('Content-Range', `bytes ${start}-${end}/${returnedRange[3]}`);
+      res.setHeader('Content-Length', String(boundedBytes));
+      res.setHeader('Accept-Ranges', 'bytes');
+    } else if (req.method === 'GET' && requestedRange && status === 200
+        && BigInt(requestedRange[1]) === 0n && /^\d+$/.test(String(upstreamResponse.headers['content-length'] || ''))) {
+      // Some providers ignore Range entirely. A first-chunk request can still
+      // be represented as a truthful 206 when the full length is known.
+      const total = BigInt(upstreamResponse.headers['content-length']);
+      boundedBytes = Number([total, BigInt(requestedRange[2]) + 1n, BigInt(directChunkBytes)]
+        .reduce((smallest, value) => value < smallest ? value : smallest));
+      res.setHeader('Content-Range', `bytes 0-${boundedBytes - 1}/${total}`);
+      res.setHeader('Content-Length', String(boundedBytes));
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.status(206);
+    }
     probedMediaType = session.rhMime === 'mkv' ? 'video/x-matroska' : session.rhMime === 'mp4' ? 'video/mp4' : '';
     const tunneledMediaType = probedMediaType || upstreamResponse.headers['content-type'] || 'application/octet-stream';
     // Xtream hosts frequently label all media as application/octet-stream or
@@ -996,15 +1020,37 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     if (!upstreamResponse.headers['cache-control']) res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-RH-Strategy', 'DIRECT');
     res.setHeader('X-RH-Delivery', 'RH_HTTPS_PROXY');
-    res.status(status);
+    if (!boundedBytes) res.status(status);
     // HEAD/304 are bodyless by HTTP definition. Keep upstream status and body
     // for 416/401/403/404/429/5xx so range and provider failures stay visible.
     if (req.method === 'HEAD' || status === 304 || status < 200) {
       upstreamResponse.destroy();
       return res.end();
     }
-    const counter = new Transform({ transform(chunk, encoding, callback) { bytesTransferred += chunk.length; callback(null, chunk); } });
-    await pipeline(upstreamResponse, counter, res);
+    if (boundedBytes) {
+      let remaining = boundedBytes;
+      try {
+        for await (const chunk of upstreamResponse) {
+          const portion = chunk.subarray(0, remaining);
+          bytesTransferred += portion.length;
+          remaining -= portion.length;
+          if (!res.write(portion)) {
+            await new Promise((resolve, reject) => {
+              const drained = () => { res.off('close', closed); resolve(); };
+              const closed = () => { res.off('drain', drained); reject(new Error('browser disconnected')); };
+              res.once('drain', drained);
+              res.once('close', closed);
+            });
+          }
+          if (!remaining) break;
+        }
+      } finally { upstreamResponse.destroy(); }
+      if (remaining) throw new Error('provider ended before requested range completed');
+      res.end();
+    } else {
+      const counter = new Transform({ transform(chunk, encoding, callback) { bytesTransferred += chunk.length; callback(null, chunk); } });
+      await pipeline(upstreamResponse, counter, res);
+    }
   } catch (error) {
     if (!controller.signal.aborted) {
       const code = error.message.includes('timeout') ? 504 : error.message.includes('private') || error.message.includes('redirect') ? 403 : 502;
@@ -1023,7 +1069,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
     const rangeRequest = req.headers.range || 'none';
     const rangeResponse = upstreamResponse?.headers['content-range'] || 'none';
     const httpStatus = upstreamResponse?.statusCode || res.statusCode;
-    console.info(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} host=${session.providerHost} status=${httpStatus} upstreamMime=${String(upstreamResponse?.headers['content-type'] || 'none').replace(/[^a-z0-9.+/-]/gi, '').slice(0, 80)} browserMime=${probedMediaType || 'upstream'} range=${rangeRequest} returned=${rangeResponse} bytes=${bytesTransferred} startupMs=${upstreamResponse ? 'ready' : 'failed'} durationMs=${Date.now() - startedAt} disconnect=${controller.signal.aborted}`);
+    console.info(`[DirectProxy] id=${session.idHash} source=${session.sourceId} item=${session.kind}:${session.itemId} host=${session.providerHost} status=${httpStatus} upstreamMime=${String(upstreamResponse?.headers['content-type'] || 'none').replace(/[^a-z0-9.+/-]/gi, '').slice(0, 80)} browserMime=${probedMediaType || 'upstream'} range=${rangeRequest} returned=${rangeResponse} served=${res.getHeader('Content-Range') || 'none'} bytes=${bytesTransferred} startupMs=${upstreamResponse ? 'ready' : 'failed'} durationMs=${Date.now() - startedAt} disconnect=${controller.signal.aborted}`);
   }
 });
 
