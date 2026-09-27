@@ -949,10 +949,25 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
   res.once('close', abort);
   try {
     releaseDirectStream = directStreamLimiter.acquire(session.sourceId);
+    // Cloudflare Tunnel can hold a long-lived media response before delivering
+    // it to the browser. Bound native video requests so each 206 completes
+    // quickly; the browser then asks for the next byte range. Preserve small
+    // explicit ranges (including Chrome's tiny format probes).
+    const requestHeaders = { ...req.headers };
+    const directChunkBytes = 2 * 1024 * 1024;
+    const singleRange = /^bytes=(\d+)-(\d*)$/.exec(String(requestHeaders.range || ''));
+    if (singleRange) {
+      const start = BigInt(singleRange[1]);
+      const limit = start + BigInt(directChunkBytes) - 1n;
+      const requestedEnd = singleRange[2] ? BigInt(singleRange[2]) : limit;
+      if (requestedEnd > limit) requestHeaders.range = `bytes=${start}-${limit}`;
+    } else if (!requestHeaders.range && req.method === 'GET') {
+      requestHeaders.range = `bytes=0-${directChunkBytes - 1}`;
+    }
     const result = await openProviderMedia({
       url: session.providerUrl,
       method: req.method,
-      requestHeaders: req.headers,
+      requestHeaders,
       allowedRedirectHosts: session.allowedRedirectHosts,
       signal: controller.signal,
       connectTimeoutMs: Number(process.env.DIRECT_PROXY_CONNECT_TIMEOUT_MS) || 10_000,
@@ -977,7 +992,7 @@ app.all('/api/xtream/direct-session/:token', async (req, res) => {
       res.setHeader('X-RH-Media-Type', tunneledMediaType);
       res.setHeader('Content-Type', 'text/event-stream');
     }
-    if (!upstreamResponse.headers['content-type'] && status >= 200 && status < 300) res.setHeader('Content-Type', 'application/octet-stream');
+    if (!upstreamResponse.headers['content-type'] && !probedMediaType && status >= 200 && status < 300) res.setHeader('Content-Type', 'application/octet-stream');
     if (!upstreamResponse.headers['cache-control']) res.setHeader('Cache-Control', 'private, no-store');
     res.setHeader('X-RH-Strategy', 'DIRECT');
     res.setHeader('X-RH-Delivery', 'RH_HTTPS_PROXY');
