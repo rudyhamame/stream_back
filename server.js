@@ -1501,7 +1501,7 @@ app.use('/api/xtream', (req, res, next) => {
   // The "someone else is streaming" clip carries no provider content or
   // per-user data, so it is exempt the same way /logo is - the manifest route
   // redirects here with no streamTicket/deviceToken of its own to forward.
-  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|resource\/[a-f0-9]{24})$/);
+  const hls = req.path.match(/^\/hls\/([^/]+)\/(channel|movie|series)\/([^/]+)\/(?:master\.m3u8|segment-\d{6}\.ts|init\.mp4|resource\/[a-f0-9]{24})$/);
   if (hls && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(hls[1]), hls[2], decodeURIComponent(hls[3]))) return next();
   const direct = req.path.match(/^\/play\/([^/]+)\/(movie|series)\/([^/]+)$/);
   if (direct && resolveStreamTicket(requestStreamTicket(req), decodeURIComponent(direct[1]), direct[2], decodeURIComponent(direct[3]))) return next();
@@ -3046,6 +3046,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     throw error;
   }
   const mode = strategyUsesEncoding(decision) ? 'transcode' : 'remux';
+  // Chrome's hls.js must transmux MPEG-TS in a worker before MSE can append
+  // it. Some valid stream-copy H.264 segments leave that transmuxer wedged.
+  // Browser remux jobs use fragmented MP4 HLS instead: the tracks are still
+  // copied byte-for-byte at the codec level, while MSE receives its native
+  // ISO-BMFF container. Roku keeps its established MPEG-TS output.
+  const browserFmp4Remux = target.client === PlaybackClient.BROWSER && mode === 'remux';
   // Every Roku strategy that converts video uses the stable VAAPI path. Remux
   // and audio-only conversion preserve the original video bitstream.
   const hardwareTranscode = false;
@@ -3074,8 +3080,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // catch up immediately and uses a bounded low-latency input analysis.
                   ...hlsInputArgs(kind === 'channel', hlsVodInitialBurstSeconds, hlsVodReadrate), '-reconnect', '1', '-reconnect_streamed', '1', '-reconnect_delay_max', '5', '-i', inputUrl,
     '-map', '0:v:0?', '-map', '0:a:0?', ...hlsCodecArgs(decision, { fastStart, hardware: hardwareTranscode }),
+    ...(browserFmp4Remux && decision.audioMode === 'copy' ? ['-bsf:a', 'aac_adtstoasc'] : []),
     '-sn', '-dn',
                   '-f', 'hls',
+                  ...(browserFmp4Remux ? ['-hls_segment_type', 'fmp4', '-hls_fmp4_init_filename', 'init.mp4'] : []),
                   ...(playlistProfile.initialSegmentSeconds > 0 ? ['-hls_init_time', String(playlistProfile.initialSegmentSeconds)] : []),
                   '-hls_time', String(playlistProfile.segmentSeconds), '-hls_list_size', String(playlistProfile.listSize),
                   ...(retainSegments ? [] : ['-hls_delete_threshold', '6']),
@@ -3091,6 +3099,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     let inputHeaderComplete = !seekableVod;
     const created = {
       generationId, directory, manifest, child, error: '', retainSegments, activeRequests: 0,
+      hlsSegmentType: browserFmp4Remux ? 'fmp4' : 'mpegts',
       stop: async () => {
         await terminateChild(child);
         if (retainSegments || target.client === PlaybackClient.BROWSER) retireHlsGeneration(key, hlsGenerationJobs.get(generationId) || created);
@@ -3332,7 +3341,9 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     if ([...segmentQuery].length > 0) {
       const query = segmentQuery.toString();
       manifestText = manifestText.split('\n').map(line => (
-        /^segment-\d{6}\.ts$/.test(line.trim()) ? `${line}?${query}` : line
+        /^segment-\d{6}\.ts$/.test(line.trim())
+          ? `${line}?${query}`
+          : line.replace(/^(#EXT-X-MAP:URI=")init\.mp4(".*)$/, `$1init.mp4?${query}$2`)
       )).join('\n');
     }
     if (req.params.kind === 'channel' && !manifestText.includes('#EXT-X-START')) {
@@ -3482,8 +3493,9 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
   let job;
+  const segmentStartedAt = Date.now();
   try {
-    if (!/^segment-\d{6}\.ts$/.test(req.params.segment)) {
+    if (!/^(?:segment-\d{6}\.ts|init\.mp4)$/.test(req.params.segment)) {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} invalid segment=${req.params.segment}`);
       return res.sendStatus(404);
     }
@@ -3504,6 +3516,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
     const key = rokuHlsKey(req.params.sourceId, req.params.kind, req.params.id, req.query.ext,
       wwpSessionId && seekableVod ? 0 : startSeconds, keyedCapability);
     const requestedGeneration = String(req.query.generation || '');
+    console.log(`[Media HLS segment] ${req.params.kind}:${req.params.id} segment=${req.params.segment} generation=${requestedGeneration || 'current'} start=${startSeconds}s client=${target.client}`);
     job = requestedGeneration ? hlsGenerationJobs.get(requestedGeneration) : mediaJobs.get(key);
     if (!job) {
       // The other WWP participant may still be creating the shared job - give it
@@ -3553,10 +3566,11 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/:segment', async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 150));
       }
     }
-    res.setHeader('Content-Type', 'video/mp2t');
+    res.setHeader('Content-Type', job.hlsSegmentType === 'fmp4' ? 'video/mp4' : 'video/mp2t');
     res.setHeader('Cache-Control', 'no-store');
     res.sendFile(filename, error => {
       releaseRequest();
+      if (!error) console.log(`[Media HLS segment] ${req.params.kind}:${req.params.id} delivered=${req.params.segment} generation=${job.generationId || 'unknown'} bytes=${job.directory ? 'file' : 'unknown'} durationMs=${Date.now() - segmentStartedAt}`);
       if (!error || res.destroyed || res.writableEnded) return;
       if (!res.headersSent) res.sendStatus(error.code === 'ENOENT' ? 404 : 502);
       else res.destroy(error);
