@@ -858,6 +858,10 @@ async function playbackDecision(req, source) {
     codecsCompatible: codecs.known ? codecs.compatible : true,
     playable: playable && (direct.compatible || selectedEnabled),
     strategyUnavailable: playable && !direct.compatible && !selectedEnabled,
+    // Browser capability detection is performed in the browser itself. This
+    // flag communicates the RH Control Panel gate without treating the
+    // server's conservative container profile as the browser's verdict.
+    directEnabled: Boolean(enabled.DIRECT),
     incompatibleReason: playable ? '' : codecs.reason,
     directCompatible: direct.compatible,
     playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
