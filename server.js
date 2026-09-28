@@ -303,11 +303,15 @@ function markProviderUnavailable(cacheKey, message, ttlMs = 25_000) {
   evictCodecProbeCache();
 }
 
-async function inspectProviderCodecs(inputUrl) {
+async function inspectProviderCodecs(inputUrl, deepProbe = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffprobeBin, [
-      '-v', 'error', '-rw_timeout', '12000000',
-      '-probesize', '1048576', '-analyzeduration', '3000000',
+      '-v', 'error', '-rw_timeout', deepProbe ? '30000000' : '12000000',
+      // Provider files sometimes expose format metadata before ffprobe has
+      // reached the audio/video stream headers. Retry those with a larger
+      // bounded scan so Roku receives actual codec names instead of Unknown.
+      '-probesize', deepProbe ? '16777216' : '1048576',
+      '-analyzeduration', deepProbe ? '12000000' : '3000000',
       '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:format=format_name,duration,bit_rate',
       '-of', 'json', inputUrl,
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -323,7 +327,7 @@ async function inspectProviderCodecs(inputUrl) {
     const timeout = setTimeout(() => {
       child.kill('SIGKILL');
       finish(new Error('Codec probe timed out'));
-    }, 15_000);
+    }, deepProbe ? 30_000 : 15_000);
     timeout.unref?.();
     child.stdout.on('data', chunk => { output = appendTail(output, chunk, 64 * 1024); });
     child.stderr.on('data', chunk => { errorOutput = appendTail(errorOutput, chunk); });
@@ -336,7 +340,7 @@ async function inspectProviderCodecs(inputUrl) {
         const video = streams.find(stream => stream.codec_type === 'video') || {};
         const audioStreams = streams.filter(stream => stream.codec_type === 'audio');
         const audio = audioStreams[0] || {};
-        finish(null, {
+        const metadata = {
           container: String(probe.format?.format_name || ''),
           containerSeconds: Math.max(0, Math.round(Number(probe.format?.duration) || 0)),
           probeBitrate: Math.max(0, Math.round(Number(probe.format?.bit_rate) || 0)),
@@ -358,7 +362,20 @@ async function inspectProviderCodecs(inputUrl) {
             sampleRate: Number(stream.sample_rate) || 0, channels: Number(stream.channels) || 0,
             channelLayout: String(stream.channel_layout || ''),
           })),
-        });
+        };
+        if (!deepProbe && (!metadata.videoCodec || !metadata.audioCodec)) {
+          inspectProviderCodecs(inputUrl, true)
+            .then(deep => finish(null, {
+              ...metadata,
+              ...deep,
+              container: deep.container || metadata.container,
+              containerSeconds: deep.containerSeconds || metadata.containerSeconds,
+              probeBitrate: deep.probeBitrate || metadata.probeBitrate,
+            }))
+            .catch(() => finish(null, metadata));
+          return;
+        }
+        finish(null, metadata);
       } catch { finish(new Error('Codec probe returned invalid metadata')); }
     });
   });
