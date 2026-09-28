@@ -1048,7 +1048,11 @@ async function playbackDecision(req, source) {
     directEnabled: Boolean(enabled.DIRECT),
     remuxEnabled: Boolean(enabled.HLS_REMUX),
     incompatibleReason: playable ? '' : codecs.reason,
-    directCompatible: direct.compatible,
+    // Compatibility is a media/device fact. Timing repair may still make the
+    // native route ineligible even when container and codecs are supported.
+    directCompatible: timingClient ? nativeCandidate.compatible : direct.compatible,
+    nativeCompatible: nativeCandidate.compatible,
+    directEligible: direct.compatible && !timingRepair,
     playbackStrategy: timingRepair ? HlsStrategy.TIMING_REPAIR : direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy,
     timingRepair: Boolean(timingRepair),
     videoMode: direct.compatible && !timingRepair ? 'copy' : hlsDecision.videoMode,

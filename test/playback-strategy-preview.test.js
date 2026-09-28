@@ -61,6 +61,7 @@ test('direct playback normalizes ffprobe Matroska format names', () => {
   assert.equal(accepted.compatible, true);
   assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.ANDROID), 'mkv').compatible, true);
   assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.BROWSER), 'mkv').compatible, false);
+  assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.BROWSER, ['mkv-direct']), 'mkv').compatible, true);
 });
 
 test('only decoded PTS regressions select the exceptional timing repair strategy', () => {

@@ -57,6 +57,7 @@ export function getPlaybackCapabilities(clientType = PlaybackClient.BROWSER, rep
     client,
     videoCodecs: new Set(defaults.videoCodecs),
     audioCodecs,
+    browserMkvDirect: client === PlaybackClient.BROWSER && tokens.has('mkv-direct'),
     hevcMain: tokens.has('hevc-main') || tokens.has('hevc-main-41') || tokens.has('hevc-main-51'),
     hevcMain10: tokens.has('hevc-main10') || tokens.has('hevc-main10-41') || tokens.has('hevc-main10-51'),
     maxHevcMainLevel: tokens.has('hevc-main-51') || tokens.has('hevc-main') ? 5.1 : tokens.has('hevc-main-41') ? 4.1 : 0,
@@ -146,7 +147,7 @@ export function containerCompatibility(metadata = {}, capabilities = getPlayback
     else ext = probedContainers[0];
   }
   const directContainers = capabilities.client === PlaybackClient.BROWSER
-    ? ['mp4', 'm4v', 'mov']
+    ? capabilities.browserMkvDirect ? ['mp4', 'm4v', 'mov', 'mkv'] : ['mp4', 'm4v', 'mov']
     : ['mp4', 'm4v', 'mov', 'mkv'];
   if (!directContainers.includes(ext)) {
     return { compatible: false, reason: `container ${ext || 'unknown'} is not approved for ${capabilities.client} direct playback` };
