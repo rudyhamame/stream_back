@@ -50,11 +50,31 @@ async function linkedDeviceRows(filter = {}) {
 function isRokuDeviceId(deviceId) { return String(deviceId || '').startsWith('roku-'); }
 
 async function accountHasOtherRokuDevice(accountCollection, accountId, deviceId) {
-  const account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1 } });
-  return (account?.devices || []).some(device => isRokuDeviceId(device.deviceId) && String(device.deviceId) !== String(deviceId));
+  let account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1, rokuDeviceId: 1 } });
+  if (!account) return false;
+  const rokuDevices = (account.devices || []).filter(device => isRokuDeviceId(device.deviceId));
+  let boundId = String(account.rokuDeviceId || '');
+  if (!boundId && rokuDevices.length) {
+    rokuDevices.sort((a, b) => {
+      const date = value => new Date(value?.linkedAt || value?.createdAt || 0).getTime();
+      return date(a) - date(b) || String(a.deviceId).localeCompare(String(b.deviceId));
+    });
+    boundId = String(rokuDevices[0].deviceId);
+    await accountCollection.updateOne(
+      { _id: accountId, $or: [{ rokuDeviceId: { $exists: false } }, { rokuDeviceId: null }, { rokuDeviceId: '' }] },
+      { $set: { rokuDeviceId: boundId, updatedAt: new Date() } },
+    );
+    account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1, rokuDeviceId: 1 } });
+    boundId = String(account?.rokuDeviceId || boundId);
+  }
+  if (boundId) await accountCollection.updateOne(
+    { _id: accountId },
+    { $pull: { devices: { $and: [{ deviceId: /^roku-/ }, { deviceId: { $ne: boundId } }] } }, $set: { updatedAt: new Date() } },
+  );
+  return Boolean(boundId && boundId !== String(deviceId));
 }
 
-const singleRokuPerAccountError = 'This RH account is already linked to another Roku device. Unlink it before linking this Roku.';
+const singleRokuPerAccountError = 'This RH account is permanently linked to another Roku device.';
 
 async function updateLinkedDevice(filter, update, options = {}) {
   const collection = await accounts();
@@ -69,15 +89,19 @@ async function updateLinkedDevice(filter, update, options = {}) {
     const { accountId: ignored, ...setFields } = update.$set || {};
     void ignored;
     const insertFilter = { _id: id, 'devices.deviceId': { $ne: deviceId } };
-    if (isRokuDeviceId(deviceId)) insertFilter.devices = { $not: { $elemMatch: { deviceId: /^roku-/ } } };
+    if (isRokuDeviceId(deviceId)) {
+      insertFilter.devices = { $not: { $elemMatch: { deviceId: /^roku-/ } } };
+      insertFilter.$or = [{ rokuDeviceId: deviceId }, { rokuDeviceId: { $exists: false } }, { rokuDeviceId: null }, { rokuDeviceId: '' }];
+    }
     const result = await collection.updateOne(
       insertFilter,
-      { $push: { devices: { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date() } },
+      { $push: { devices: { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date(), ...(isRokuDeviceId(deviceId) ? { rokuDeviceId: deviceId } : {}) } },
     );
     if (result.modifiedCount) return result;
     const linkedSameDevice = await linkedDeviceRows({ accountId: id, deviceId });
     if (linkedSameDevice.length) return updateLinkedDevice({ accountId: id, deviceId }, update);
-    if (isRokuDeviceId(deviceId) && await accountHasOtherRokuDevice(collection, id, deviceId)) {
+    const account = isRokuDeviceId(deviceId) ? await collection.findOne({ _id: id }, { projection: { rokuDeviceId: 1, devices: 1 } }) : null;
+    if (isRokuDeviceId(deviceId) && (account?.rokuDeviceId && String(account.rokuDeviceId) !== deviceId || (account?.devices || []).some(row => isRokuDeviceId(row.deviceId)))) {
       return { matchedCount: 0, modifiedCount: 0, rokuDeviceLimitReached: true };
     }
     return result;
