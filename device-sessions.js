@@ -47,6 +47,15 @@ async function linkedDeviceRows(filter = {}) {
   }))).filter(device => Object.entries(filter).every(([key, value]) => String(device[key] ?? '') === String(value)));
 }
 
+function isRokuDeviceId(deviceId) { return String(deviceId || '').startsWith('roku-'); }
+
+async function accountHasOtherRokuDevice(accountCollection, accountId, deviceId) {
+  const account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1 } });
+  return (account?.devices || []).some(device => isRokuDeviceId(device.deviceId) && String(device.deviceId) !== String(deviceId));
+}
+
+const singleRokuPerAccountError = 'This RH account is already linked to another Roku device. Unlink it before linking this Roku.';
+
 async function updateLinkedDevice(filter, update, options = {}) {
   const collection = await accounts();
   if (options.upsert) {
@@ -59,10 +68,19 @@ async function updateLinkedDevice(filter, update, options = {}) {
     if (existing.some(row => String(row.accountId) === String(id))) return updateLinkedDevice({ accountId: id, deviceId }, update);
     const { accountId: ignored, ...setFields } = update.$set || {};
     void ignored;
-    return collection.updateOne(
-      { _id: id, 'devices.deviceId': { $ne: deviceId } },
+    const insertFilter = { _id: id, 'devices.deviceId': { $ne: deviceId } };
+    if (isRokuDeviceId(deviceId)) insertFilter.devices = { $not: { $elemMatch: { deviceId: /^roku-/ } } };
+    const result = await collection.updateOne(
+      insertFilter,
       { $push: { devices: { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date() } },
     );
+    if (result.modifiedCount) return result;
+    const linkedSameDevice = await linkedDeviceRows({ accountId: id, deviceId });
+    if (linkedSameDevice.length) return updateLinkedDevice({ accountId: id, deviceId }, update);
+    if (isRokuDeviceId(deviceId) && await accountHasOtherRokuDevice(collection, id, deviceId)) {
+      return { matchedCount: 0, modifiedCount: 0, rokuDeviceLimitReached: true };
+    }
+    return result;
   }
   const row = (await linkedDeviceRows(filter))[0];
   if (!row) return { matchedCount: 0, modifiedCount: 0 };
@@ -191,15 +209,18 @@ export async function authorizeDeviceSession(code, token) {
   const authorization = resolveDeviceToken(token);
   if (authorization?.type !== 'browser' || !ObjectId.isValid(authorization.accountId)) return { error: 'Sign in to authorize this Roku' };
   const accountId = new ObjectId(authorization.accountId);
+  const accountCollection = await accounts();
+  if (await accountHasOtherRokuDevice(accountCollection, accountId, session.deviceId)) return { error: singleRokuPerAccountError };
   const deviceCollection = await profiles();
   const profile = await deviceCollection.findOne({ ownerId: session.ownerId }, { projection: { accountId: 1 } });
   if (profile?.accountId && String(profile.accountId) !== String(accountId)) return { error: 'This Roku is linked to a different RH account' };
   session.accountId = String(accountId);
-  await deviceCollection.updateOne(
+  const linked = await deviceCollection.updateOne(
     { ownerId: session.ownerId },
     { $setOnInsert: { ownerId: session.ownerId, deviceId: session.deviceId, createdAt: new Date() }, $set: { accountId, updatedAt: new Date() } },
     { upsert: true },
   );
+  if (linked.rokuDeviceLimitReached) return { error: singleRokuPerAccountError };
   session.approvedAt = Date.now();
   return { ok: true, deviceId: session.deviceId };
 }
@@ -229,12 +250,14 @@ async function consumePairing(code, email, password, setup) {
     }
     if (!account || !verifyPassword(password, account.passwordHash)) return { error: 'Incorrect email or password' };
   }
+  if (await accountHasOtherRokuDevice(accountCollection, account._id, session.deviceId)) return { error: singleRokuPerAccountError };
   session.accountId = String(account._id);
-  await deviceCollection.updateOne(
+  const linked = await deviceCollection.updateOne(
     { ownerId: session.ownerId },
     { $setOnInsert: { ownerId: session.ownerId, deviceId: session.deviceId, createdAt: new Date() }, $set: { accountId: account._id, linkedAt: new Date(), updatedAt: new Date() } },
     { upsert: true },
   );
+  if (linked.rokuDeviceLimitReached) return { error: singleRokuPerAccountError };
   session.approvedAt = Date.now();
   return { token: issueToken(session, 'browser'), deviceId: session.deviceId };
 }
