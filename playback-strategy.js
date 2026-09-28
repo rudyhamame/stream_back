@@ -231,7 +231,9 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
 export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
   if (decision?.strategy === HlsStrategy.TIMING_REPAIR) {
     return [
-      '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '20', '-pix_fmt', 'yuv420p',
+      // OVH has two CPU cores and no render node. Keep simultaneous timing
+      // repair jobs light enough to maintain real-time segment production.
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads:v', '1', '-crf', '20', '-pix_fmt', 'yuv420p',
       '-profile:v', 'high', '-flags', '+cgop', '-force_key_frames', 'expr:gte(t,n_forced*2)',
       '-vf', setptsForFrameRate(decision.frameRate), '-fps_mode', 'cfr', '-r', String(decision.frameRate),
       '-c:a', 'copy',

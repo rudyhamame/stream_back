@@ -2545,6 +2545,21 @@ function hlsStartSeconds(value) {
   return Math.min(7 * 24 * 60 * 60, Math.max(0, parsed));
 }
 
+function hlsPlaybackJobKey(sourceId, kind, id, extension, startSeconds, identity, target, strategyOverride = '') {
+  const seekableVod = kind === 'movie' || kind === 'series';
+  const capabilityKey = identity.wwpSessionId
+    ? `wwp:${identity.wwpSessionId}`
+    : seekableVod ? String(target.key || target.client || PlaybackClient.BROWSER)
+      : (target.maxHeight ? `live:h${target.maxHeight}` : '');
+  const recoveryKey = typeof strategyOverride === 'string' && strategyOverride
+    ? `:hls-fallback-${strategyOverride}` : '';
+  const timingKey = identity.timingRepairRequested && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)
+    ? ':hls-timing-repair' : '';
+  return rokuHlsKey(sourceId, kind, id, extension,
+    identity.wwpSessionId && seekableVod ? 0 : startSeconds,
+    `${capabilityKey}${recoveryKey}${timingKey}`);
+}
+
 function evictNativeHlsSessions(now = Date.now()) {
   for (const [key, session] of nativeHlsSessions) if (session.expiresAt <= now) nativeHlsSessions.delete(key);
   while (nativeHlsSessions.size > nativeHlsSessionMaxEntries) nativeHlsSessions.delete(nativeHlsSessions.keys().next().value);
@@ -3099,19 +3114,6 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // Quality remains part of the key because 1080p and 480p are different
   // encoded outputs. VOD keeps its per-target key because its compatibility
   // and seek state are client-specific.
-  const capabilityKey = identity.wwpSessionId
-    ? `wwp:${identity.wwpSessionId}`
-    : seekableVod
-      ? String(target.key || target.client || PlaybackClient.BROWSER)
-      : (target.maxHeight ? `live:h${target.maxHeight}` : '');
-  const recoveryKey = typeof strategyOverride === 'string' && strategyOverride
-    ? `:hls-fallback-${strategyOverride}`
-    : '';
-  const timingKey = identity.timingRepairRequested && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)
-    ? ':hls-timing-repair'
-    : '';
-  const keyedCapability = `${capabilityKey}${recoveryKey}${timingKey}`;
-
   // Watch with Partner: the two participants compute their own playback
   // position independently and to 0.1s precision, so every follow / poll /
   // error-recovery restart from one side carries a slightly different -ss than
@@ -3124,9 +3126,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // so a flaky provider's endless error-recovery reloads do NOT keep forking
   // and tearing down the shared job.
   const wwpJobKey = identity.wwpSessionId && seekableVod;
-  const key = wwpJobKey
-    ? rokuHlsKey(source._id, kind, id, extension, 0, keyedCapability)
-    : rokuHlsKey(source._id, kind, id, extension, startSeconds, keyedCapability);
+  const key = hlsPlaybackJobKey(source._id, kind, id, extension, startSeconds, identity, target, strategyOverride);
 
   if (wwpJobKey) {
     const running = mediaJobs.get(key);
@@ -3328,7 +3328,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // boundaries and the usual two-second cadence after the opening segment.
     const fastStart = false;
     const playlistProfile = hlsPlaylistProfile({ fastStart, preview: previewRemux, client: target.client });
-    const args = ['-hide_banner', '-nostats', '-loglevel', 'info', ...hlsHwDeviceArgs({ enabled: hardwareTranscode })];
+    const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-progress', 'pipe:2', '-stats_period', '0.5', ...hlsHwDeviceArgs({ enabled: hardwareTranscode })];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
     args.push(
     // Keep a live, rolling manifest. Do not mark it VOD or EVENT: VOD made Roku
@@ -3358,7 +3358,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     let inputHeader = '';
     let inputHeaderComplete = !seekableVod;
     const created = {
-      generationId, directory, manifest, child, error: '', retainSegments, activeRequests: 0,
+      generationId, directory, manifest, child, error: '', generatedSeconds: 0, retainSegments, activeRequests: 0,
       hlsSegmentType: browserFmp4Remux ? 'fmp4' : 'mpegts',
       stop: async () => {
         await terminateChild(child);
@@ -3370,7 +3370,15 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       },
     };
     hlsGenerationJobs.set(generationId, created);
+    let progressLineBuffer = '';
     child.stderr.on('data', chunk => {
+      progressLineBuffer += chunk.toString();
+      const progressLines = progressLineBuffer.split(/\r?\n/);
+      progressLineBuffer = progressLines.pop().slice(-256);
+      for (const line of progressLines) {
+        const outputMicros = /^out_time_us=(\d+)$/.exec(line.trim());
+        if (outputMicros) created.generatedSeconds = Math.max(created.generatedSeconds, Number(outputMicros[1]) / 1_000_000);
+      }
       if (!inputHeaderComplete) {
         inputHeader = (inputHeader + chunk.toString()).slice(0, 16384);
         const seconds = inputDurationSeconds(inputHeader);
@@ -3382,7 +3390,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
       }
       created.error = appendTail(created.error, chunk);
       const registered = mediaJobs.get(key);
-      if (registered?.child === child) registered.error = created.error;
+      if (registered?.child === child) {
+        registered.error = created.error;
+        registered.generatedSeconds = created.generatedSeconds;
+      }
     });
     child.on('error', error => {
       created.error = appendTail(created.error, error.message);
@@ -3432,6 +3443,37 @@ setInterval(async () => {
   await Promise.allSettled([...mediaJobs.values()].filter(job => job.persistent).map(enforceHlsFileBound));
   } finally { mediaHousekeepingRunning = false; }
 }, 5_000).unref();
+
+// Report measured HLS startup work while the first manifest request is still
+// waiting for FFmpeg. The percentage is capped before the browser downloads
+// and decodes a segment; those later stages are reported by hls.js itself.
+app.get('/api/xtream/hls/:sourceId/:kind/:id/startup-status', async (req, res) => {
+  try {
+    if (!['movie', 'series'].includes(req.params.kind)) return res.sendStatus(404);
+    const ticket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
+    const source = await getXtreamSource(req.params.sourceId, ticket?.accountOwnerId || requestAccountOwner(req));
+    if (!source) return res.sendStatus(404);
+    const identity = mediaIdentity(req);
+    identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
+    const target = playbackTarget(req);
+    if (target.client !== PlaybackClient.BROWSER) return res.sendStatus(404);
+    const startSeconds = hlsStartSeconds(req.query.start);
+    const key = hlsPlaybackJobKey(source._id, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedHlsFallback(req));
+    const job = mediaJobs.get(key);
+    if (job?.userId && job.userId !== identity.userId && !identity.wwpSessionId) return res.sendStatus(404);
+    let segmentsReady = 0;
+    if (job?.manifest) {
+      const manifest = await fs.readFile(job.manifest, 'utf8').catch(() => '');
+      segmentsReady = manifest.match(/^segment-\d{6}\.(?:ts|m4s)$/gm)?.length || 0;
+    }
+    const encodedSeconds = Math.max(0, Number(job?.generatedSeconds) || 0);
+    let percent = job ? 42 + Math.min(24, Math.floor(encodedSeconds / 4 * 24)) : 40;
+    if (segmentsReady >= 1) percent = Math.max(percent, 60);
+    if (segmentsReady >= 2) percent = Math.max(percent, 68);
+    res.set('Cache-Control', 'no-store');
+    res.json({ percent, phase: job?.finished && !segmentsReady ? 'failed' : job ? 'encoding' : 'waiting', encodedSeconds, segmentsReady });
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
 
 app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
   const manifestRequestStartedAt = Date.now();
