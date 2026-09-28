@@ -87,6 +87,9 @@ const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
 const timingProbesInFlight = new Map();
 const decodedTimingCache = new Map();
+// Version timing cache keys so a prior decision without decoded-frame
+// validation cannot be reused as proof that DIRECT is safe.
+const decodedTimingSchema = 'decoded-pts-v2';
 // VOD runtime (seconds) learned while a title is streaming - from the codec
 // probe or a one-shot ffprobe on the same provider connection the job holds.
 // library_backend reads this via /internal/media-duration when its own probe
@@ -913,7 +916,7 @@ async function playbackDecision(req, source) {
   }
   const target = playbackTarget(req);
   if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}`;
+    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}`;
     metadata.timing = await inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, timingKey);
   }
   const strategyPolicy = await getStreamStrategyPolicy();
@@ -922,11 +925,29 @@ async function playbackDecision(req, source) {
   const direct = forceFull
     ? { compatible: false, reason: 'full transcode forced by server policy' }
     : confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
+  const timingClient = [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client);
+  // Timing must be validated before returning DIRECT. Unknown probes follow
+  // the existing Browser/Android HLS attempt behavior instead of bypassing
+  // timing analysis with the original provider URL.
+  if (timingClient && direct.compatible && metadata.timing?.checked !== true) {
+    direct.compatible = false;
+    direct.reason = 'Decoded frame timing was not validated; attempting HLS';
+  }
+  if (timingClient && metadata.timing?.checked === true && metadata.timing?.timingMalformed === true) {
+    direct.compatible = false;
+    direct.reason = 'Decoded frame timestamps regress; timing repair is required';
+  }
   if (!enabled.DIRECT) direct.compatible = false;
   const selectedHlsDecision = determineHlsStrategy(metadata, target.capabilities);
   let hlsDecision = forceFull ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
   if (!forceFull) hlsDecision = timingRepairDecision(metadata, target.capabilities, hlsDecision) || hlsDecision;
   const timingRepair = hlsDecision.strategy === HlsStrategy.TIMING_REPAIR;
+  if (timingClient && metadata.timing?.checked === true && metadata.timing?.timingMalformed === true && !timingRepair) {
+    const error = new Error('Fatal transport decision: malformed decoded timing did not produce an HLS timing-repair strategy');
+    error.statusCode = 415;
+    console.error(`[transport-final] client=${target.client} item=${kind}:${id} timingProbeCompleted=true decodedPtsMonotonic=false timingRegressionCount=${metadata.timing.regressionCount || 0} finalTransport=ERROR reason=timing_repair_unavailable`);
+    throw error;
+  }
   if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
     const fps = normalizeFrameRate(metadata.frameRate) || 'unknown';
     console.info(`[vod-timing-probe] client=${target.client} fps=${fps} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0} largestRegressionMs=${Math.round((metadata.timing?.largestRegressionSeconds || 0) * 1000)} decision=${timingRepair ? HlsStrategy.TIMING_REPAIR : direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision.strategy}`);
@@ -950,11 +971,19 @@ async function playbackDecision(req, source) {
   if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:') {
     browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl, metadata);
   }
-  const browserDirectAttempt = target.client === PlaybackClient.BROWSER && enabled.DIRECT;
-  const transportLog = browserDirectAttempt
-    ? sourceProtocol === 'http:' ? 'DIRECT_PROXY' : 'DIRECT_PROVIDER'
-    : direct.compatible ? 'DIRECT_PROVIDER' : hlsDecision.strategy;
-  console.info(`[BrowserTransport] client=${target.client} item=${kind}:${id} protocol=${sourceProtocol.slice(0, -1)} container=${metadata.container || 'unknown'} video=${metadata.videoCodec || 'unknown'} audio=${metadata.audioCodec || 'unknown'} directCompatible=${direct.compatible} transport=${transportLog}${browserDirectProxyUrl ? ' deliveryReason=mixed_content_bridge' : ''}`);
+  const nativeCandidate = confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
+  const finalTransport = timingRepair ? HlsStrategy.TIMING_REPAIR
+    : direct.compatible ? sourceProtocol === 'http:' && target.client === PlaybackClient.BROWSER ? 'DIRECT_PROXY' : PlaybackStrategy.DIRECT
+      : hlsDecision.strategy;
+  if (metadata.timing?.checked === true && metadata.timing.timingMalformed === true && String(finalTransport).startsWith('DIRECT')) {
+    throw new Error('Fatal transport decision: malformed decoded timing cannot use DIRECT');
+  }
+  const playbackRoute = timingRepair
+    ? `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8?client=${target.client}&timingRepair=1`
+    : finalTransport === 'DIRECT_PROXY' ? browserDirectProxyUrl
+      : finalTransport === PlaybackStrategy.DIRECT ? '/api/xtream/play/:sourceId/:kind/:id'
+        : `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8`;
+  console.info(`[transport-final] client=${target.client} codec=${metadata.videoCodec || 'unknown'} container=${metadata.container || 'unknown'} nativeCompatible=${nativeCandidate.compatible} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision.strategy} timingProbeCompleted=${metadata.timing?.checked === true} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} timingRegressionCount=${metadata.timing?.regressionCount || 0} finalTransport=${finalTransport} playbackRoute=${playbackRoute}`);
   return {
     ok: true,
     containerCompatible: container.compatible,
@@ -3189,9 +3218,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     error.providerUnavailable = true;
     throw error;
   }
-  const timingKnownBeforeHls = decodedTimingCache.get(`${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`)?.expiresAt > Date.now();
+  const timingKnownBeforeHls = decodedTimingCache.get(`${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`)?.expiresAt > Date.now();
   if (seekableVod && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
+    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
     metadata.timing = await inspectProviderDecodedTiming(providerCacheKey, inputUrl, metadata, null, timingKey, identity.timingProbeSignal);
     if (identity.timingProbeSignal?.aborted) throw identity.timingProbeSignal.reason || new Error('Manifest request cancelled');
   }
@@ -3200,7 +3229,19 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const selectedDecision = seekableVod
     ? determineHlsStrategy(metadata, capabilities)
     : forceHlsFallback('full', determineHlsStrategy({ videoCodec: 'h264', audioCodec: 'aac' }, getPlaybackCapabilities(PlaybackClient.ROKU)));
-  const timingAwareDecision = seekableVod ? timingRepairDecision(metadata, capabilities, selectedDecision) || selectedDecision : selectedDecision;
+  const requestedTimingRepair = identity.timingRepairRequested
+    && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client);
+  const requestedRepairDecision = requestedTimingRepair
+    ? timingRepairDecision({ ...metadata, timing: { ...metadata.timing, checked: true, timingMalformed: true } }, capabilities, selectedDecision)
+    : null;
+  const timingAwareDecision = seekableVod
+    ? requestedRepairDecision || timingRepairDecision(metadata, capabilities, selectedDecision) || selectedDecision
+    : selectedDecision;
+  if (requestedTimingRepair && timingAwareDecision.strategy !== HlsStrategy.TIMING_REPAIR) {
+    const error = new Error('Timing repair was requested but this stream cannot be repaired with the detected media parameters.');
+    error.statusCode = 415;
+    throw error;
+  }
   if (seekableVod && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client) && !timingKnownBeforeHls) {
     console.info(`[vod-timing-probe] client=${target.client} fps=${normalizeFrameRate(metadata.frameRate) || 'unknown'} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0} largestRegressionMs=${Math.round((metadata.timing?.largestRegressionSeconds || 0) * 1000)} decision=${timingAwareDecision.strategy}`);
   }
@@ -3481,7 +3522,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         await mediaJobs.remove(job.key, 'provider-refused');
         break;
       }
-      if (target.client === PlaybackClient.BROWSER) break;
+      if (target.client === PlaybackClient.BROWSER || job.hlsStrategy === HlsStrategy.TIMING_REPAIR) break;
       const fallback = fallbackHlsStrategy(job.hlsDecision);
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
