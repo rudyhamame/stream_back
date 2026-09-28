@@ -53,9 +53,9 @@ test('blocks mutations even when the path resembles streaming', () => {
   assert.equal(isStreamingRoute('DELETE', '/api/health'), false);
 });
 
-test('allows only the Android handoff POST under /internal/streams', () => {
+test('rejects obsolete provider-wide Android handoff routes', () => {
   assert.equal(isStreamingRoute('POST', '/internal/streams/stop'), false);
-  assert.equal(isStreamingRoute('POST', '/internal/streams/android-handoff'), true);
+  assert.equal(isStreamingRoute('POST', '/internal/streams/android-handoff'), false);
   assert.equal(isStreamingRoute('GET', '/internal/streams/stop'), false);
   assert.equal(isStreamingRoute('GET', '/internal/streams/android-handoff'), false);
   assert.equal(isStreamingRoute('POST', '/internal/streams/stop/extra'), false);

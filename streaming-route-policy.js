@@ -53,12 +53,7 @@ const WRITE_STREAMING_PATTERNS = [
   /^\/internal\/stream-strategies$/,
   /^\/api\/xtream\/wwp-call\/[^/]+\/signal$/,
   /^\/api\/xtream\/wwp-end\/[^/]+$/,
-  // Account handoff coordinator: loopback-only and limited by the route to
-  // Android jobs for one provider source.
-  /^\/internal\/streams\/android-handoff$/,
-  // "Play on Roku" hand-off: the phone tells the streamer to drop its own
-  // ffmpeg job + provider lease immediately so the Roku can take the slot.
-  // Scoped to the caller's own playback viewer identity inside the route.
+  // A player can release only its own participation in a shared job.
   /^\/api\/xtream\/playback\/release$/,
 ];
 

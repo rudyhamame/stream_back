@@ -26,7 +26,6 @@ import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.
 import { getFavorites, toggleFavorite } from './favorites-store.js';
 import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getActiveRokuPlaybackHeartbeats, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
-import { releaseOrphanedProviderStreamLeases, providerLeaseKey } from './provider-stream-leases.js';
 import { applyWwpControl, appendWwpCallSignal, endWwpSession, getWwpSession, noteWwpPresence, reconcileWwpSession, setWwpCallRing, waitForWwpCallSignals, waitForWwpSession, wwpSyncToken } from './wwp-sessions.js';
 import { wwpCallPageHtml } from './wwp-call-page.js';
 import { accountOwnerId } from './account-library-owner.js';
@@ -94,8 +93,8 @@ const playbackTraceId = req => String(req.query.traceId || '').replace(/[^a-zA-Z
 const playbackSourceHash = url => createHash('sha256').update(String(url)).digest('hex').slice(0, 16);
 // VOD runtime (seconds) learned while a title is streaming - from the codec
 // probe or a one-shot ffprobe on the same provider connection the job holds.
-// library_backend reads this via /internal/media-duration when its own probe
-// cannot get the single provider slot (the playback is holding it).
+// library_backend reads this via /internal/media-duration when an additional
+// metadata probe would be unnecessary during playback.
 const vodDurations = new Map();
 function rememberVodDuration(sourceId, kind, id, seconds) {
   const value = Math.max(0, Math.round(Number(seconds) || 0));
@@ -1574,32 +1573,6 @@ app.get('/internal/active-streams', async (req, res) => {
   res.json({ port, count: streams.length, streams });
 });
 
-// A phone-to-Roku handoff must clear every Android job for this provider on
-// the Android streamer, not only the item currently visible in PlayerActivity.
-// An abandoned prior episode can otherwise retain the provider's only lease:
-// Roku Direct then stalls and its HLS recovery is rejected forever at 13%.
-app.post('/internal/streams/android-handoff', async (req, res) => {
-  if (!loopbackRequest(req)) return res.sendStatus(404);
-  const sourceId = String(req.body?.sourceId || '').trim();
-  if (!sourceId) return res.status(400).json({ error: 'sourceId required' });
-  let stopped = 0;
-  const capacityKeys = new Set();
-  for (const [key, job] of [...mediaJobs.entries()]) {
-    if (job.wwpSessionId || String(job.sourceId || '') !== sourceId
-        || String(job.client || '').toLowerCase() !== 'android') continue;
-    if (job.capacityKey) capacityKeys.add(String(job.capacityKey));
-    if (await mediaJobs.remove(key, 'android-roku-provider-handoff')) stopped += 1;
-  }
-  // remove() normally releases the lease. Also clear any orphan belonging to
-  // this process after the FFmpeg jobs have exited; never touch another
-  // streamer's holder.
-  for (const capacityKey of capacityKeys) {
-    await releaseOrphanedProviderStreamLeases(capacityKey).catch(() => {});
-  }
-  res.set('Cache-Control', 'no-store');
-  res.json({ port: Number(process.env.PORT) || null, stopped });
-});
-
 // Watch with Partner: whichever side has an open device session (host) or a
 // valid stream ticket for this exact title (partner) can long-poll here to
 // learn when the OTHER side seeks/changes quality, and follow. The ticket
@@ -2447,10 +2420,7 @@ app.post('/api/xtream/sources/:id/archive/:key/restore', async (req, res) => {
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
-// A Roku ECP launch is a true handoff: stop only the Android player's exact
-// backend job and wait for its provider lease to close before Roku asks for
-// the same item. Roku device playback has a different viewer identity, so
-// later Android navigation cannot stop a stream already owned by Roku.
+// Release only the requesting player's own participation in a media job.
 app.post('/api/xtream/playback/release', async (req, res) => {
   try {
     const proxyToken = String(req.body?.directProxyToken || req.query.directProxyToken || '').trim();
@@ -2474,10 +2444,11 @@ app.post('/api/xtream/playback/release', async (req, res) => {
     for (const [key, job] of [...mediaJobs.entries()]) {
       if (job.wwpSessionId || String(job.sourceId) !== sourceId || job.kind !== kind
           || String(job.mediaId) !== id || !samePlaybackViewer(job, identity)) continue;
-      if (await mediaJobs.remove(key, 'android-roku-handoff')) stopped += 1;
+      if (await mediaJobs.releaseViewer(key, identity.viewerId, 'viewer-released')) stopped += 1;
     }
     const nativeKey = rokuHlsKey(sourceId, 'channel', id, extension, 0);
-    if (nativeHlsSessions.get(nativeKey)?.viewerId === identity.viewerId) nativeHlsSessions.delete(nativeKey);
+    const nativeSession = nativeHlsSessions.get(nativeKey);
+    if (nativeSession?.viewers?.delete(identity.viewerId) && nativeSession.viewers.size === 0) nativeHlsSessions.delete(nativeKey);
     res.set('Cache-Control', 'no-store');
     res.json({ stopped });
   } catch (error) { res.status(500).json({ error: error.message }); }
@@ -2589,6 +2560,7 @@ function nativeHlsSession(req, identity, create = false) {
       key,
       userId: identity.userId,
       viewerId: identity.viewerId,
+      viewers: new Set([identity.viewerId]),
       resources: new Map(),
       manifests: new Map(),
       resourceBodies: new Map(),
@@ -2603,6 +2575,7 @@ function nativeHlsSession(req, identity, create = false) {
     evictNativeHlsSessions();
   }
   if (session) {
+    if (identity.viewerId) session.viewers?.add(identity.viewerId);
     session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
     nativeHlsSessions.delete(key);
     nativeHlsSessions.set(key, session);
@@ -3191,18 +3164,16 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     }
   }
 
-  // One player/viewer owns one active playback job. Android account tokens do
-  // not always carry a linked Roku device ID, so viewer identity must also
-  // replace the prior episode immediately instead of waiting for idle cleanup.
+  // A player switching titles leaves its prior job. Other viewers sharing
+  // that job keep their playback and FFmpeg generation alive.
   for (const [otherKey, otherJob] of mediaJobs.entries()) {
     if (isPlaybackSupersededForViewer(otherJob, identity, key)) {
-      await mediaJobs.remove(otherKey, 'replaced-viewer-playback');
+      await mediaJobs.releaseViewer(otherKey, identity.viewerId, 'replaced-viewer-playback');
     }
   }
 
-  // Xtream accounts commonly allow only one live connection. Stop the prior
-  // channel immediately when another channel is opened; otherwise the
-  // provider responds with a tiny valid-but-completely-black placeholder.
+  // Retire the requesting viewer's old preview or channel when it changes
+  // channels, leaving any other viewer's stream intact.
   if (kind === 'channel') {
     // The focused-card snapshot opens the same provider channel. Roku can
     // select the card while that request is still decoding; wait for its
@@ -3214,20 +3185,18 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     if (previews.length) await Promise.allSettled(previews);
     for (const [otherKey, otherJob] of mediaJobs.entries()) {
       if (otherKey === key || !otherJob.persistent || otherJob.kind !== 'channel' || otherJob.sourceId !== String(source._id) || !samePlaybackViewer(otherJob, identity)) continue;
-      await mediaJobs.remove(otherKey, 'replaced-channel');
+      await mediaJobs.releaseViewer(otherKey, identity.viewerId, 'replaced-channel');
     }
   }
 
-  // A VOD seek replaces the prior stream for that item. Keeping both jobs
-  // alive wastes Render CPU/disk and can exceed a provider's connection cap.
+  // A VOD seek moves this viewer to a new generation. Other viewers may keep
+  // watching the old generation at their own position.
   if (seekableVod) {
     for (const [otherKey, otherJob] of mediaJobs.entries()) {
       if (otherKey === key || !otherJob.persistent || otherJob.kind !== kind || otherJob.sourceId !== String(source._id) || otherJob.mediaId !== String(id) || !samePlaybackViewer(otherJob, identity)) continue;
-      await mediaJobs.remove(otherKey, 'replaced-seek');
+      await mediaJobs.releaseViewer(otherKey, identity.viewerId, 'replaced-seek');
     }
   }
-
-  const capacityKey = providerLeaseKey(source);
 
   // Use the exact URL carried by the selected catalog item for every client.
   // Identity-based resolution remains only as a compatibility fallback for
@@ -3345,7 +3314,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const hardwareTranscode = false;
   const { job } = await mediaJobs.getOrCreate({
     key, mode, allowCpuPressure: true, hlsStrategy: decision.strategy, hlsVideoMode: decision.videoMode, hlsAudioMode: decision.audioMode, hlsDecision: decision,
-    persistent: true, sourceId: String(source._id), capacityKey, mediaId: String(id), kind,
+    persistent: true, sourceId: String(source._id), mediaId: String(id), kind,
     startSeconds, durationSeconds: Number(metadata.containerSeconds) || 0, userId: identity.userId, deviceId: identity.deviceId, viewerId: identity.viewerId,
     clientIp: identity.clientIp, client: identity.client,
     wwpSessionId: String(identity.wwpSessionId || ''), wwpQuality: String(identity.wwpQuality || ''),
@@ -3519,7 +3488,10 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       ));
       const sharedLiveTranscode = Boolean(sharedLiveJob);
       const existingNativeSession = nativeHlsSession(req, identity);
-      if ((nativeHlsDisabled || target.maxHeight || sharedLiveTranscode) && existingNativeSession) nativeHlsSessions.delete(existingNativeSession.key);
+      if ((nativeHlsDisabled || target.maxHeight || sharedLiveTranscode) && existingNativeSession) {
+        existingNativeSession.viewers?.delete(identity.viewerId);
+        if (!existingNativeSession.viewers?.size) nativeHlsSessions.delete(existingNativeSession.key);
+      }
       // Android can reach RH over HTTPS but some provider playlists point at
       // segment hosts/ports that the phone's network blocks. Proxy the original
       // HLS playlist and rewrite every child URI through RH. This is still

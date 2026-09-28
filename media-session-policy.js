@@ -54,9 +54,12 @@ export function scopedPlaybackViewerId(baseViewerId, client, playbackClientId) {
 
 export function samePlaybackViewer(job, identity) {
   if (!job || !identity) return false;
-  if (identity.deviceId) return job.deviceId === identity.deviceId;
   if (!identity.viewerId) return false;
-  return job.viewerId === identity.viewerId || job.viewers?.has(identity.viewerId) === true;
+  // The live viewer map is authoritative for a shared HLS job. Its original
+  // creator may have left while other tabs or devices still use the job.
+  if (job.viewers instanceof Map) return job.viewers.has(identity.viewerId);
+  if (identity.deviceId) return job.deviceId === identity.deviceId;
+  return job.viewerId === identity.viewerId;
 }
 
 export function isPlaybackSupersededForViewer(job, identity, nextKey = '') {

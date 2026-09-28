@@ -30,12 +30,10 @@ export function defaultMediaLimits(env = process.env) {
   const lowMemory = constrained > 0 && constrained <= 600 * 1024 * 1024;
   const totalDefault = lowMemory || cpuCount <= 1 ? 2 : Math.min(4, cpuCount);
   return {
-    maxTranscodes: positiveInt(env.MAX_ACTIVE_TRANSCODES, 1),
+    maxTranscodes: positiveInt(env.MAX_ACTIVE_TRANSCODES, 2),
     maxSnapshots: positiveInt(env.MAX_ACTIVE_SNAPSHOTS, 1),
     maxRemuxJobs: positiveInt(env.MAX_ACTIVE_REMUX_JOBS, totalDefault),
     maxTotalJobs: positiveInt(env.MAX_TOTAL_FFMPEG_JOBS, totalDefault),
-    maxJobsPerUser: positiveInt(env.MAX_JOBS_PER_USER, totalDefault),
-    maxJobsPerDevice: positiveInt(env.MAX_JOBS_PER_DEVICE, 1),
     maxStartupQueue: positiveInt(env.MAX_STARTUP_QUEUE, totalDefault),
     maxViewersPerJob: positiveInt(env.MAX_VIEWERS_PER_MEDIA_JOB, 64),
     idleTimeoutMs: positiveInt(env.MEDIA_JOB_IDLE_TIMEOUT_MS, 45_000),
@@ -102,14 +100,6 @@ export class MediaJobManager {
     if (mode === 'snapshot' && counts.snapshot + starting.filter(spec => spec.mode === 'snapshot').length >= this.limits.maxSnapshots) throw new MediaCapacityError('Snapshot capacity is currently full');
     if (mode === 'remux' && counts.remux + starting.filter(spec => spec.mode === 'remux').length >= this.limits.maxRemuxJobs) throw new MediaCapacityError('Remux capacity is currently full');
     if (this.starting.size >= this.limits.maxStartupQueue) throw new MediaCapacityError('Media startup queue is full');
-    if (userId) {
-      const count = [...this.jobs.values()].filter(job => job.userId === userId).length + starting.filter(spec => spec.userId === userId).length;
-      if (count >= this.limits.maxJobsPerUser) throw new MediaCapacityError('User media-job limit reached');
-    }
-    if (deviceId) {
-      const count = [...this.jobs.values()].filter(job => job.deviceId === deviceId).length + starting.filter(spec => spec.deviceId === deviceId).length;
-      if (count >= this.limits.maxJobsPerDevice) throw new MediaCapacityError('Device media-job limit reached');
-    }
   }
 
   async getOrCreate(spec, create) {
@@ -148,6 +138,14 @@ export class MediaJobManager {
     if (viewerId) job.viewers.set(viewerId, now);
     while (job.viewers.size > this.limits.maxViewersPerJob) job.viewers.delete(job.viewers.keys().next().value);
     return job;
+  }
+
+  async releaseViewer(key, viewerId, reason = 'viewer-left') {
+    const job = this.jobs.get(key);
+    if (!job || !viewerId || !job.viewers?.has(viewerId)) return false;
+    job.viewers.delete(viewerId);
+    if (job.viewers.size === 0) await this.remove(key, reason);
+    return true;
   }
 
   async remove(key, reason = 'complete') {

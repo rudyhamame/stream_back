@@ -29,7 +29,8 @@ The default API address is `http://0.0.0.0:8787`. Check `GET /api/health`.
 ## Media resource controls
 
 FFmpeg jobs are bounded by `MAX_TOTAL_FFMPEG_JOBS`, `MAX_ACTIVE_REMUX_JOBS`,
-`MAX_ACTIVE_TRANSCODES`, `MAX_JOBS_PER_USER`, and `MAX_JOBS_PER_DEVICE`.
+and `MAX_ACTIVE_TRANSCODES`. Separate viewers do not consume a single
+account or device playback slot.
 `MEDIA_JOB_IDLE_TIMEOUT_MS` controls abandoned HLS cleanup. Direct proxy
 streams do not consume FFmpeg capacity and preserve byte-range requests.
 
