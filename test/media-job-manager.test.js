@@ -7,8 +7,6 @@ const limits = {
   maxSnapshots: 1,
   maxRemuxJobs: 2,
   maxTotalJobs: 2,
-  maxJobsPerUser: 2,
-  maxJobsPerDevice: 1,
   maxStartupQueue: 2,
   maxViewersPerJob: 64,
   idleTimeoutMs: 100,
@@ -36,21 +34,19 @@ test('coalesces concurrent startup for an identical HLS job', async () => {
   await manager.shutdown();
 });
 
-test('enforces per-device and transcode limits with controlled errors', async () => {
+test('enforces transcode capacity without a device playback slot', async () => {
   const manager = new MediaJobManager({ limits, pressure: noPressure });
   await manager.getOrCreate({ key: 'one', mode: 'transcode', deviceId: 'roku-1' }, async () => ({ stop() {} }));
   await assert.rejects(
     manager.getOrCreate({ key: 'two', mode: 'transcode', deviceId: 'roku-2' }, async () => ({ stop() {} })),
     MediaCapacityError,
   );
-  await assert.rejects(
-    manager.getOrCreate({ key: 'three', mode: 'remux', deviceId: 'roku-1' }, async () => ({ stop() {} })),
-    MediaCapacityError,
-  );
+  const second = await manager.getOrCreate({ key: 'three', mode: 'remux', deviceId: 'roku-1' }, async () => ({ stop() {} }));
+  assert.equal(second.job.mode, 'remux');
   await manager.shutdown();
 });
 
-test('counts starting jobs against per-device limits', async () => {
+test('allows two starting jobs from the same device within server capacity', async () => {
   const manager = new MediaJobManager({ limits, pressure: noPressure });
   let release;
   const gate = new Promise(resolve => { release = resolve; });
@@ -58,10 +54,8 @@ test('counts starting jobs against per-device limits', async () => {
     await gate;
     return { stop() {} };
   });
-  await assert.rejects(
-    manager.getOrCreate({ key: 'other', mode: 'remux', deviceId: 'roku-1' }, async () => ({ stop() {} })),
-    /device media-job limit/i,
-  );
+  const other = await manager.getOrCreate({ key: 'other', mode: 'remux', deviceId: 'roku-1' }, async () => ({ stop() {} }));
+  assert.equal(other.job.mode, 'remux');
   release();
   await first;
   await manager.shutdown();

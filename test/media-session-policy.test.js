@@ -55,7 +55,7 @@ test('Android playback identity is isolated from the account and Roku viewers', 
 });
 
 test('replacement is scoped to the requesting device or anonymous viewer', () => {
-  const job = { deviceId: 'roku-1', viewerId: 'owner-1', viewers: new Map([['browser-1', 1]]) };
+  const job = { deviceId: 'roku-1', viewerId: 'owner-1', viewers: new Map([['owner-1', 1], ['browser-1', 1]]) };
   assert.equal(samePlaybackViewer(job, { deviceId: 'roku-1', viewerId: 'owner-1' }), true);
   assert.equal(samePlaybackViewer(job, { deviceId: 'roku-2', viewerId: 'owner-1' }), false);
   assert.equal(samePlaybackViewer(job, { deviceId: '', viewerId: 'browser-1' }), true);
@@ -73,7 +73,7 @@ test('browser tabs on one account cannot supersede each other', () => {
 });
 
 test('a new Android episode replaces the prior job for the same account viewer', () => {
-  const priorEpisode = { key: 'episode-1', persistent: true, deviceId: '', viewerId: 'account-1', viewers: new Map() };
+  const priorEpisode = { key: 'episode-1', persistent: true, deviceId: '', viewerId: 'account-1', viewers: new Map([['account-1', 1]]) };
   assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-1' }, 'episode-2'), true);
   assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-2' }, 'episode-2'), false);
   assert.equal(isPlaybackSupersededForViewer(priorEpisode, { deviceId: '', viewerId: 'account-1' }, 'episode-1'), false);
