@@ -925,8 +925,10 @@ app.get('/api/roku/internet-health', async (req, res) => {
 // other clients resolve it from the authenticated source identity here.
 async function playbackDecision(req, source) {
   const { kind, id } = req.params;
+  const traceId = playbackTraceId(req);
   const inputUrl = await requestProviderUrl(req, source, kind, id, req.query.ext);
-  const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${createHash('sha256').update(inputUrl).digest('hex').slice(0, 16)}`;
+  const sourceHash = playbackSourceHash(inputUrl);
+  const cacheKey = `${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${sourceHash}`;
   const metadata = await providerCodecMetadata(cacheKey, inputUrl);
   if (metadata.providerUnavailable) {
     const error = new Error(metadata.providerError || 'Playlist provider unavailable');
@@ -934,9 +936,12 @@ async function playbackDecision(req, source) {
     throw error;
   }
   const target = playbackTarget(req);
+  const nativeCandidate = confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
+  console.info(`[RH-TRACE-2] traceId=${traceId} itemId=${kind}:${id} client=${target.client} probeCandidate=${nativeCandidate.compatible ? 'DIRECT' : 'HLS'} sourceHash=${sourceHash} container=${metadata.container || 'unknown'} codec=${metadata.videoCodec || 'unknown'}`);
   if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}`;
-    metadata.timing = await inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, timingKey);
+    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${sourceHash}`;
+    metadata.timing = await inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, timingKey, null, traceId);
+    console.info(`[RH-TRACE-4] traceId=${traceId} sourceHash=${sourceHash} timingProbeCompleted=${metadata.timing?.checked === true} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0}`);
   }
   const strategyPolicy = await getStreamStrategyPolicy();
   const enabled = strategyPolicy.devices[target.client];
@@ -948,7 +953,7 @@ async function playbackDecision(req, source) {
   // Timing must be validated before returning DIRECT. Unknown probes follow
   // the existing Browser/Android HLS attempt behavior instead of bypassing
   // timing analysis with the original provider URL.
-  if (timingClient && direct.compatible && metadata.timing?.checked !== true) {
+  if (timingClient && direct.compatible && !(metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === true)) {
     direct.compatible = false;
     direct.reason = 'Decoded frame timing was not validated; attempting HLS';
   }
@@ -987,24 +992,34 @@ async function playbackDecision(req, source) {
   const playable = !codecs.known || codecs.compatible;
   let browserDirectProxyUrl = '';
   const sourceProtocol = new URL(inputUrl).protocol;
-  if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:') {
+  if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible && !timingRepair) {
     browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl, metadata);
   }
-  const nativeCandidate = confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
   const finalTransport = timingRepair ? HlsStrategy.TIMING_REPAIR
     : direct.compatible ? sourceProtocol === 'http:' && target.client === PlaybackClient.BROWSER ? 'DIRECT_PROXY' : PlaybackStrategy.DIRECT
       : hlsDecision.strategy;
   if (metadata.timing?.checked === true && metadata.timing.timingMalformed === true && String(finalTransport).startsWith('DIRECT')) {
     throw new Error('Fatal transport decision: malformed decoded timing cannot use DIRECT');
   }
-  const playbackRoute = timingRepair
-    ? `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8?client=${target.client}&timingRepair=1`
-    : finalTransport === 'DIRECT_PROXY' ? browserDirectProxyUrl
-      : finalTransport === PlaybackStrategy.DIRECT ? '/api/xtream/play/:sourceId/:kind/:id'
-        : `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8`;
+  const hlsRoute = `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8`;
+  const hlsQuery = new URLSearchParams({ client: target.client, sourceHash, traceId });
+  if (req.query.ext) hlsQuery.set('ext', String(req.query.ext));
+  if (timingRepair) hlsQuery.set('timingRepair', '1');
+  const playbackUrl = timingRepair || !direct.compatible
+    ? `${hlsRoute}?${hlsQuery}`
+    : finalTransport === 'DIRECT_PROXY' ? browserDirectProxyUrl : inputUrl;
+  const playbackRoute = finalTransport === 'DIRECT_PROXY'
+    ? '/api/xtream/direct-session/[redacted]'
+    : finalTransport === PlaybackStrategy.DIRECT ? '[provider-direct]'
+      : playbackUrl;
+  console.info(`[RH-TRACE-5] traceId=${traceId} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision.strategy} finalTransport=${finalTransport} timingProbeCompleted=${metadata.timing?.checked === true} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'}`);
+  console.info(`[RH-TRACE-6] traceId=${traceId} serverPlaybackUrl=${playbackRoute} sourceHash=${sourceHash}`);
   console.info(`[transport-final] client=${target.client} codec=${metadata.videoCodec || 'unknown'} container=${metadata.container || 'unknown'} nativeCompatible=${nativeCandidate.compatible} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision.strategy} timingProbeCompleted=${metadata.timing?.checked === true} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} timingRegressionCount=${metadata.timing?.regressionCount || 0} finalTransport=${finalTransport} playbackRoute=${playbackRoute}`);
   return {
     ok: true,
+    traceId,
+    sourceHash,
+    playbackUrl,
     containerCompatible: container.compatible,
     codecsCompatible: codecs.known ? codecs.compatible : true,
     videoCodecKnown,
@@ -3237,10 +3252,11 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     error.providerUnavailable = true;
     throw error;
   }
-  const timingKnownBeforeHls = decodedTimingCache.get(`${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`)?.expiresAt > Date.now();
+  const sourceHash = playbackSourceHash(inputUrl);
+  const timingKnownBeforeHls = decodedTimingCache.get(`${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${sourceHash}`)?.expiresAt > Date.now();
   if (seekableVod && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}`;
-    metadata.timing = await inspectProviderDecodedTiming(providerCacheKey, inputUrl, metadata, null, timingKey, identity.timingProbeSignal);
+    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${sourceHash}`;
+    metadata.timing = await inspectProviderDecodedTiming(providerCacheKey, inputUrl, metadata, null, timingKey, identity.timingProbeSignal, identity.traceId);
     if (identity.timingProbeSignal?.aborted) throw identity.timingProbeSignal.reason || new Error('Manifest request cancelled');
   }
   if (seekableVod && Number(metadata.containerSeconds) > 0) rememberVodDuration(String(source._id), kind, String(id), metadata.containerSeconds);
@@ -3453,6 +3469,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     if (suppliedProviderURL || [PlaybackClient.ANDROID, PlaybackClient.BROWSER].includes(target.client)) {
       playbackProviderURL = await requestProviderUrl(req, source, req.params.kind, req.params.id, req.query.ext);
     }
+    const expectedSourceHash = String(req.query.sourceHash || '').toLowerCase();
+    if (expectedSourceHash && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
+      const actualSourceHash = playbackSourceHash(playbackProviderURL);
+      if (actualSourceHash !== expectedSourceHash) {
+        console.error(`[RH-TRACE-6] traceId=${playbackTraceId(req)} sourceHashMismatch expected=${expectedSourceHash} actual=${actualSourceHash}`);
+        return res.status(409).json({ error: 'The provider media URL changed after timing validation. Retry playback to probe the current source.' });
+      }
+    }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
@@ -3460,6 +3484,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const identity = mediaIdentity(req);
     identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
     identity.timingProbeSignal = requestAbort.signal;
+    identity.traceId = playbackTraceId(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${fastPreview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
     if (req.params.kind === 'channel') {
       // If another device already caused a shared live transcode to start,
