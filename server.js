@@ -89,7 +89,9 @@ const timingProbesInFlight = new Map();
 const decodedTimingCache = new Map();
 // Version timing cache keys so a prior decision without decoded-frame
 // validation cannot be reused as proof that DIRECT is safe.
-const decodedTimingSchema = 'decoded-pts-v2';
+const decodedTimingSchema = 'decoded-pts-v3-source-bound';
+const playbackTraceId = req => String(req.query.traceId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 36) || randomUUID().slice(0, 12);
+const playbackSourceHash = url => createHash('sha256').update(String(url)).digest('hex').slice(0, 16);
 // VOD runtime (seconds) learned while a title is streaming - from the codec
 // probe or a one-shot ffprobe on the same provider connection the job holds.
 // library_backend reads this via /internal/media-duration when its own probe
@@ -387,15 +389,27 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
   });
 }
 
-async function inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, stableKey = cacheKey, signal = null) {
+async function inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, stableKey = cacheKey, signal = null, traceId = '') {
+  const sourceHash = playbackSourceHash(inputUrl);
   const stableCached = decodedTimingCache.get(stableKey);
-  if (stableCached?.expiresAt > Date.now()) return stableCached.timing;
+  if (stableCached?.expiresAt > Date.now() && stableCached.timing?.checked === true && typeof stableCached.timing.decodedPtsMonotonic === 'boolean') {
+    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=decoded-timing sourceHash=${sourceHash}`);
+    return stableCached.timing;
+  }
   const cached = codecProbeCache.get(cacheKey);
-  if (cached?.expiresAt > Date.now() && cached.metadata?.timing?.checked) return cached.metadata.timing;
-  if (timingProbesInFlight.has(stableKey)) return timingProbesInFlight.get(stableKey);
+  if (cached?.expiresAt > Date.now() && cached.metadata?.timing?.checked && typeof cached.metadata.timing.decodedPtsMonotonic === 'boolean') {
+    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=codec-probe sourceHash=${sourceHash}`);
+    return cached.metadata.timing;
+  }
+  if (timingProbesInFlight.has(stableKey)) {
+    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=in-flight sourceHash=${sourceHash}`);
+    return timingProbesInFlight.get(stableKey);
+  }
   if (timingProbesInFlight.size >= maxCodecProbes) {
+    if (traceId) console.warn(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false reason=capacity sourceHash=${sourceHash}`);
     return { checked: false, decodedPtsMonotonic: null, timingMalformed: false, framesChecked: 0, regressionCount: 0, largestRegressionSeconds: 0 };
   }
+  if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=true cache=miss sourceHash=${sourceHash}`);
   const pending = new Promise(resolve => {
     const child = spawn(ffprobeBin, [
       '-v', 'error', '-rw_timeout', '12000000', '-read_intervals', '%+3',
@@ -420,7 +434,7 @@ async function inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, s
         current.metadata = { ...current.metadata, timing };
         codecProbeCache.set(cacheKey, current);
       }
-      if (cacheResult) {
+      if (cacheResult && timing.checked === true && typeof timing.decodedPtsMonotonic === 'boolean') {
         decodedTimingCache.set(stableKey, { timing, expiresAt: Date.now() + codecProbeTtlMs });
         while (decodedTimingCache.size > codecProbeMaxEntries) decodedTimingCache.delete(decodedTimingCache.keys().next().value);
       }
@@ -441,7 +455,12 @@ async function inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, s
       if (settled) return;
       try {
         if (code !== 0) return finish(unknown, false);
-        const timing = inspectDecodedPts(JSON.parse(output).frames || []);
+        const frames = JSON.parse(output).frames || [];
+        const timing = inspectDecodedPts(frames);
+        if (traceId) {
+          const pts = frames.map(frame => Number(frame?.pts_time ?? frame?.best_effort_timestamp_time)).filter(Number.isFinite);
+          console.info(`[RH-TRACE-4-PTS] traceId=${traceId} sourceHash=${sourceHash} decodedPtsSample=${JSON.stringify(pts.slice(0, 100))}`);
+        }
         finish(timing);
       } catch { finish(unknown, false); }
     });
