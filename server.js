@@ -941,6 +941,9 @@ async function playbackDecision(req, source) {
   if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
     const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${sourceHash}`;
     metadata.timing = await inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, timingKey, null, traceId);
+    if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false) {
+      metadata.timing = { ...metadata.timing, timingMalformed: true };
+    }
     console.info(`[RH-TRACE-4] traceId=${traceId} sourceHash=${sourceHash} timingProbeCompleted=${metadata.timing?.checked === true} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0}`);
   }
   const strategyPolicy = await getStreamStrategyPolicy();
@@ -957,7 +960,7 @@ async function playbackDecision(req, source) {
     direct.compatible = false;
     direct.reason = 'Decoded frame timing was not validated; attempting HLS';
   }
-  if (timingClient && metadata.timing?.checked === true && metadata.timing?.timingMalformed === true) {
+  if (timingClient && metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === false) {
     direct.compatible = false;
     direct.reason = 'Decoded frame timestamps regress; timing repair is required';
   }
@@ -966,7 +969,7 @@ async function playbackDecision(req, source) {
   let hlsDecision = forceFull ? forceHlsFallback('full', selectedHlsDecision) : selectedHlsDecision;
   if (!forceFull) hlsDecision = timingRepairDecision(metadata, target.capabilities, hlsDecision) || hlsDecision;
   const timingRepair = hlsDecision.strategy === HlsStrategy.TIMING_REPAIR;
-  if (timingClient && metadata.timing?.checked === true && metadata.timing?.timingMalformed === true && !timingRepair) {
+  if (timingClient && metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === false && !timingRepair) {
     const error = new Error('Fatal transport decision: malformed decoded timing did not produce an HLS timing-repair strategy');
     error.statusCode = 415;
     console.error(`[transport-final] client=${target.client} item=${kind}:${id} timingProbeCompleted=true decodedPtsMonotonic=false timingRegressionCount=${metadata.timing.regressionCount || 0} finalTransport=ERROR reason=timing_repair_unavailable`);
@@ -998,8 +1001,8 @@ async function playbackDecision(req, source) {
   const finalTransport = timingRepair ? HlsStrategy.TIMING_REPAIR
     : direct.compatible ? sourceProtocol === 'http:' && target.client === PlaybackClient.BROWSER ? 'DIRECT_PROXY' : PlaybackStrategy.DIRECT
       : hlsDecision.strategy;
-  if (metadata.timing?.checked === true && metadata.timing.timingMalformed === true && String(finalTransport).startsWith('DIRECT')) {
-    throw new Error('Fatal transport decision: malformed decoded timing cannot use DIRECT');
+  if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false && finalTransport !== HlsStrategy.TIMING_REPAIR) {
+    throw new Error('Fatal transport decision: malformed decoded timing requires HLS_TIMING_REPAIR');
   }
   const hlsRoute = `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8`;
   const hlsQuery = new URLSearchParams({ client: target.client, sourceHash, traceId });
@@ -3257,6 +3260,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   if (seekableVod && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
     const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${sourceHash}`;
     metadata.timing = await inspectProviderDecodedTiming(providerCacheKey, inputUrl, metadata, null, timingKey, identity.timingProbeSignal, identity.traceId);
+    if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false) {
+      metadata.timing = { ...metadata.timing, timingMalformed: true };
+    }
     if (identity.timingProbeSignal?.aborted) throw identity.timingProbeSignal.reason || new Error('Manifest request cancelled');
   }
   if (seekableVod && Number(metadata.containerSeconds) > 0) rememberVodDuration(String(source._id), kind, String(id), metadata.containerSeconds);
@@ -3296,6 +3302,12 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // sourceHeight is 0/unknown here - applyQualityCeiling always forces the
   // rung in that case, which is exactly what a live "pick 480p" should do.
   let decision = applyQualityCeiling(baseDecision, target.maxHeight, Number(metadata.height) || 0);
+  if ((requestedTimingRepair || metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false)
+      && decision.strategy !== HlsStrategy.TIMING_REPAIR) {
+    const error = new Error('BUG: malformed video timing cannot use DIRECT or HLS_REMUX.');
+    error.statusCode = 409;
+    throw error;
+  }
   if (target.client === PlaybackClient.BROWSER && strategyUsesEncoding(decision) && decision.strategy !== HlsStrategy.TIMING_REPAIR) {
     throw Object.assign(new Error('This item cannot be remuxed without transcoding.'), { statusCode: 415 });
   }
