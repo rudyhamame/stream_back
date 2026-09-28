@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { confidentDirectPlayback, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsPlaylistProfile, PlaybackClient, HlsStrategy } from '../playback-strategy.js';
+import { confidentDirectPlayback, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsPlaylistProfile, PlaybackClient, HlsStrategy, timingRepairDecision } from '../playback-strategy.js';
 
 test('live previews can start from the first remuxed segment', () => {
   assert.equal(hlsPlaylistProfile({ preview: true }).startupSegments, 1);
@@ -61,4 +61,20 @@ test('direct playback normalizes ffprobe Matroska format names', () => {
   assert.equal(accepted.compatible, true);
   assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.ANDROID), 'mkv').compatible, true);
   assert.equal(confidentDirectPlayback({ ...rokuCompatibleMedia, container: 'matroska,webm' }, getPlaybackCapabilities(PlaybackClient.BROWSER), 'mkv').compatible, false);
+});
+
+test('only decoded PTS regressions select the exceptional timing repair strategy', () => {
+  const browser = getPlaybackCapabilities(PlaybackClient.BROWSER);
+  const healthyHigh41 = { ...rokuCompatibleMedia, videoLevel: 41, videoProfile: 'High', timing: { checked: true, timingMalformed: false } };
+  assert.equal(timingRepairDecision(healthyHigh41, browser, { strategy: HlsStrategy.REMUX }).strategy, HlsStrategy.REMUX);
+  const brokenLow31 = { ...rokuCompatibleMedia, videoLevel: 31, timing: { checked: true, timingMalformed: true } };
+  const repaired = timingRepairDecision(brokenLow31, browser, { strategy: HlsStrategy.REMUX });
+  assert.equal(repaired.strategy, HlsStrategy.TIMING_REPAIR);
+  assert.equal(repaired.videoMode, 'transcode');
+  assert.equal(repaired.audioMode, 'copy');
+  assert.equal(timingRepairDecision(brokenLow31, getPlaybackCapabilities(PlaybackClient.ROKU), { strategy: HlsStrategy.REMUX }).strategy, HlsStrategy.REMUX);
+  const args = hlsCodecArgs(repaired);
+  assert.ok(args.includes('setpts=N/((25/1)*TB)'));
+  assert.ok(args.includes('-fps_mode') && args.includes('cfr'));
+  assert.ok(args.includes('copy'));
 });
