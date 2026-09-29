@@ -265,10 +265,17 @@ function mediaIdentity(req) {
   const ticket = resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id);
   const client = String(req.query.client || '');
   const baseViewerId = String(session?.deviceId || session?.ownerId || ticket?.ownerId || req.ip || 'anonymous');
+  // Home can hold two independent Roku VOD preview players at once. Give each
+  // bounded preview slot its own streaming viewer identity so starting the
+  // second preview does not evict the first one's persistent HLS job.
+  const rokuPreviewSlot = String(req.query.rokuPreviewSlot || '');
+  const viewerId = client === PlaybackClient.ROKU && ['0', '1'].includes(rokuPreviewSlot)
+    ? `${baseViewerId}:roku-preview:${rokuPreviewSlot}`
+    : scopedPlaybackViewerId(baseViewerId, client, req.query.playbackClientId);
   return {
     userId: String(session?.ownerId || ticket?.ownerId || ''),
     deviceId: client === PlaybackClient.BROWSER ? '' : String(session?.deviceId || ''),
-    viewerId: scopedPlaybackViewerId(baseViewerId, client, req.query.playbackClientId),
+    viewerId,
     clientIp: clientAddress(req),
     client,
     wwpSessionId: String(req.query.wwpSessionId || ''),

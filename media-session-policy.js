@@ -36,6 +36,8 @@ export function hlsChildRequestQuery(query = {}, startSeconds = 0) {
   // falls back to the account owner and can collide with another player.
   const playbackClientId = String(query.playbackClientId || '').trim();
   if (playbackClientId) params.set('playbackClientId', playbackClientId);
+  const rokuPreviewSlot = String(query.rokuPreviewSlot || '').trim();
+  if (['0', '1'].includes(rokuPreviewSlot)) params.set('rokuPreviewSlot', rokuPreviewSlot);
   // Watch with Partner: the segment requests must resolve to the one shared
   // job key too, so carry the session id onto every child request.
   const wwpSessionId = String(query.wwpSessionId || '').trim();
