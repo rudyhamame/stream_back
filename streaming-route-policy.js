@@ -6,6 +6,7 @@ const EXACT_STREAMING_PATHS = new Set([
   '/api/roku/auth-health',
   '/api/roku/internet-health',
   '/api/playback/preview',
+  '/api/playback/continue-frame',
   '/internal/media-health',
   '/internal/active-streams',
   '/internal/stream-strategies',

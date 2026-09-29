@@ -108,6 +108,7 @@ function recallVodDuration(sourceId, kind, id) {
   return entry && entry.expiresAt > Date.now() ? entry.seconds : 0;
 }
 const mediaSourceLocks = new KeyedSerialExecutor();
+const snapshotCaptureLocks = new KeyedSerialExecutor();
 const nativeHlsResourceLocks = new KeyedSerialExecutor();
 const directStreamLimiter = new DirectStreamLimiter({ maxTotal: maxActiveDirectStreams, maxPerSource: maxDirectStreamsPerSource });
 const browserDirectSessions = new Map();
@@ -1968,6 +1969,48 @@ async function capturePlaybackPreview(inputUrl, key, identity, kind = 'channel',
   finally { await mediaJobs.remove(key, 'preview-complete'); }
 }
 
+// Home's Continue Watching cards need two paused last frames at once. Roku
+// devices can decode only one SceneGraph Video node, so serve independent
+// still frames without starting either card's player or a persistent HLS job.
+app.get('/api/playback/continue-frame', async (req, res) => {
+  try {
+    const sourceId = String(req.query?.sourceId || '');
+    const kind = String(req.query?.kind || '');
+    const id = String(req.query?.id || '');
+    const extension = String(req.query?.ext || 'mp4');
+    const rawPosition = Number(req.query?.position);
+    if (!sourceId || !id || !['movie', 'series'].includes(kind) || !/^[a-z0-9]{1,12}$/i.test(extension)
+        || !Number.isFinite(rawPosition) || rawPosition < 0 || rawPosition > 7 * 24 * 60 * 60) {
+      return res.status(400).json({ error: 'A VOD item and saved position are required' });
+    }
+    const ticket = resolveStreamTicket(requestStreamTicket(req), sourceId, kind, id);
+    const ownerId = ticket?.accountOwnerId || requestAccountOwner(req);
+    if (!ownerId) return res.status(401).json({ error: 'Authentication required' });
+    const source = await getXtreamSource(sourceId, ownerId);
+    if (!source) return res.sendStatus(404);
+    const position = Math.floor(rawPosition);
+    const cacheKey = `${ownerId}:${sourceId}:${kind}:${id}:${extension}:${position}`;
+    const frame = await snapshotCaptureLocks.run('capture', async () => {
+      evictPreviewCache();
+      const cached = previewCache.get(cacheKey)?.frame;
+      if (cached) return cached;
+      if (res.destroyed) return null;
+      const key = `continue-frame:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
+      const captured = await capturePlaybackPreview(
+        await sourceProviderUrl(source, kind, id, extension), key, mediaIdentity(req), kind, position,
+      );
+      cachePreview(cacheKey, captured, 5 * 60_000);
+      return captured;
+    });
+    if (!frame || res.destroyed) return;
+    res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=300', 'Content-Length': String(frame.length) });
+    res.end(frame);
+  } catch (error) {
+    console.warn(`[Continue frame] ${error.message}`);
+    if (!res.headersSent && !res.destroyed && !capacityResponse(res, error)) res.status(502).json({ error: 'Could not capture the saved frame' });
+  }
+});
+
 app.get('/api/playback/preview', async (req, res) => {
   let previewJobKey = '';
   const cancelPreview = () => { if (previewJobKey) mediaJobs.remove(previewJobKey, 'client-disconnect').catch(() => {}); };
@@ -1997,7 +2040,7 @@ app.get('/api/playback/preview', async (req, res) => {
       }
       if (superseded.length) await Promise.allSettled(superseded);
       previewJobKey = `preview:${createHash('sha256').update(cacheKey).digest('hex').slice(0, 24)}`;
-      frame = await capturePlaybackPreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), previewJobKey, identity, target.kind, position);
+      frame = await snapshotCaptureLocks.run('capture', async () => capturePlaybackPreview(await sourceProviderUrl(source, target.kind, target.id, target.extension), previewJobKey, identity, target.kind, position));
       cachePreview(cacheKey, frame, 30_000);
     }
     res.set({ 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, max-age=30', 'Content-Length': String(frame.length) });
