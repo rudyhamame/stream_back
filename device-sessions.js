@@ -50,28 +50,8 @@ async function linkedDeviceRows(filter = {}) {
 function isRokuDeviceId(deviceId) { return String(deviceId || '').startsWith('roku-'); }
 
 async function accountHasOtherRokuDevice(accountCollection, accountId, deviceId) {
-  let account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1, rokuDeviceId: 1 } });
-  if (!account) return false;
-  const rokuDevices = (account.devices || []).filter(device => isRokuDeviceId(device.deviceId));
-  let boundId = String(account.rokuDeviceId || '');
-  if (!boundId && rokuDevices.length) {
-    rokuDevices.sort((a, b) => {
-      const date = value => new Date(value?.linkedAt || value?.createdAt || 0).getTime();
-      return date(a) - date(b) || String(a.deviceId).localeCompare(String(b.deviceId));
-    });
-    boundId = String(rokuDevices[0].deviceId);
-    await accountCollection.updateOne(
-      { _id: accountId, $or: [{ rokuDeviceId: { $exists: false } }, { rokuDeviceId: null }, { rokuDeviceId: '' }] },
-      { $set: { rokuDeviceId: boundId, updatedAt: new Date() } },
-    );
-    account = await accountCollection.findOne({ _id: accountId }, { projection: { devices: 1, rokuDeviceId: 1 } });
-    boundId = String(account?.rokuDeviceId || boundId);
-  }
-  if (boundId) await accountCollection.updateOne(
-    { _id: accountId },
-    { $pull: { devices: { $and: [{ deviceId: /^roku-/ }, { deviceId: { $ne: boundId } }] } }, $set: { updatedAt: new Date() } },
-  );
-  return Boolean(boundId && boundId !== String(deviceId));
+  const account = await accountCollection.findOne({ _id: accountId }, { projection: { rokuDeviceId: 1 } });
+  return String(account?.rokuDeviceId || '') !== String(deviceId);
 }
 
 const singleRokuPerAccountError = 'This RH account is permanently linked to another Roku device.';
@@ -83,6 +63,10 @@ async function updateLinkedDevice(filter, update, options = {}) {
     const deviceId = String(update.$setOnInsert?.deviceId || filter.deviceId || '');
     if (!ObjectId.isValid(accountId) || !deviceId) throw new Error('A linked device needs an account and device ID');
     const id = new ObjectId(String(accountId));
+    if (isRokuDeviceId(deviceId)) {
+      const account = await collection.findOne({ _id: id }, { projection: { rokuDeviceId: 1 } });
+      if (String(account?.rokuDeviceId || '') !== deviceId) return { matchedCount: 0, modifiedCount: 0, rokuDeviceLimitReached: true };
+    }
     const existing = await linkedDeviceRows({ deviceId });
     for (const row of existing) if (String(row.accountId) !== String(id)) await collection.updateOne({ _id: row.accountId }, { $pull: { devices: { deviceId } } });
     if (existing.some(row => String(row.accountId) === String(id))) return updateLinkedDevice({ accountId: id, deviceId }, update);
@@ -91,11 +75,11 @@ async function updateLinkedDevice(filter, update, options = {}) {
     const insertFilter = { _id: id, 'devices.deviceId': { $ne: deviceId } };
     if (isRokuDeviceId(deviceId)) {
       insertFilter.devices = { $not: { $elemMatch: { deviceId: /^roku-/ } } };
-      insertFilter.$or = [{ rokuDeviceId: deviceId }, { rokuDeviceId: { $exists: false } }, { rokuDeviceId: null }, { rokuDeviceId: '' }];
+      insertFilter.rokuDeviceId = deviceId;
     }
     const result = await collection.updateOne(
       insertFilter,
-      { $push: { devices: { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date(), ...(isRokuDeviceId(deviceId) ? { rokuDeviceId: deviceId } : {}) } },
+      { $push: { devices: { ...update.$setOnInsert, ...setFields, deviceId } }, $set: { updatedAt: new Date() } },
     );
     if (result.modifiedCount) return result;
     const linkedSameDevice = await linkedDeviceRows({ accountId: id, deviceId });
@@ -178,7 +162,7 @@ export async function createDeviceSession(deviceId, frontendUrl, deviceToken = '
   // login. Validate its local Roku token against the still-linked DB profile;
   // neither the token nor account credentials are ever placed in the QR URL.
   const authorization = resolveDeviceToken(deviceToken);
-  if (authorization?.type === 'roku' && authorization.deviceId === normalizedDeviceId && authorization.ownerId === session.ownerId && ObjectId.isValid(authorization.accountId)) {
+  if (authorization?.type === 'roku' && authorization.deviceId === normalizedDeviceId && authorization.ownerId === session.ownerId && ObjectId.isValid(authorization.accountId) && await isRokuSessionLinked(authorization)) {
     const profile = await (await profiles()).findOne({ ownerId: session.ownerId, deviceId: normalizedDeviceId, accountId: new ObjectId(authorization.accountId) }, { projection: { accountId: 1 } });
     if (profile?.accountId) {
       session.accountId = String(profile.accountId);
@@ -262,14 +246,14 @@ async function consumePairing(code, email, password, setup) {
   if (setup) {
     if (profile?.accountId) return { error: 'This Roku is already activated. Sign in instead.' };
     if (await accountCollection.findOne({ email: normalizedEmail }, { projection: { _id: 1 } })) return { error: 'An account with this email already exists. Sign in instead.' };
-    const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: hashPassword(password), devices: [], createdAt: new Date(), updatedAt: new Date() });
+    const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: hashPassword(password), rokuDeviceId: session.deviceId, devices: [], createdAt: new Date(), updatedAt: new Date() });
     account = { _id: created.insertedId };
   } else {
     account = await accountCollection.findOne({ email: normalizedEmail });
     // A profile created by the earlier device-password implementation can be
     // adopted on its first successful sign-in without losing its library.
     if (!account && profile?.email === normalizedEmail && verifyPassword(password, profile.passwordHash)) {
-      const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: profile.passwordHash, devices: [], createdAt: profile.createdAt || new Date(), updatedAt: new Date() });
+      const created = await accountCollection.insertOne({ email: normalizedEmail, passwordHash: profile.passwordHash, rokuDeviceId: session.deviceId, devices: [], createdAt: profile.createdAt || new Date(), updatedAt: new Date() });
       account = { _id: created.insertedId };
     }
     if (!account || !verifyPassword(password, account.passwordHash)) return { error: 'Incorrect email or password' };
@@ -417,6 +401,8 @@ export function resolveDeviceToken(token) {
 
 export async function isRokuSessionLinked(session) {
   if (session?.type !== 'roku' || !session.deviceId || !ObjectId.isValid(session.accountId)) return false;
+  const account = await (await accounts()).findOne({ _id: new ObjectId(session.accountId) }, { projection: { rokuDeviceId: 1 } });
+  if (String(account?.rokuDeviceId || '') !== String(session.deviceId)) return false;
   const row = await (await profiles()).findOne({ deviceId: String(session.deviceId), accountId: new ObjectId(session.accountId) });
   return Boolean(row);
 }
