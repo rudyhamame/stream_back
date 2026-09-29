@@ -24,7 +24,7 @@ import { applyQualityCeiling, audioCompatibility, codecCompatibility, confidentD
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
 import { getFavorites, toggleFavorite } from './favorites-store.js';
-import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getActiveRokuPlaybackHeartbeats, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
+import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, createDeviceSession, getActiveRokuPlaybackHeartbeats, getLinkedDevices, getPairingInfo, getRokuDeviceSessionStatus, isRokuSessionLinked, loginAccount, loginDeviceSession, recordDeviceHeartbeat, resolveDeviceToken, setupDeviceSession, unlinkAccountDevice } from './device-sessions.js';
 import { enforceStreamingOnly } from './streaming-route-policy.js';
 import { applyWwpControl, appendWwpCallSignal, endWwpSession, getWwpSession, noteWwpPresence, reconcileWwpSession, setWwpCallRing, waitForWwpCallSignals, waitForWwpSession, wwpSyncToken } from './wwp-sessions.js';
 import { wwpCallPageHtml } from './wwp-call-page.js';
@@ -887,6 +887,18 @@ app.use(cors({
   methods: ['GET', 'HEAD', 'POST', 'OPTIONS'],
 }));
 app.use(express.json());
+
+// Revoking a Roku link must also revoke its still-signed media token.
+app.use(async (req, res, next) => {
+  if (req.path.startsWith('/api/roku/device-session')) return next();
+  const token = String(req.get('x-device-token') || req.query.deviceToken || '');
+  const session = resolveDeviceToken(token);
+  if (session?.type !== 'roku') return next();
+  try {
+    if (!await isRokuSessionLinked(session)) return res.status(401).json({ error: 'Roku device is no longer linked' });
+    next();
+  } catch (error) { next(error); }
+});
 
 // Unlike the public /api/health endpoint, this verifies the same signed Roku
 // token used by /api/xtream/hls. The Roku status indicator can therefore

@@ -414,3 +414,9 @@ export function resolveDeviceToken(token) {
     return { ...data, ownerId: canonicalSessionOwner(data) };
   } catch { return null; }
 }
+
+export async function isRokuSessionLinked(session) {
+  if (session?.type !== 'roku' || !session.deviceId || !ObjectId.isValid(session.accountId)) return false;
+  const row = await (await profiles()).findOne({ deviceId: String(session.deviceId), accountId: new ObjectId(session.accountId) });
+  return Boolean(row);
+}
