@@ -30,7 +30,7 @@ export function selectEnabledHlsStrategy({
     if (!videoKnown && candidate.strategy !== HLS_MODE.REMUX) continue;
     if (requiredVideo && candidate.videoMode !== 'transcode') continue;
     if (requiredAudio && candidate.audioMode !== 'transcode') continue;
-    return { ...candidate, requiredVideo, requiredAudio };
+    return { ...candidate, requiredVideo, requiredAudio, videoKnown };
   }
   return null;
 }

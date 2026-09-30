@@ -38,12 +38,7 @@ export async function saveStreamStrategyPolicy(devices) {
       if (typeof devices[device][strategy] !== 'boolean') throw new Error(`Invalid ${device}/${strategy} setting`);
       normalized[device][strategy] = devices[device][strategy];
     }
-    // Audio transcode and encoder strategies are not implemented by policy.
-    if (normalized[device].HLS_AUDIO_TRANSCODE || normalized[device].HLS_VIDEO_TRANSCODE || normalized[device].HLS_FULL_TRANSCODE) {
-      throw new Error('Only Direct and HLS Remux are currently supported.');
-    }
-    if (!normalized[device].DIRECT && !normalized[device].HLS_REMUX) throw new Error(`${device} must keep Direct or HLS Remux enabled.`);
-    if (device === 'roku' && normalized[device].HLS_AUDIO_TRANSCODE) throw new Error('Roku audio transcode is unavailable.');
+    // An all-off policy intentionally blocks new playback.
   }
   const updatedAt = new Date();
   await (await collection()).updateOne({ _id: 'active' }, { $set: { devices: normalized, updatedAt } }, { upsert: true });

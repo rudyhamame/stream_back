@@ -73,3 +73,8 @@ test('rejects prefix and traversal lookalikes', () => {
   assert.equal(isStreamingRoute('GET', '/api/xtream/hls/source/channel/42/resource/not-a-valid-id'), false);
   assert.equal(isStreamingRoute('GET', '/api/xtream/sources/../play/source/channel/42'), false);
 });
+
+test('authenticated live strategy policy is a read-only streaming route', () => {
+  assert.equal(isStreamingRoute('GET', '/api/xtream/strategy-policy'), true);
+  assert.equal(isStreamingRoute('POST', '/api/xtream/strategy-policy'), false);
+});

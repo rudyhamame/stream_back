@@ -11,6 +11,7 @@ const EXACT_STREAMING_PATHS = new Set([
   '/internal/active-streams',
   '/internal/stream-strategies',
   '/api/xtream/playback/release',
+  '/api/xtream/strategy-policy',
 ]);
 
 const STREAMING_PATH_PATTERNS = [

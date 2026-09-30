@@ -3,6 +3,7 @@ import { normalizeFrameRate, setptsForFrameRate } from './decoded-frame-timing.j
 
 export const HlsStrategy = Object.freeze({
   REMUX: 'HLS_REMUX',
+  AUDIO_TRANSCODE: 'HLS_AUDIO_TRANSCODE',
   TIMING_REPAIR: 'HLS_TIMING_REPAIR',
   VIDEO_TRANSCODE: 'HLS_VIDEO_TRANSCODE',
   FULL_TRANSCODE: 'HLS_FULL_TRANSCODE',
@@ -11,6 +12,7 @@ export const HlsStrategy = Object.freeze({
 export const PlaybackStrategy = Object.freeze({
   DIRECT: 'DIRECT',
   REMUX: HlsStrategy.REMUX,
+  AUDIO_TRANSCODE: HlsStrategy.AUDIO_TRANSCODE,
   VIDEO_TRANSCODE: HlsStrategy.VIDEO_TRANSCODE,
   TRANSCODE: HlsStrategy.FULL_TRANSCODE,
 });
