@@ -3401,7 +3401,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     // A seek needs its first playable segment quickly. Keep keyframe-safe
     // boundaries and the usual two-second cadence after the opening segment.
     const fastStart = false;
-    const playlistProfile = hlsPlaylistProfile({ fastStart, preview: previewRemux, client: target.client });
+    const playlistProfile = hlsPlaylistProfile({ fastStart, preview: identity.preview === true, client: target.client });
     const args = ['-hide_banner', '-nostats', '-loglevel', 'info', '-progress', 'pipe:2', '-stats_period', '0.5', ...hlsHwDeviceArgs({ enabled: hardwareTranscode })];
     if (startSeconds > 0) args.push('-ss', String(startSeconds));
     args.push(
@@ -3584,6 +3584,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
     const nativeHlsDisabled = String(req.query.native || '') === '0';
     const identity = mediaIdentity(req);
+    identity.preview = fastPreview;
     identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
     identity.timingProbeSignal = requestAbort.signal;
     identity.traceId = playbackTraceId(req);
