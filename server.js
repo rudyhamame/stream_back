@@ -973,6 +973,16 @@ async function playbackDecision(req, source) {
     console.info(`[vod-timing-probe] client=${target.client} fps=${fps} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0} largestRegressionMs=${Math.round((metadata.timing?.largestRegressionSeconds || 0) * 1000)} decision=${timingRepair ? HlsStrategy.TIMING_REPAIR : direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision?.strategy || 'UNSUPPORTED'}`);
   }
   const selectedEnabled = Boolean(hlsDecision && (timingRepair ? enabled.HLS_VIDEO_TRANSCODE : enabled[hlsDecision.strategy]));
+  const hlsRecoveryStrategies = [];
+  if (hlsDecision && selectedEnabled && target.client === PlaybackClient.ROKU) {
+    const excluded = [];
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const candidate = selectEnabledHlsForMedia(metadata, target.capabilities, enabled, { excluded });
+      if (!candidate) break;
+      hlsRecoveryStrategies.push(candidate.strategy);
+      excluded.push(candidate.strategy);
+    }
+  }
   const durationSeconds = Math.max(0, Math.round(Number(metadata.containerSeconds) || 0));
   if (durationSeconds > 0) rememberVodDuration(String(source._id), kind, String(id), durationSeconds);
   // Ordered client hints: (2) container, (3) codecs. Incompatible codecs are
@@ -1039,6 +1049,7 @@ async function playbackDecision(req, source) {
     directEnabled: Boolean(enabled.DIRECT),
     remuxEnabled: Boolean(enabled.HLS_REMUX),
     hlsFallbackStrategy: hlsDecision?.strategy || '',
+    hlsRecoveryStrategies,
     enabledStrategies: { ...enabled },
     incompatibleReason: playable ? '' : codecs.reason || 'No checked compatible HLS strategy',
     // Compatibility is a media/device fact. Timing repair may still make the
