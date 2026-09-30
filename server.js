@@ -3187,7 +3187,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const cachedMode = cachedJob.hlsStrategy === HlsStrategy.TIMING_REPAIR
       ? HLS_MODE.VIDEO : cachedJob.hlsStrategy;
     if (!currentPolicy[cachedMode]) {
-      await mediaJobs.remove(key, 'strategy-unchecked');
+      await mediaJobs.releaseViewer(key, identity.viewerId, 'strategy-unchecked');
       const error = new Error(`${cachedMode} is no longer checked for ${target.client}.`);
       error.statusCode = 409;
       throw error;
