@@ -228,7 +228,7 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
   return ['-vaapi_device', process.env.HLS_VAAPI_DEVICE || '/dev/dri/renderD128'];
 }
 
-export function hlsCodecArgs(decision, { fastStart = false, hardware = false } = {}) {
+export function hlsCodecArgs(decision, { fastStart = false, hardware = false, enabledStrategies = null } = {}) {
   if (decision?.strategy === HlsStrategy.TIMING_REPAIR) {
     return [
       // OVH has two CPU cores and no render node. Keep simultaneous timing
@@ -239,14 +239,14 @@ export function hlsCodecArgs(decision, { fastStart = false, hardware = false } =
       '-c:a', 'copy',
     ];
   }
-  const videoTranscodeAllowed = TRANSCODING_ENABLED && decision.videoMode === 'transcode';
-  if (decision.videoMode === 'transcode' && !videoTranscodeAllowed || decision.audioMode === 'transcode') {
-    decision = {
-      ...decision,
-      videoMode: videoTranscodeAllowed ? 'transcode' : 'copy',
-      audioMode: 'copy',
-      strategy: videoTranscodeAllowed ? decision.strategy : HlsStrategy.REMUX,
-    };
+  const encodingRequested = decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
+  if (encodingRequested && enabledStrategies !== null && !enabledStrategies[decision.strategy]) {
+    throw new Error(`${decision.strategy} is not enabled for this device`);
+  }
+  if (encodingRequested && enabledStrategies === null) {
+    // Preserve the existing copy-only behavior until the server passes the
+    // saved per-device policy into this function at the FFmpeg call site.
+    decision = { ...decision, videoMode: 'copy', audioMode: 'copy', strategy: HlsStrategy.REMUX };
   }
   const maxHeight = Number(decision.maxHeight) || 0;
   const rungKbps = QUALITY_RUNGS[maxHeight] || 0;
