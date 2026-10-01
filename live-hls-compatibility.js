@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { normalizeProbe } from './codec-probe.js';
 import { audioCompatibility, videoCompatibility } from './playback-strategy.js';
 import { selectEnabledHlsStrategy } from './stream-strategy-selection.js';
 import { samePlaybackViewer } from './media-session-policy.js';
@@ -8,25 +9,18 @@ import { samePlaybackViewer } from './media-session-policy.js';
 export function probeLiveSegment(body, ffprobe = 'ffprobe') {
   return new Promise(resolve => {
     const child = spawn(ffprobe, ['-v', 'error', '-probesize', '1048576',
-      '-analyzeduration', '3000000', '-show_streams', '-of', 'json', 'pipe:0'],
+      '-analyzeduration', '3000000', '-show_streams', '-show_format', '-of', 'json', 'pipe:0'],
     { stdio: ['pipe', 'pipe', 'ignore'] });
     let output = '';
     let settled = false;
-    const timer = setTimeout(() => { child.kill('SIGKILL'); }, 3000);
+    const timer = setTimeout(() => { child.kill('SIGKILL'); finish(); }, 3000);
     const finish = () => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       try {
-        const streams = JSON.parse(output).streams || [];
-        if (!streams.length) return resolve({});
-        const video = streams.find(s => s.codec_type === 'video') || {};
-        const audio = streams.find(s => s.codec_type === 'audio') || {};
-        resolve({ videoCodec: video.codec_name || '', videoProfile: video.profile || '',
-          videoLevel: video.level, pixelFormat: video.pix_fmt, width: video.width,
-          height: video.height, frameRate: video.avg_frame_rate,
-          audioCodec: audio.codec_name || '', audioChannels: audio.channels,
-          audioSampleRate: Number(audio.sample_rate) || 0 });
+        const metadata = normalizeProbe(JSON.parse(output));
+        resolve(metadata.videoCodec || metadata.audioCodec ? metadata : {});
       } catch { resolve({}); }
     };
     child.stdout.on('data', chunk => { output = (output + chunk).slice(-65536); });

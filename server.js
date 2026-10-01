@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { inspectProviderCodecs, probeCacheTtl, missingProbeFacts, mergeProbeFacts } from './codec-probe.js';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
 import { waitForHlsManifest } from './hls-startup.js';
 import { measuredHlsPreparedRange } from './hls-prepared-range.js';
@@ -306,14 +307,6 @@ function appendTail(current, chunk, maxBytes = 8_000) {
   return `${current}${chunk}`.slice(-maxBytes);
 }
 
-function normalizeFrameRate(value) {
-  const raw = String(value || '').trim();
-  if (!raw || raw === '0/0') return '';
-  const [numerator, denominator] = raw.split('/').map(Number);
-  const fps = denominator ? numerator / denominator : Number(raw);
-  return Number.isFinite(fps) && fps > 0 ? String(Math.round(fps * 1000) / 1000) : '';
-}
-
 function safeProbeError(error) {
   return String(error?.message || error || 'Unknown FFprobe error')
     .replace(/https?:\/\/[^\s"'<>]+/gi, value => {
@@ -358,134 +351,6 @@ function releaseCodecProbeSlot() {
   else activeCodecProbes = Math.max(0, activeCodecProbes - 1);
 }
 
-async function inspectProviderCodecs(inputUrl, deepProbe = false) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(ffprobeBin, [
-      '-v', 'error', '-rw_timeout', deepProbe ? '60000000' : '12000000',
-      // Provider files sometimes expose format metadata before ffprobe has
-      // reached the audio/video stream headers. Retry those with a larger
-      // bounded scan so clients receive codec, level, and timing facts instead
-      // of partial metadata. The deep limits allow a dispersed SPS/header to
-      // be found while keeping provider reads and startup delay bounded.
-      '-probesize', deepProbe ? '104857600' : '1048576',
-      '-max_probe_packets', deepProbe ? '10000' : '2500',
-      '-analyzeduration', deepProbe ? '30000000' : '3000000',
-      '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:stream_disposition=attached_pic:format=format_name,duration,bit_rate',
-      '-of', 'json', inputUrl,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let output = '';
-    let errorOutput = '';
-    let settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      if (error) reject(error); else resolve(value);
-    };
-    const timeout = setTimeout(() => {
-      child.kill('SIGKILL');
-      finish(new Error('Codec probe timed out'));
-    }, deepProbe ? 65_000 : 15_000);
-    timeout.unref?.();
-    child.stdout.on('data', chunk => { output = appendTail(output, chunk, 64 * 1024); });
-    child.stderr.on('data', chunk => { errorOutput = appendTail(errorOutput, chunk); });
-    child.once('error', error => finish(error));
-    child.once('close', code => {
-      if (code !== 0) return finish(new Error(errorOutput.trim() || `ffprobe exited with ${code}`));
-      try {
-        const probe = JSON.parse(output);
-        const streams = probe.streams || [];
-        const videoStreams = streams.filter(stream => stream.codec_type === 'video');
-        // Some providers place a cover image before the actual video stream.
-        // Base compatibility on a moving-picture stream whenever one exists.
-        const video = videoStreams.find(stream => !stream.disposition?.attached_pic) || videoStreams[0] || {};
-        const audioStreams = streams.filter(stream => stream.codec_type === 'audio');
-        const audio = audioStreams[0] || {};
-        const metadata = {
-          container: String(probe.format?.format_name || ''),
-          containerSeconds: Math.max(0, Math.round(Number(probe.format?.duration) || 0)),
-          probeBitrate: Math.max(0, Math.round(Number(probe.format?.bit_rate) || 0)),
-          videoCodec: String(video.codec_name || ''),
-          videoTracks: videoStreams.map((stream, index) => ({
-            index, codec: String(stream.codec_name || ''), profile: String(stream.profile || ''),
-            width: Number(stream.width) || 0, height: Number(stream.height) || 0,
-            attachedPicture: Boolean(stream.disposition?.attached_pic),
-          })),
-          videoProfile: String(video.profile || ''),
-          videoLevel: Number(video.level) || 0,
-          pixelFormat: String(video.pix_fmt || ''),
-          videoBitDepth: Number(video.bits_per_raw_sample) || 0,
-          width: Number(video.width) || 0,
-          height: Number(video.height) || 0,
-          frameRate: String(normalizeFrameRate(video.avg_frame_rate) || normalizeFrameRate(video.r_frame_rate) || ''),
-          audioCodec: String(audio.codec_name || ''),
-          audioProfile: String(audio.profile || ''),
-          audioSampleRate: Number(audio.sample_rate) || 0,
-          audioChannels: Number(audio.channels) || 0,
-          audioChannelLayout: String(audio.channel_layout || ''),
-          audioTracks: audioStreams.map((stream, index) => ({
-            index, codec: String(stream.codec_name || ''), profile: String(stream.profile || ''),
-            sampleRate: Number(stream.sample_rate) || 0, channels: Number(stream.channels) || 0,
-            channelLayout: String(stream.channel_layout || ''),
-          })),
-        };
-        const requiredFactsMissing = [
-          !metadata.videoCodec,
-          !metadata.videoProfile || /^unknown$/i.test(metadata.videoProfile),
-          !metadata.videoLevel,
-          !metadata.pixelFormat || /^unknown$/i.test(metadata.pixelFormat),
-          !metadata.width,
-          !metadata.height,
-          !metadata.frameRate,
-          audioStreams.length > 0 && !metadata.audioCodec,
-          audioStreams.length > 0 && !metadata.audioSampleRate,
-          audioStreams.length > 0 && !metadata.audioChannels,
-        ];
-        const missingRequiredFacts = requiredFactsMissing.filter(Boolean).length;
-        if (deepProbe && missingRequiredFacts) {
-          console.warn(`[Media probe] cache=${cacheKey} incomplete missingFacts=${missingRequiredFacts} videoStreams=${videoStreams.length} audioStreams=${audioStreams.length}`);
-        }
-        if (!deepProbe && missingRequiredFacts) {
-          inspectProviderCodecs(inputUrl, true)
-          .then(deep => finish(null, {
-              ...metadata,
-              ...deep,
-              // A second scan may identify additional streams without
-              // returning every field from the first scan. Preserve any
-              // concrete shallow-probe facts instead of replacing them with
-              // empty strings or zeroes from the deeper result.
-              videoCodec: deep.videoCodec || metadata.videoCodec,
-              videoTracks: deep.videoTracks?.some(track => track.codec) ? deep.videoTracks : metadata.videoTracks,
-              videoProfile: deep.videoProfile || metadata.videoProfile,
-              videoLevel: deep.videoLevel || metadata.videoLevel,
-              pixelFormat: deep.pixelFormat || metadata.pixelFormat,
-              videoBitDepth: deep.videoBitDepth || metadata.videoBitDepth,
-              width: deep.width || metadata.width,
-              height: deep.height || metadata.height,
-              frameRate: deep.frameRate || metadata.frameRate,
-              audioCodec: deep.audioCodec || metadata.audioCodec,
-              audioProfile: deep.audioProfile || metadata.audioProfile,
-              audioSampleRate: deep.audioSampleRate || metadata.audioSampleRate,
-              audioChannels: deep.audioChannels || metadata.audioChannels,
-              audioChannelLayout: deep.audioChannelLayout || metadata.audioChannelLayout,
-              audioTracks: deep.audioTracks?.length ? deep.audioTracks : metadata.audioTracks,
-              container: deep.container || metadata.container,
-              containerSeconds: deep.containerSeconds || metadata.containerSeconds,
-              probeBitrate: deep.probeBitrate || metadata.probeBitrate,
-            }))
-            .catch(error => {
-              console.warn(`[Media probe] cache=${cacheKey} deep scan failed type=${error.name || 'Error'} detail=${safeProbeError(error)}`);
-              finish(null, metadata);
-            });
-          return;
-        }
-        finish(null, metadata);
-      } catch (error) {
-        finish(new Error(`Codec probe returned invalid metadata: ${safeProbeError(error)}`));
-      }
-    });
-  });
-}
 
 function playbackTarget(req) {
   const requested = String(req.query.client || '').trim().toLowerCase();
@@ -553,10 +418,10 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
     return codecProbesInFlight.get(cacheKey);
   }
 
-  const pending = inspectProviderCodecs(inputUrl)
+  const pending = inspectProviderCodecs(inputUrl, { ffprobe: ffprobeBin })
     .then(metadata => {
       codecProbeCache.delete(cacheKey);
-      codecProbeCache.set(cacheKey, { metadata, expiresAt: Date.now() + codecProbeTtlMs });
+      codecProbeCache.set(cacheKey, { metadata, expiresAt: Date.now() + probeCacheTtl(metadata, codecProbeTtlMs) });
       evictCodecProbeCache();
       return metadata;
     })
@@ -2840,9 +2705,12 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
       rememberMediaSegmentMetadata(session, normalizedManifest, manifestUrl);
       const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
       const sample = [...session.resourceBodies.values()].find(entry => entry.body?.[0] === 0x47);
-      if (sample && !session.codecMetadata) session.codecMetadata = await probeLiveSegment(sample.body, ffprobeBin);
+      if (sample && missingProbeFacts(session.codecMetadata).length && (session.codecProbeAttempts || 0) < 3) {
+        session.codecProbeAttempts = (session.codecProbeAttempts || 0) + 1;
+        session.codecMetadata = mergeProbeFacts(session.codecMetadata || {}, await probeLiveSegment(sample.body, ffprobeBin));
+      }
       if (session.codecMetadata) {
-        codecProbeCache.set(probeKey, { metadata: session.codecMetadata, expiresAt: Date.now() + codecProbeTtlMs });
+        codecProbeCache.set(probeKey, { metadata: session.codecMetadata, expiresAt: Date.now() + probeCacheTtl(session.codecMetadata, codecProbeTtlMs) });
         const facts = liveCodecFacts(session.codecMetadata, playbackTarget(req).capabilities);
         if (!facts.videoCompatible || !facts.audioCompatible) {
           throw new Error(`Native codecs require checked conversion: video=${session.codecMetadata.videoCodec || 'unknown'} audio=${session.codecMetadata.audioCodec || 'unknown'}`);

@@ -165,7 +165,8 @@ export function confidentDirectPlayback(metadata = {}, capabilities = getPlaybac
     ['audio codec', metadata.audioCodec], ['audio channels', metadata.audioChannels],
     ['audio sample rate', metadata.audioSampleRate],
   ];
-  const missing = required.filter(([, value]) => value === undefined || value === null || value === '' || Number(value) === 0).map(([name]) => name);
+  const missing = required.filter(([, value]) => value === undefined || value === null || value === ''
+    || /^(unknown|n\/a)$/i.test(String(value)) || Number(value) <= 0).map(([name]) => name);
   if (missing.length) return { compatible: false, reason: `direct-play facts unavailable: ${missing.join(', ')}` };
   const video = videoCompatibility(metadata, capabilities);
   if (!video.compatible) return { compatible: false, reason: video.reason };
@@ -183,6 +184,9 @@ export function codecCompatibility(metadata = {}, capabilities = getPlaybackCapa
   if (!videoKnown) return { known: false, compatible: false, reason: 'video codec unavailable' };
   const video = videoCompatibility(metadata, capabilities);
   const hasAudio = Boolean(normalizedCodec(metadata.audioCodec || metadata.codecAudio));
+  if (!hasAudio && (metadata.audioTracks?.length || metadata.audioStreamStatus === 'unknown')) {
+    return { known: false, compatible: false, reason: 'audio stream detected but codec unavailable' };
+  }
   const audio = hasAudio ? audioCompatibility(metadata, capabilities) : { compatible: true, reason: 'no audio stream' };
   return {
     known: true,
