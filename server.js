@@ -964,7 +964,11 @@ async function playbackDecision(req, source) {
     hlsFallbackStrategy: hlsDecision?.strategy || '',
     hlsRecoveryStrategies,
     enabledStrategies: { ...enabled },
-    incompatibleReason: playable ? '' : codecs.reason || 'No checked compatible HLS strategy',
+    // Say what is actually missing: compatible codecs must not be reported as the cause of a refusal.
+    incompatibleReason: playable ? ''
+      : (codecs.known && !codecs.compatible) ? codecs.reason
+        : !container.compatible ? container.reason
+          : `No enabled strategy can play this item for ${target.client}: Direct is unavailable (${direct.reason || 'not eligible'}) and HLS Remux cannot serve it; Video/Audio/Full transcode ${enabled.HLS_VIDEO_TRANSCODE || enabled.HLS_AUDIO_TRANSCODE || enabled.HLS_FULL_TRANSCODE ? 'do not apply' : 'are off in the control panel'}.`,
     // Compatibility is a media/device fact. Timing repair may still make the
     // native route ineligible even when container and codecs are supported.
     directCompatible: direct.compatible,
