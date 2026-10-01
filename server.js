@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
 import { waitForHlsManifest } from './hls-startup.js';
 import { measuredHlsPreparedRange } from './hls-prepared-range.js';
+import { probeLiveSegment, liveCodecFacts, selectLiveHlsStrategy, pinnedLiveGeneration, activeLiveStrategy } from './live-hls-compatibility.js';
 import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
 import express from 'express';
 import cors from 'cors';
@@ -2838,6 +2839,15 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
       const normalizedManifest = normalizeNativeHlsTimeline(manifest, manifestUrl, session);
       rememberMediaSegmentMetadata(session, normalizedManifest, manifestUrl);
       const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
+      const sample = [...session.resourceBodies.values()].find(entry => entry.body?.[0] === 0x47);
+      if (sample && !session.codecMetadata) session.codecMetadata = await probeLiveSegment(sample.body, ffprobeBin);
+      if (session.codecMetadata) {
+        codecProbeCache.set(probeKey, { metadata: session.codecMetadata, expiresAt: Date.now() + codecProbeTtlMs });
+        const facts = liveCodecFacts(session.codecMetadata, playbackTarget(req).capabilities);
+        if (!facts.videoCompatible || !facts.audioCompatible) {
+          throw new Error(`Native codecs require checked conversion: video=${session.codecMetadata.videoCodec || 'unknown'} audio=${session.codecMetadata.audioCodec || 'unknown'}`);
+        }
+      }
       const rewrittenMediaManifest = rewriteHlsManifest(stableManifest, manifestUrl, url => nativeHlsResourcePath(req, session, url));
       const mediaPlaylistPath = nativeHlsResourcePath(req, session, manifestUrl);
       session.resourceBodies.set(manifestUrl, {
@@ -3013,7 +3023,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // below that height, preserve its compatible bitstreams with HLS remux.
   // The bounded probe cache keeps subsequent quality changes and seeks from
   // opening another provider connection.
-  const metadata = seekableVod
+  const metadata = seekableVod || ['decoder-video', 'decoder-audio'].includes(strategyOverride)
     ? await providerCodecMetadata(providerCacheKey, inputUrl)
     : cachedProviderState || {};
   if (metadata.providerUnavailable) {
@@ -3039,10 +3049,8 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const downscale = ceiling > 0 && (sourceHeight === 0 || sourceHeight > ceiling + 16);
   const choice = seekableVod
     ? selectEnabledHlsForMedia(metadata, capabilities, enabledStrategies, { downscale, exact: exactStrategy })
-    : selectEnabledHlsStrategy({ enabled: enabledStrategies, downscale,
-      exact: exactStrategy, videoKnown: true, audioKnown: true,
-      videoCompatible: requestedMode !== 'decoder-video',
-      audioCompatible: requestedMode !== 'decoder-audio' });
+    : selectLiveHlsStrategy(metadata, capabilities, enabledStrategies,
+      { downscale, exact: exactStrategy, decoderFailure: requestedMode });
   if (!choice) {
     const error = new Error(`No checked compatible HLS strategy for ${target.client}`);
     error.statusCode = 409;
@@ -3279,6 +3287,19 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/startup-status', async (req, res) =
   } catch (error) { res.status(500).json({ error: error.message }); }
 });
 
+app.get('/api/xtream/hls/:sourceId/:kind/:id/active-strategy', async (req, res) => {
+  try {
+    if (!['channel', 'movie', 'series'].includes(req.params.kind)) return res.sendStatus(404);
+    const source = await getXtreamSource(req.params.sourceId, requestAccountOwner(req));
+    if (!source) return res.sendStatus(404);
+    const identity = mediaIdentity(req);
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json(activeLiveStrategy(mediaJobs.values(), source._id, req.params.id,
+      identity, req.params.kind === 'channel' ? nativeHlsSession(req, identity) : null,
+      String(req.query.loadId || ''), req.params.kind));
+  } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
   const manifestRequestStartedAt = Date.now();
   const requestAbort = new AbortController();
@@ -3379,7 +3400,20 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const requestedFallback = fastPreview && !target.maxHeight && !explicitFallback
       ? 'preview-remux'
       : explicitFallback;
-    let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, playbackProviderURL);
+    const pinnedGeneration = req.params.kind === 'channel' && String(req.query.media || '') === '1'
+      ? String(req.query.generation || '') : '';
+    let job;
+    if (pinnedGeneration) {
+      const pinned = pinnedLiveGeneration(hlsGenerationJobs.get(pinnedGeneration), source._id,
+        req.params.id, identity, enabledForClient);
+      if (pinned.status) return res.sendStatus(pinned.status);
+      job = pinned.job;
+      // A live media playlist must never jump back to sequence zero inside
+      // one Video load. Let the player drain/finish this immutable generation
+      // and reopen through its bounded live recovery path.
+    } else {
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, playbackProviderURL);
+    }
     let playlistProfile = hlsPlaylistProfile({ preview: identity.preview, client: target.client });
     let manifestReady = false;
     // At most two bounded fallbacks are allowed. Accurate probe metadata
@@ -3404,7 +3438,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         generatedSeconds: () => job.generatedSeconds,
         requiredSegments: playlistProfile.startupSegments,
       });
-      if (manifestReady || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
+      if (manifestReady || pinnedGeneration || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
       // The provider refused the connection (rate limit, geo/auth block). No
       // ffmpeg strategy fixes that - stop the fallback cascade and cache the
       // refusal so the client's retries do not keep hitting the line.
@@ -3512,6 +3546,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       // the already-authenticated media playlist from this same generation.
       const mediaPlaylistUrl = new URL(req.originalUrl, 'http://localhost');
       mediaPlaylistUrl.searchParams.set('media', '1');
+      if (req.params.kind === 'channel') mediaPlaylistUrl.searchParams.set('generation', job.generationId);
       const measured = await measureLocalHlsPlaylistBitrate(manifestText, job.directory);
       let bitrate = measured || DEFAULT_ROKU_FALLBACK_BITRATE;
       if (req.params.kind === 'channel') {
