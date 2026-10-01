@@ -1,5 +1,7 @@
 import 'dotenv/config';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
+import { waitForHlsManifest } from './hls-startup.js';
+import { measuredHlsPreparedRange } from './hls-prepared-range.js';
 import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
 import express from 'express';
 import cors from 'cors';
@@ -78,7 +80,7 @@ const mediaStreamIdleTimeoutMs = Math.max(10_000, Number.parseInt(process.env.ME
 // Full-speed read of the opening seconds of a VOD so the first HLS segment is
 // written in ~1s rather than waiting a real GOP under -readrate pacing. Needs a
 // modern FFmpeg (-readrate_initial_burst); keep 0 on builds that lack it.
-const hlsVodInitialBurstSeconds = Math.max(0, Number.parseInt(process.env.HLS_VOD_INITIAL_BURST_SECONDS || '0', 10) || 0);
+const hlsVodInitialBurstSeconds = Math.min(12, Math.max(0, Number.parseInt(process.env.HLS_VOD_INITIAL_BURST_SECONDS || '0', 10) || 0));
 const hlsVodReadrate = Math.max(1, Number.parseFloat(process.env.HLS_VOD_READRATE || '1') || 1);
 const codecProbeTtlMs = Math.max(60_000, Number.parseInt(process.env.CODEC_PROBE_TTL_MS || '21600000', 10) || 21_600_000);
 const codecProbeMaxEntries = Math.max(16, Number.parseInt(process.env.CODEC_PROBE_MAX_ENTRIES || '256', 10) || 256);
@@ -2869,25 +2871,6 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   res.send(responseManifest);
 }
 
-async function waitForHlsManifest(filename, timeoutMs = 15_000, signal, isFinished = () => false, requiredSegments = 1) {
-  const started = Date.now();
-  while (Date.now() - started < timeoutMs) {
-    if (signal?.aborted) throw signal.reason || new Error('Manifest request cancelled');
-    try {
-      const manifest = await fs.readFile(filename, 'utf8');
-      const segmentCount = manifest.split('\n').filter(line => /^segment-\d{6}\.(?:ts|m4s)$/.test(line.trim())).length;
-      // A deep restart at the end of a VOD may legitimately contain only its
-      // final short segment. ENDLIST makes that one segment a complete,
-      // playable response; waiting for the normal three-segment startup
-      // cushion can never succeed and makes Roku loop forever at 13%.
-      if (segmentCount >= requiredSegments || (segmentCount > 0 && manifest.includes('#EXT-X-ENDLIST'))) return true;
-    } catch { /* ffmpeg has not produced the first segment yet */ }
-    if (isFinished()) return false;
-    await new Promise(resolve => setTimeout(resolve, 75));
-  }
-  return false;
-}
-
 async function completedHlsManifestAvailable(filename) {
   try {
     const manifest = await fs.readFile(filename, 'utf8');
@@ -3218,9 +3201,53 @@ setInterval(async () => {
   evictNativeHlsSessions();
   if (pressure.soft) { evictXtreamCache(Date.now(), true); evictM3uCache(Date.now(), true); evictPreviewCache(Date.now(), true); }
   await mediaJobs.sweep({ aggressive: pressure.hard });
-  await Promise.allSettled([...mediaJobs.values()].filter(job => job.persistent).map(enforceHlsFileBound));
+  await Promise.allSettled([...mediaJobs.values()].filter(job => job.persistent).map(async job => {
+    await enforceHlsFileBound(job);
+    // Track complete durations before the rolling manifest drops old entries,
+    // even when the Roku transport overlay is hidden.
+    if (job.client === PlaybackClient.ROKU && ['movie', 'series'].includes(job.kind)) await readHlsPreparedRange(job);
+  }));
   } finally { mediaHousekeepingRunning = false; }
 }, 5_000).unref();
+
+async function readHlsPreparedRange(job) {
+  if (!job?.manifest || !job.generationId) return null;
+  try {
+    const manifest = await fs.readFile(job.manifest, 'utf8');
+    // Serialize the cursor update after the read; simultaneous polling and
+    // housekeeping must not double-count an overlapping playlist.
+    const measured = measuredHlsPreparedRange(manifest, job.generationId, job.startSeconds, job.preparedTimeline);
+    if (!measured || measured.nextSequence === 0) return null;
+    await fs.access(path.join(job.directory, `segment-${String(measured.nextSequence - 1).padStart(6, '0')}.${job.hlsSegmentType === 'fmp4' ? 'm4s' : 'ts'}`));
+    // A newer read may have advanced during the file check. Keep its cursor.
+    if (!job.preparedTimeline || measured.nextSequence > job.preparedTimeline.nextSequence
+      || (measured.nextSequence === job.preparedTimeline.nextSequence && measured.availableStartSeconds > job.preparedTimeline.availableStartSeconds)) job.preparedTimeline = measured;
+    return job.preparedTimeline;
+  } catch { return null; }
+}
+
+app.get('/api/xtream/hls/:sourceId/:kind/:id/prepared-range', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  try {
+    if (!['movie', 'series'].includes(req.params.kind)) return res.sendStatus(404);
+    const owner = requestAccountOwner(req);
+    if (!owner) return res.sendStatus(401);
+    const source = await getXtreamSource(req.params.sourceId, owner);
+    if (!source) return res.sendStatus(404);
+    const identity = mediaIdentity(req);
+    const target = playbackTarget(req);
+    if (target.client !== PlaybackClient.ROKU) return res.sendStatus(404);
+    const key = hlsPlaybackJobKey(source._id, req.params.kind, req.params.id, req.query.ext,
+      hlsStartSeconds(req.query.start), identity, target, requestedHlsFallback(req));
+    const job = mediaJobs.get(key);
+    if (!job || job.userId !== identity.userId || !samePlaybackViewer(job, identity)) return res.sendStatus(404);
+    const range = await readHlsPreparedRange(job);
+    if (mediaJobs.get(key) !== job) return res.sendStatus(404);
+    res.json({ ready: Boolean(range), generationId: job.generationId,
+      baseSeconds: range?.startSeconds || 0,
+      startSeconds: range?.availableStartSeconds || 0, endSeconds: range?.endSeconds || 0 });
+  } catch { res.sendStatus(500); }
+});
 
 // Report measured HLS startup work while the first manifest request is still
 // waiting for FFmpeg. The percentage is capped before the browser downloads
@@ -3365,7 +3392,18 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       // beyond that, do not spend the remaining startup window on another
       // video-copy attempt with the same sparse-keyframe limitation.
       const firstAttemptTimeout = hlsManifestStartupTimeoutMs({ seekableVod, client: target.client, strategy: job.hlsStrategy });
-      manifestReady = await waitForHlsManifest(job.manifest, attempt === 0 ? firstAttemptTimeout : 20_000, requestAbort.signal, () => job.finished === true, playlistProfile.startupSegments);
+      const startupTimeout = attempt === 0 ? firstAttemptTimeout : 20_000;
+      // Roku's 25s inactivity watchdog needs room for the response/download.
+      // Keep the existing larger transcode budgets; extend short remux waits
+      // only while FFmpeg output or completed-segment count really advances.
+      const maxStartupWait = target.client === PlaybackClient.ROKU
+        ? Math.max(startupTimeout, 23_000) : startupTimeout;
+      manifestReady = await waitForHlsManifest(job.manifest, {
+        timeoutMs: startupTimeout, maxWaitMs: maxStartupWait,
+        signal: requestAbort.signal, isFinished: () => job.finished === true,
+        generatedSeconds: () => job.generatedSeconds,
+        requiredSegments: playlistProfile.startupSegments,
+      });
       if (manifestReady || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
       // The provider refused the connection (rate limit, geo/auth block). No
       // ffmpeg strategy fixes that - stop the fallback cascade and cache the

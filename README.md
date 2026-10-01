@@ -48,6 +48,34 @@ MEDIA_TEST_PLAYBACK_PATH='/api/xtream/hls/.../master.m3u8' \
 npm run test:media-leak
 ```
 
+## Roku HLS startup
+
+The OVH Roku service uses `node:24-trixie-slim` for FFmpeg 7.1 and sets
+`HLS_VOD_INITIAL_BURST_SECONDS=12`, capped at 12 seconds in the server.
+`HLS_VOD_READRATE=1` resumes real-time input pacing after this initial burst.
+Each VOD startup, seek, and pipeline recovery gets the same bounded burst;
+live inputs keep their provider pacing. Older FFmpeg deployments must leave
+the burst at its default of zero.
+
+Roku still waits for three complete, keyframe-safe segments. Its short HLS
+manifest wait can extend while FFmpeg output time or completed-segment count
+advances, with a 23-second absolute cap (existing longer transcode budgets
+remain unchanged). Stalled jobs retain their inactivity timeout. Cancellation,
+finished jobs, and a short final ENDLIST remain bounded.
+
+Run `node scripts/check-hls-startup.js` inside the upgraded image to compare
+cold startup and seeking against paced input without the burst. This offline
+benchmark also checks segment decoding, opening keyframes, and steady pacing.
+
+The Roku progress bar shows completed HLS media ahead of playback in yellow.
+`GET /api/xtream/hls/:sourceId/:kind/:id/prepared-range` reads the existing
+job only, under its account owner and active viewer. It reports the immutable
+generation, restart base, currently advertised range start, and completed
+range end. The server maintains a bounded duration cursor across rolling
+manifests; it does not estimate the range from FFmpeg progress. The Roku
+client ignores cancelled/older-URL requests and hides the range while a seek
+is pending. Live channels and Direct playback do not show this VOD range.
+
 ## Self-hosted deployment
 
 This service runs on the local machine only, managed by the systemd units in
