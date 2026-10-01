@@ -88,6 +88,8 @@ const maxDirectStreamsPerSource = Math.max(1, Number.parseInt(process.env.MAX_DI
 const streamTicketSecret = process.env.DEVICE_AUTH_SECRET || 'local-development-secret-change-before-production';
 const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
+const codecProbeWaiters = [];
+let activeCodecProbes = 0;
 const playbackTraceId = req => String(req.query.traceId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 36) || randomUUID().slice(0, 12);
 const playbackSourceHash = url => createHash('sha256').update(String(url)).digest('hex').slice(0, 16);
 // VOD runtime (seconds) learned while a title is streaming - from the codec
@@ -320,6 +322,20 @@ function markProviderUnavailable(cacheKey, message, ttlMs = 25_000) {
   evictCodecProbeCache();
 }
 
+async function acquireCodecProbeSlot() {
+  if (activeCodecProbes < maxCodecProbes) {
+    activeCodecProbes += 1;
+    return;
+  }
+  await new Promise(resolve => codecProbeWaiters.push(resolve));
+}
+
+function releaseCodecProbeSlot() {
+  const next = codecProbeWaiters.shift();
+  if (next) next();
+  else activeCodecProbes = Math.max(0, activeCodecProbes - 1);
+}
+
 async function inspectProviderCodecs(inputUrl, deepProbe = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffprobeBin, [
@@ -329,7 +345,7 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
       // bounded scan so Roku receives actual codec names instead of Unknown.
       '-probesize', deepProbe ? '16777216' : '1048576',
       '-analyzeduration', deepProbe ? '12000000' : '3000000',
-      '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:format=format_name,duration,bit_rate',
+      '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:stream_disposition=attached_pic:format=format_name,duration,bit_rate',
       '-of', 'json', inputUrl,
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
     let output = '';
@@ -354,7 +370,10 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
       try {
         const probe = JSON.parse(output);
         const streams = probe.streams || [];
-        const video = streams.find(stream => stream.codec_type === 'video') || {};
+        const videoStreams = streams.filter(stream => stream.codec_type === 'video');
+        // Some providers place a cover image before the actual video stream.
+        // Base compatibility on a moving-picture stream whenever one exists.
+        const video = videoStreams.find(stream => !stream.disposition?.attached_pic) || videoStreams[0] || {};
         const audioStreams = streams.filter(stream => stream.codec_type === 'audio');
         const audio = audioStreams[0] || {};
         const metadata = {
@@ -362,6 +381,11 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
           containerSeconds: Math.max(0, Math.round(Number(probe.format?.duration) || 0)),
           probeBitrate: Math.max(0, Math.round(Number(probe.format?.bit_rate) || 0)),
           videoCodec: String(video.codec_name || ''),
+          videoTracks: videoStreams.map((stream, index) => ({
+            index, codec: String(stream.codec_name || ''), profile: String(stream.profile || ''),
+            width: Number(stream.width) || 0, height: Number(stream.height) || 0,
+            attachedPicture: Boolean(stream.disposition?.attached_pic),
+          })),
           videoProfile: String(video.profile || ''),
           videoLevel: Number(video.level) || 0,
           pixelFormat: String(video.pix_fmt || ''),
@@ -380,16 +404,41 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
             channelLayout: String(stream.channel_layout || ''),
           })),
         };
+        if (deepProbe && (!metadata.videoCodec || (audioStreams.length > 0 && !metadata.audioCodec))) {
+          console.warn(`[Media probe] cache=${cacheKey} incomplete video=${metadata.videoCodec || 'unknown'} audio=${metadata.audioCodec || 'unknown'} videoStreams=${videoStreams.length} audioStreams=${audioStreams.length}`);
+        }
         if (!deepProbe && (!metadata.videoCodec || !metadata.audioCodec)) {
           inspectProviderCodecs(inputUrl, true)
-            .then(deep => finish(null, {
+          .then(deep => finish(null, {
               ...metadata,
               ...deep,
+              // A second scan may identify additional streams without
+              // returning every field from the first scan. Preserve any
+              // concrete shallow-probe facts instead of replacing them with
+              // empty strings or zeroes from the deeper result.
+              videoCodec: deep.videoCodec || metadata.videoCodec,
+              videoTracks: deep.videoTracks?.some(track => track.codec) ? deep.videoTracks : metadata.videoTracks,
+              videoProfile: deep.videoProfile || metadata.videoProfile,
+              videoLevel: deep.videoLevel || metadata.videoLevel,
+              pixelFormat: deep.pixelFormat || metadata.pixelFormat,
+              videoBitDepth: deep.videoBitDepth || metadata.videoBitDepth,
+              width: deep.width || metadata.width,
+              height: deep.height || metadata.height,
+              frameRate: deep.frameRate || metadata.frameRate,
+              audioCodec: deep.audioCodec || metadata.audioCodec,
+              audioProfile: deep.audioProfile || metadata.audioProfile,
+              audioSampleRate: deep.audioSampleRate || metadata.audioSampleRate,
+              audioChannels: deep.audioChannels || metadata.audioChannels,
+              audioChannelLayout: deep.audioChannelLayout || metadata.audioChannelLayout,
+              audioTracks: deep.audioTracks?.length ? deep.audioTracks : metadata.audioTracks,
               container: deep.container || metadata.container,
               containerSeconds: deep.containerSeconds || metadata.containerSeconds,
               probeBitrate: deep.probeBitrate || metadata.probeBitrate,
             }))
-            .catch(() => finish(null, metadata));
+            .catch(error => {
+              console.warn(`[Media probe] cache=${cacheKey} deep scan failed type=${error.name || 'Error'}`);
+              finish(null, metadata);
+            });
           return;
         }
         finish(null, metadata);
@@ -448,7 +497,21 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
   const cached = codecProbeCache.get(cacheKey);
   if (cached?.expiresAt > Date.now()) return cached.metadata;
   if (codecProbesInFlight.has(cacheKey)) return codecProbesInFlight.get(cacheKey);
-  if (codecProbesInFlight.size >= maxCodecProbes) return {};
+  // A busy probe pool is not a reason to tell clients that every codec is
+  // unknown. Queue distinct items behind the bounded pool, then recheck the
+  // cache/in-flight map because another request may have probed this item
+  // while it waited.
+  await acquireCodecProbeSlot();
+  evictCodecProbeCache();
+  const queuedCached = codecProbeCache.get(cacheKey);
+  if (queuedCached?.expiresAt > Date.now()) {
+    releaseCodecProbeSlot();
+    return queuedCached.metadata;
+  }
+  if (codecProbesInFlight.has(cacheKey)) {
+    releaseCodecProbeSlot();
+    return codecProbesInFlight.get(cacheKey);
+  }
 
   const pending = inspectProviderCodecs(inputUrl)
     .then(metadata => {
@@ -475,7 +538,10 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
     });
   codecProbesInFlight.set(cacheKey, pending);
   try { return await pending; }
-  finally { codecProbesInFlight.delete(cacheKey); }
+  finally {
+    codecProbesInFlight.delete(cacheKey);
+    releaseCodecProbeSlot();
+  }
 }
 
 function redactSensitiveUrl(value) {
