@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { videoTimestampFacts, mergeProbeFacts } from '../codec-probe.js';
+import { videoTimestampFacts, mergeProbeFacts, copiedVideoNeedsNormalization } from '../codec-probe.js';
 import { getPlaybackCapabilities, hlsCodecArgs, confidentDirectPlayback } from '../playback-strategy.js';
 import { selectEnabledHlsForMedia } from '../stream-strategy-selection.js';
 const media = {container:'matroska',videoCodec:'h264',videoProfile:'High',videoLevel:41,pixelFormat:'yuv420p',width:1920,height:1032,frameRate:'24',audioCodec:'aac',audioChannels:6,audioSampleRate:48000};
@@ -30,4 +30,11 @@ test('timing correction only changes video under checked video/full conversion',
   assert.equal(args.includes('-fps_mode:v'),videoMode==='transcode');
   assert.equal(args.includes('aresample=async=1:first_pts=0'),strategy==='HLS_FULL_TRANSCODE');
  }
+});
+
+test('seek audio gaps require video normalization without silently changing Audio mode',()=>{
+ assert.equal(copiedVideoNeedsNormalization({audioVideoStartDelta:6.24},{startSeconds:16.7,audioMode:'transcode'}),true);
+ assert.equal(copiedVideoNeedsNormalization({audioVideoStartDelta:.08},{startSeconds:16.7,audioMode:'transcode'}),false);
+ assert.equal(copiedVideoNeedsNormalization({},{startSeconds:16.7,audioMode:'transcode'}),false);
+ assert.equal(copiedVideoNeedsNormalization({videoTimingReliable:false}),true);
 });

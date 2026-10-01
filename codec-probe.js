@@ -37,6 +37,8 @@ export function normalizeProbe(probe, { deep = false } = {}) {
     height: Number(video.height) || 0,
     frameRate: String(normalizeFrameRate(video.avg_frame_rate) || normalizeFrameRate(video.r_frame_rate) || ''),
     audioCodec: factText(audio.codec_name),
+    ...(Number.isFinite(Number(video.start_time)) && Number.isFinite(Number(audio.start_time))
+      ? { audioVideoStartDelta: Number(audio.start_time) - Number(video.start_time) } : {}),
     audioStreamStatus: audioStreams.length ? 'present' : deep ? 'absent' : 'unknown',
     audioProfile: String(audio.profile || ''),
     audioSampleRate: Number(audio.sample_rate) || 0,
@@ -61,6 +63,11 @@ export function videoTimestampFacts(frames) {
     .filter(Number.isFinite);
   if (times.length < 3) return {};
   return { videoTimingReliable: !times.some((time, index) => index > 0 && time <= times[index - 1]) };
+}
+
+export function copiedVideoNeedsNormalization(facts, { startSeconds = 0, audioMode = 'copy' } = {}) {
+  return facts.videoTimingReliable === false || (startSeconds > 0 && audioMode === 'transcode'
+    && Math.abs(Number(facts.audioVideoStartDelta) || 0) > 0.25);
 }
 
 export function missingProbeFacts(metadata = {}) {
@@ -89,7 +96,7 @@ export function mergeProbeFacts(first, next) {
   return merged;
 }
 
-const entries = 'frame=media_type,best_effort_timestamp_time:stream=index,codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:stream_disposition=attached_pic:format=format_name,duration,bit_rate';
+const entries = 'frame=media_type,best_effort_timestamp_time:stream=index,start_time,codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:stream_disposition=attached_pic:format=format_name,duration,bit_rate';
 export function runCodecScan(inputUrl, { deep = false, ffprobe = 'ffprobe', spawnProcess = spawn, timeoutMs = deep ? 65000 : 15000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnProcess(ffprobe, ['-v', 'error', '-rw_timeout', deep ? '60000000' : '12000000',

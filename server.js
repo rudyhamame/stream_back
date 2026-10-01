@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { inspectProviderCodecs, probeCacheTtl, missingProbeFacts, mergeProbeFacts, runCodecScan } from './codec-probe.js';
+import { inspectProviderCodecs, probeCacheTtl, missingProbeFacts, mergeProbeFacts, runCodecScan, copiedVideoNeedsNormalization } from './codec-probe.js';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
 import { waitForHlsManifest } from './hls-startup.js';
 import { measuredHlsPreparedRange } from './hls-prepared-range.js';
@@ -3312,11 +3312,11 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
           && job.hlsVideoMode === 'copy' && job.videoTimingChecked !== true) {
         const facts = await runCodecScan(path.join(job.directory, 'segment-000000.ts'), { ffprobe: ffprobeBin, timeoutMs: 3000 }).catch(() => ({}));
         job.videoTimingChecked = true;
-        if (facts.videoTimingReliable === false) {
+        if (copiedVideoNeedsNormalization(facts, { startSeconds, audioMode: job.hlsAudioMode })) {
           job.hlsDecision.requiredVideo = true;
           job.hlsDecision.videoKnown = Boolean(facts.videoCodec);
           manifestReady = false;
-          console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} copied video has invalid presentation timestamps; requesting checked normalization`);
+          console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} unsafe copied-video timing brokenFrames=${facts.videoTimingReliable === false} audioOffset=${facts.audioVideoStartDelta ?? 'unknown'}; requesting checked normalization`);
         }
       }
       if (manifestReady || pinnedGeneration || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
