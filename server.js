@@ -303,6 +303,25 @@ function appendTail(current, chunk, maxBytes = 8_000) {
   return `${current}${chunk}`.slice(-maxBytes);
 }
 
+function normalizeFrameRate(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw === '0/0') return '';
+  const [numerator, denominator] = raw.split('/').map(Number);
+  const fps = denominator ? numerator / denominator : Number(raw);
+  return Number.isFinite(fps) && fps > 0 ? String(Math.round(fps * 1000) / 1000) : '';
+}
+
+function safeProbeError(error) {
+  return String(error?.message || error || 'Unknown FFprobe error')
+    .replace(/https?:\/\/[^\s"'<>]+/gi, value => {
+      try {
+        const url = new URL(value);
+        return `${url.protocol}//${url.host}/[provider-url-redacted]`;
+      } catch { return '[provider-url-redacted]'; }
+    })
+    .slice(0, 200);
+}
+
 function evictCodecProbeCache(now = Date.now()) {
   for (const [key, entry] of codecProbeCache) if (entry.expiresAt <= now) codecProbeCache.delete(key);
   while (codecProbeCache.size > codecProbeMaxEntries) codecProbeCache.delete(codecProbeCache.keys().next().value);
@@ -436,13 +455,15 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
               probeBitrate: deep.probeBitrate || metadata.probeBitrate,
             }))
             .catch(error => {
-              console.warn(`[Media probe] cache=${cacheKey} deep scan failed type=${error.name || 'Error'}`);
+              console.warn(`[Media probe] cache=${cacheKey} deep scan failed type=${error.name || 'Error'} detail=${safeProbeError(error)}`);
               finish(null, metadata);
             });
           return;
         }
         finish(null, metadata);
-      } catch { finish(new Error('Codec probe returned invalid metadata')); }
+      } catch (error) {
+        finish(new Error(`Codec probe returned invalid metadata: ${safeProbeError(error)}`));
+      }
     });
   });
 }
@@ -521,7 +542,7 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
       return metadata;
     })
     .catch(error => {
-      console.warn(`[Media probe] cache=${cacheKey} unavailable type=${error.name || 'Error'}`);
+      console.warn(`[Media probe] cache=${cacheKey} unavailable type=${error.name || 'Error'} detail=${safeProbeError(error)}`);
       // A hard provider refusal (expired line / no VOD / IP block) will fail
       // ffmpeg the same way - surface it so the caller can stop fast instead
       // of burning the whole startup window on transcode retries. Cache it
