@@ -26,7 +26,7 @@ export function hlsChildRequestQuery(query = {}, startSeconds = 0) {
   // must retain that job identity or the segment route looks up the normal
   // stream and returns 404 for every recovery segment.
   const hlsFallback = String(query.hlsFallback || '').trim().toLowerCase();
-  if (['remux', 'audio', 'video', 'partial', 'full'].includes(hlsFallback)) params.set('hlsFallback', hlsFallback);
+  if (['remux', 'audio', 'video', 'partial', 'full', 'decoder-video', 'decoder-audio'].includes(hlsFallback)) params.set('hlsFallback', hlsFallback);
   const playbackAttemptId = String(query.playbackAttemptId || '').trim();
   if (/^\d{1,9}$/.test(playbackAttemptId)) params.set('playbackAttemptId', playbackAttemptId);
   const sessionId = String(query.sessionId || '').trim();

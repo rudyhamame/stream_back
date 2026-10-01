@@ -33,6 +33,10 @@ import { accountOwnerId } from './account-library-owner.js';
 import { checkInternetConnection } from './internet-health.js';
 import { getStreamStrategyPolicy, saveStreamStrategyPolicy } from './stream-strategy-policy.js';
 import { copyMediaHeaders, openProviderMedia } from './direct-media-proxy.js';
+import { isProviderRefusal } from './provider-refusal.js';
+import { arabicText, freshDashboardTimes, rokuPage, rokuPagePayload, detectXtreamLanguage, titleLanguageCode, displayDuration } from './roku-catalog-format.js';
+import { createLiveBitrateCache } from './live-bitrate-cache.js';
+import { createNativeHlsSessionCache } from './native-hls-session-cache.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -45,7 +49,6 @@ const ffmpegBin = process.env.FFMPEG_BIN || 'ffmpeg';
 const ffprobeBin = process.env.FFPROBE_BIN || 'ffprobe';
 const dashboardCache = new Map();
 const previewCache = new Map();
-const arabicText = /[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]/;
 const rokuText = (value) => arabicText.test(String(value || '')) ? shapeArabicForRoku(value) : String(value || '');
 // Roku cannot reliably receive a JSON document containing a provider's entire
 // catalog (this source alone has 44,995 series). Keep the initial screen fast;
@@ -115,14 +118,18 @@ const browserDirectSessions = new Map();
 const activeBrowserDirectRequests = new Map();
 const browserDirectSessionTtlMs = 8 * 60 * 60 * 1000;
 const browserDirectSessionMaxEntries = 2000;
-const nativeHlsSessions = new Map();
 const nativeHlsSessionTtlMs = 60_000;
-const nativeHlsSessionMaxEntries = 16;
-const liveBitrateMeasurements = new Map();
+const { sessions: nativeHlsSessions, get: nativeHlsSession, evict: evictNativeHlsSessions } = createNativeHlsSessionCache({ ttlMs: nativeHlsSessionTtlMs });
 const liveBitrateSampleTarget = Math.min(12, Math.max(2, Number.parseInt(process.env.LIVE_HLS_BITRATE_SAMPLE_TARGET || '8', 10) || 8));
 const liveBitrateRollingSamples = Math.min(20, Math.max(liveBitrateSampleTarget, Number.parseInt(process.env.LIVE_HLS_BITRATE_ROLLING_SAMPLES || '16', 10) || 16));
 const liveBitrateSafetyFactor = Math.min(1.5, Math.max(1, Number.parseFloat(process.env.LIVE_HLS_BITRATE_SAFETY_FACTOR || '1.10') || 1.10));
 const liveBitrateTtlMs = Math.max(60_000, Number.parseInt(process.env.LIVE_HLS_BITRATE_TTL_MS || '600000', 10) || 600_000);
+const liveBitrateCache = createLiveBitrateCache({
+  sampleTarget: liveBitrateSampleTarget,
+  rollingSamples: liveBitrateRollingSamples,
+  safetyFactor: liveBitrateSafetyFactor,
+  ttlMs: liveBitrateTtlMs,
+});
 let previewCacheBytes = 0;
 let shuttingDown = false;
 let mediaRequestSequence = 0;
@@ -309,7 +316,6 @@ function evictCodecProbeCache(now = Date.now()) {
 // retrying client (hls.js retries ~5x, each restart re-probes) does not hammer an
 // already-refusing line and make the rate limit worse.
 // ponytail: string-match on ffmpeg stderr; upgrade path is a structured exit only if this misclassifies.
-const providerRefusalPattern = /error opening input|server returned \d?4\d\d|http error 4\d\d|\b(40[134]|402|405|406|408|409|423|429|451)\b|forbidden|access denied|not found|too many requests|connection limit/i;
 
 function markProviderUnavailable(cacheKey, message, ttlMs = 25_000) {
   if (!cacheKey) return;
@@ -516,6 +522,8 @@ function playbackTarget(req) {
 // strategies and never changes the normal first-choice decision.
 function requestedHlsFallback(req) {
   const value = String(req.query.hlsFallback || '').trim().toLowerCase();
+  if (req.params?.kind === 'channel' && playbackTarget(req).client === PlaybackClient.ROKU
+      && (value === 'decoder-video' || value === 'decoder-audio')) return value;
   if (value === 'full' || value === HLS_MODE.FULL.toLowerCase()) return 'full';
   if (value === 'remux' || value === HLS_MODE.REMUX.toLowerCase()) return 'remux';
   if (value === 'audio' || value === HLS_MODE.AUDIO.toLowerCase()) return 'audio';
@@ -544,7 +552,7 @@ async function providerCodecMetadata(cacheKey, inputUrl) {
       // of burning the whole startup window on transcode retries. Cache it
       // briefly so a Roku that re-polls the manifest every few seconds does
       // not hammer an already-refusing provider.
-      if (providerRefusalPattern.test(String(error.message || ''))) {
+      if (isProviderRefusal(error.message)) {
         // Auth/geo blocks stay cached longer; rate limits clear faster so a
         // recovered line becomes playable again without a long dead window.
         const hardBlock = /\b(401|403|404)\b|forbidden|access denied|not found/i.test(String(error.message || ''));
@@ -695,73 +703,6 @@ function requestAccountOwner(req) {
 
 function mediaOwner(req) {
   return requestOwner(req) || resolveStreamTicket(requestStreamTicket(req), req.params.sourceId, req.params.kind, req.params.id)?.ownerId || null;
-}
-
-function cityIsoMinute(timeZone) {
-  const values = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
-    timeZone, year: 'numeric', month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hourCycle: 'h23',
-  }).formatToParts(new Date()).filter(part => part.type !== 'literal').map(part => [part.type, part.value]));
-  return `${values.year}-${values.month}-${values.day}T${values.hour}:${values.minute}`;
-}
-
-function freshDashboardTimes(data) {
-  return { ...data, cities: (data?.cities || []).map(city => ({
-    ...city,
-    time: cityIsoMinute(city.timezone || 'UTC'),
-  })) };
-}
-
-function rokuPage(req, defaultLimit) {
-  const page = Math.max(0, Number.parseInt(req.query.page || '0', 10) || 0);
-  const requestedLimit = Number.parseInt(req.query.limit || String(defaultLimit), 10);
-  const limit = Math.min(200, Math.max(1, Number.isFinite(requestedLimit) ? requestedLimit : defaultLimit));
-  return { page, limit, offset: page * limit };
-}
-
-function rokuPagePayload(items, pageInfo) {
-  const total = items.length;
-  const pageItems = items.slice(pageInfo.offset, pageInfo.offset + pageInfo.limit);
-  return { items: pageItems, page: pageInfo.page, limit: pageInfo.limit, total, hasMore: pageInfo.offset + pageItems.length < total };
-}
-
-function detectXtreamLanguage(item, category) {
-  const text = `${category || ''} ${item.title || ''}`;
-  const categoryCode = String(category || '').match(/^\s*([A-Za-z]{2})\s*(?:[|:\-]|$)/)?.[1]?.toUpperCase();
-  const categoryLanguages = {
-    AR: 'Arabic', EN: 'English', AF: 'Afghan', AL: 'Albanian', BE: 'Belarusian', BG: 'Bulgarian',
-    DE: 'German', ES: 'Spanish', FR: 'French', HI: 'Hindi', IT: 'Italian', KU: 'Kurdish',
-    PT: 'Portuguese', RU: 'Russian', TR: 'Turkish', UR: 'Urdu', FA: 'Persian', NL: 'Dutch',
-  };
-  if (categoryCode) return categoryLanguages[categoryCode] || categoryCode;
-  if (arabicText.test(text) || /\b(arabic|arab|ar)\b/i.test(text)) return 'Arabic';
-  const rules = [
-    ['English', /\b(english|eng|en)\b/i], ['French', /\b(french|francais|fr)\b/i],
-    ['Turkish', /\b(turkish|turk|tr)\b/i], ['Spanish', /\b(spanish|espanol|es)\b/i],
-    ['German', /\b(german|deutsch|de)\b/i], ['Italian', /\b(italian|italiano|it)\b/i],
-    ['Portuguese', /\b(portuguese|portugues|pt)\b/i], ['Russian', /\b(russian|ru)\b/i],
-    ['Hindi', /\b(hindi|hi)\b/i], ['Urdu', /\b(urdu|ur)\b/i],
-    ['Persian', /\b(persian|farsi|fa)\b/i], ['Kurdish', /\b(kurdish|kurd|ku)\b/i],
-  ];
-  for (const [language, pattern] of rules) if (pattern.test(text)) return language;
-  return 'Other';
-}
-
-function titleLanguageCode(item) {
-  const match = String(item?.title || '').match(/^\s*([A-Za-z]{2})\s*(?:[-|:])/);
-  return match ? match[1].toUpperCase() : 'OTHER';
-}
-
-function displayDuration(value) {
-  const raw = String(value ?? '').trim();
-  if (!raw) return '';
-  if (/^\d{1,2}:\d{2}(?::\d{2})?$/.test(raw)) return raw.length === 5 ? `00:${raw}` : raw;
-  const seconds = Number(raw);
-  if (!Number.isFinite(seconds) || seconds <= 0) return raw;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  const remaining = Math.floor(seconds % 60);
-  return [hours, minutes, remaining].map(part => String(part).padStart(2, '0')).join(':');
 }
 
 async function getAllXtreamItems(kind, accountOwner) {
@@ -1406,8 +1347,8 @@ function diagnosticsAuthorized(req) {
 
 app.get('/api/debug/live/:channelId/bitrate', (req, res) => {
   if (!diagnosticsAuthorized(req)) return res.sendStatus(404);
-  evictLiveBitrateMeasurements();
-  const matches = [...liveBitrateMeasurements.values()].filter(entry => entry.channelId === String(req.params.channelId));
+  liveBitrateCache.evict();
+  const matches = [...liveBitrateCache.measurements.values()].filter(entry => entry.channelId === String(req.params.channelId));
   if (!matches.length) return res.status(404).json({ error: 'No live bitrate measurement is cached for this channel' });
   const entry = matches.at(-1);
   res.set('Cache-Control', 'no-store');
@@ -2625,116 +2566,8 @@ function hlsPlaybackJobKey(sourceId, kind, id, extension, startSeconds, identity
     `${capabilityKey}${recoveryKey}${timingKey}`);
 }
 
-function evictNativeHlsSessions(now = Date.now()) {
-  for (const [key, session] of nativeHlsSessions) if (session.expiresAt <= now) nativeHlsSessions.delete(key);
-  while (nativeHlsSessions.size > nativeHlsSessionMaxEntries) nativeHlsSessions.delete(nativeHlsSessions.keys().next().value);
-}
-
-function nativeHlsSession(req, identity, create = false) {
-  evictNativeHlsSessions();
-  const key = rokuHlsKey(req.params.sourceId, 'channel', req.params.id, req.query.ext, 0);
-  let session = nativeHlsSessions.get(key);
-  if (session && session.userId && session.userId !== identity.userId) session = null;
-  if (!session && create) {
-    session = {
-      key,
-      userId: identity.userId,
-      viewerId: identity.viewerId,
-      viewers: new Set([identity.viewerId]),
-      resources: new Map(),
-      manifests: new Map(),
-      resourceBodies: new Map(),
-      segmentMetadata: new Map(),
-      bitrateSamples: new Map(),
-      timelineSequences: new Map(),
-      nextTimelineSequence: 0,
-      cacheBust: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
-      expiresAt: Date.now() + nativeHlsSessionTtlMs,
-    };
-    nativeHlsSessions.set(key, session);
-    evictNativeHlsSessions();
-  }
-  if (session) {
-    if (identity.viewerId) session.viewers?.add(identity.viewerId);
-    session.expiresAt = Date.now() + nativeHlsSessionTtlMs;
-    nativeHlsSessions.delete(key);
-    nativeHlsSessions.set(key, session);
-  }
-  return session;
-}
-
-function liveBitrateKey(sourceId, channelId) {
-  return `${String(sourceId)}:channel:${String(channelId)}`;
-}
-
 function providerProbeCacheKey(sourceId, kind, mediaId, extension, inputUrl) {
   return `${sourceId}:${kind}:${mediaId}:${String(extension || '').toLowerCase()}:${createHash('sha256').update(String(inputUrl)).digest('hex').slice(0, 16)}`;
-}
-
-function evictLiveBitrateMeasurements(now = Date.now()) {
-  for (const [key, entry] of liveBitrateMeasurements) if (entry.expiresAt <= now) liveBitrateMeasurements.delete(key);
-  while (liveBitrateMeasurements.size > 128) liveBitrateMeasurements.delete(liveBitrateMeasurements.keys().next().value);
-}
-
-function liveBitrateMeasurement(sourceId, channelId) {
-  evictLiveBitrateMeasurements();
-  const entry = liveBitrateMeasurements.get(liveBitrateKey(sourceId, channelId));
-  return entry?.expiresAt > Date.now() ? entry : null;
-}
-
-function bitrateMbps(value) {
-  return `${(Number(value || 0) / 1_000_000).toFixed(2)}Mbps`;
-}
-
-function logLiveBitrate(entry) {
-  const measurement = entry.measurement || {};
-  const parts = [
-    `[RH:HLS:BITRATE] channel=${entry.channelId}`,
-    `playlist=${entry.playlistType === HlsPlaylistType.MASTER ? 'MASTER' : entry.playlistType === HlsPlaylistType.MEDIA ? 'MEDIA' : 'UNKNOWN'}`,
-    `source=${entry.bitrateSource}`,
-  ];
-  if (entry.sampleCount) parts.push(`samples=${entry.sampleCount}`, `avg=${bitrateMbps(entry.averageBandwidth)}`, `peak=${bitrateMbps(measurement.peakBandwidth)}`);
-  parts.push(`advertised=${bitrateMbps(entry.bandwidth)}`, `fallback=${entry.fallbackUsed === true}`);
-  if (entry.reason) parts.push(`reason=${String(entry.reason).replace(/\s+/g, '-')}`);
-  console.log(parts.join(' '));
-}
-
-function storeLiveBitrateMeasurement(sourceId, channelId, details) {
-  const now = Date.now();
-  const key = liveBitrateKey(sourceId, channelId);
-  const prior = liveBitrateMeasurements.get(key);
-  const samples = Array.isArray(details.samples) ? details.samples.slice(-liveBitrateRollingSamples) : (prior?.samples || []);
-  let bandwidth = Number(details.bandwidth) || 0;
-  let averageBandwidth = Number(details.averageBandwidth) || null;
-  const sameMeasuredSource = prior?.bitrateSource === HlsBitrateSource.MEASURED_SEGMENTS
-    && details.bitrateSource === HlsBitrateSource.MEASURED_SEGMENTS;
-  if (sameMeasuredSource && prior.bandwidth > 0 && Math.abs(bandwidth - prior.bandwidth) / prior.bandwidth < 0.05) bandwidth = prior.bandwidth;
-  if (sameMeasuredSource && prior.averageBandwidth > 0 && averageBandwidth > 0
-      && Math.abs(averageBandwidth - prior.averageBandwidth) / prior.averageBandwidth < 0.05) averageBandwidth = prior.averageBandwidth;
-  const entry = {
-    sourceId: String(sourceId),
-    channelId: String(channelId),
-    playlistType: details.playlistType || prior?.playlistType || HlsPlaylistType.UNKNOWN,
-    provider: details.provider || prior?.provider || { bandwidth: null, averageBandwidth: null },
-    bandwidth,
-    averageBandwidth,
-    bitrateSource: details.bitrateSource || HlsBitrateSource.FALLBACK,
-    sampleCount: Number(details.sampleCount) || 0,
-    samples,
-    measurement: details.measurement || null,
-    fallbackUsed: details.bitrateSource === HlsBitrateSource.FALLBACK,
-    reason: details.reason || '',
-    measuredAt: new Date(now).toISOString(),
-    expiresAt: now + liveBitrateTtlMs,
-  };
-  liveBitrateMeasurements.delete(key);
-  liveBitrateMeasurements.set(key, entry);
-  evictLiveBitrateMeasurements(now);
-  const materialChange = !prior || prior.bitrateSource !== entry.bitrateSource
-    || prior.bandwidth <= 0 || Math.abs(entry.bandwidth - prior.bandwidth) / prior.bandwidth >= 0.05
-    || entry.sampleCount === liveBitrateSampleTarget;
-  if (materialChange) logLiveBitrate(entry);
-  return entry;
 }
 
 function rememberMediaSegmentMetadata(session, manifest, manifestUrl) {
@@ -2744,45 +2577,12 @@ function rememberMediaSegmentMetadata(session, manifest, manifestUrl) {
   return segments;
 }
 
-function recordLiveSegmentMeasurement(sourceId, channelId, session, segment, body, playlistType = HlsPlaylistType.MEDIA) {
-  const sample = createHlsSegmentBitrateSample(segment, body);
-  if (!sample) return liveBitrateMeasurement(sourceId, channelId);
-  const prior = liveBitrateMeasurement(sourceId, channelId);
-  const identity = `${sample.sequence}:${sample.url}`;
-  session.bitrateSamples.set(identity, sample);
-  while (session.bitrateSamples.size > liveBitrateRollingSamples) session.bitrateSamples.delete(session.bitrateSamples.keys().next().value);
-  const combined = new Map();
-  for (const value of prior?.samples || []) combined.set(`${value.sequence}:${value.url}`, value);
-  for (const [key, value] of session.bitrateSamples) combined.set(key, value);
-  const rolling = [...combined.values()].slice(-liveBitrateRollingSamples);
-  if (rolling.length < 2) return null;
-  const measured = measuredHlsBitrateMetadata(rolling, liveBitrateSafetyFactor);
-  return storeLiveBitrateMeasurement(sourceId, channelId, {
-    playlistType,
-    provider: { bandwidth: null, averageBandwidth: null },
-    bandwidth: measured.bandwidth,
-    averageBandwidth: measured.averageBandwidth,
-    bitrateSource: HlsBitrateSource.MEASURED_SEGMENTS,
-    sampleCount: measured.sampleCount,
-    samples: rolling,
-    measurement: {
-      sampleCount: measured.sampleCount,
-      totalSampleBytes: measured.totalSampleBytes,
-      totalSampleDurationSec: measured.totalSampleDurationSec,
-      averageBandwidth: measured.measuredAverageBandwidth,
-      peakBandwidth: measured.measuredPeakSegmentBandwidth,
-      normalizedBandwidth: measured.bandwidth,
-      safetyFactor: measured.safetyFactor,
-    },
-  });
-}
-
 async function measureProviderMediaPlaylist(sourceId, channelId, manifest, manifestUrl, session, signal, probeMetadata = null) {
-  const cached = liveBitrateMeasurement(sourceId, channelId);
+  const cached = liveBitrateCache.get(sourceId, channelId);
   if (cached && cached.bitrateSource !== HlsBitrateSource.FALLBACK && cached.sampleCount >= 2) return cached;
   const probeBitrate = Math.max(0, Math.round(Number(probeMetadata?.probeBitrate) || 0));
   if (probeBitrate > 0) {
-    return storeLiveBitrateMeasurement(sourceId, channelId, {
+    return liveBitrateCache.store(sourceId, channelId, {
       playlistType: HlsPlaylistType.MEDIA,
       provider: { bandwidth: null, averageBandwidth: null },
       bandwidth: Math.round(probeBitrate * liveBitrateSafetyFactor),
@@ -2821,19 +2621,10 @@ async function measureProviderMediaPlaylist(sourceId, channelId, manifest, manif
           while (session.resourceBodies.size > 32) session.resourceBodies.delete(session.resourceBodies.keys().next().value);
         } catch { continue; }
       }
-      recordLiveSegmentMeasurement(sourceId, channelId, session, segment, cachedBody.body);
+      liveBitrateCache.recordSegment(sourceId, channelId, session, segment, cachedBody.body);
     }
   });
-  return liveBitrateMeasurement(sourceId, channelId);
-}
-
-function fallbackLiveBitrate(sourceId, channelId, playlistType, reason) {
-  return storeLiveBitrateMeasurement(sourceId, channelId, {
-    playlistType,
-    provider: { bandwidth: null, averageBandwidth: null },
-    ...DEFAULT_ROKU_FALLBACK_BITRATE,
-    reason,
-  });
+  return liveBitrateCache.get(sourceId, channelId);
 }
 
 async function measureLocalHlsPlaylistBitrate(manifest, directory) {
@@ -3097,7 +2888,7 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
       const measured = await measureProviderMediaPlaylist(sourceId, channelId, manifest, manifestUrl, session, signal, cachedProbeMetadata);
       const bitrate = measured && measured.bitrateSource !== HlsBitrateSource.FALLBACK
         ? measured
-        : fallbackLiveBitrate(sourceId, channelId, playlistType, 'insufficient_measurement_samples');
+        : liveBitrateCache.fallback(sourceId, channelId, playlistType, 'insufficient_measurement_samples');
       const normalizedManifest = normalizeNativeHlsTimeline(manifest, manifestUrl, session);
       rememberMediaSegmentMetadata(session, normalizedManifest, manifestUrl);
       const stableManifest = await selectStableAndroidLiveStart(normalizedManifest, manifestUrl, session, signal);
@@ -3123,12 +2914,12 @@ async function serveNativeHlsManifest(req, res, upstreamUrl, session, signal) {
   const providerBitrate = providerMasterBitrateMetadata(manifest);
   console.log(`[RH:HLS:PLAYLIST] channel=${req.params.id} playlistType=MASTER_PLAYLIST providerBitrateMetadata=${providerBitrate ? 'VALID' : 'INVALID_OR_MISSING'}`);
   const bitrate = providerBitrate
-    ? storeLiveBitrateMeasurement(req.params.sourceId, req.params.id, {
+    ? liveBitrateCache.store(req.params.sourceId, req.params.id, {
         playlistType,
         provider: { bandwidth: providerBitrate.bandwidth, averageBandwidth: providerBitrate.averageBandwidth },
         ...providerBitrate,
       })
-    : fallbackLiveBitrate(req.params.sourceId, req.params.id, playlistType, 'invalid_or_missing_provider_bandwidth');
+    : liveBitrateCache.fallback(req.params.sourceId, req.params.id, playlistType, 'invalid_or_missing_provider_bandwidth');
   const responseManifest = normalizeHlsMasterForRoku(rewritten, bitrate);
   session.manifests.set(upstreamUrl, responseManifest);
   res.send(responseManifest);
@@ -3332,7 +3123,9 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const choice = seekableVod
     ? selectEnabledHlsForMedia(metadata, capabilities, enabledStrategies, { downscale, exact: exactStrategy })
     : selectEnabledHlsStrategy({ enabled: enabledStrategies, downscale,
-      exact: exactStrategy, videoKnown: true, audioKnown: true });
+      exact: exactStrategy, videoKnown: true, audioKnown: true,
+      videoCompatible: requestedMode !== 'decoder-video',
+      audioCompatible: requestedMode !== 'decoder-audio' });
   if (!choice) {
     const error = new Error(`No checked compatible HLS strategy for ${target.client}`);
     error.statusCode = 409;
@@ -3582,13 +3375,14 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
     const startSeconds = seekableVod ? hlsStartSeconds(req.query.start) : 0;
     const fastPreview = req.params.kind === 'channel' && String(req.query.preview || '') === '1';
+    const vodPreview = seekableVod && target.client === PlaybackClient.ROKU && String(req.query.preview || '') === '1';
     const nativeHlsDisabled = String(req.query.native || '') === '0';
     const identity = mediaIdentity(req);
-    identity.preview = fastPreview;
+    identity.preview = fastPreview || vodPreview;
     identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
     identity.timingProbeSignal = requestAbort.signal;
     identity.traceId = playbackTraceId(req);
-    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${fastPreview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
+    console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${identity.preview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
     if (req.params.kind === 'channel') {
       // If another device already caused a shared live transcode to start,
       // attach to that HLS output instead of opening a separate provider-native
@@ -3651,7 +3445,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       ? 'preview-remux'
       : explicitFallback;
     let job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, requestedFallback, playbackProviderURL);
-    let playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
+    let playlistProfile = hlsPlaylistProfile({ preview: identity.preview, client: target.client });
     let manifestReady = false;
     // At most two bounded fallbacks are allowed. Accurate probe metadata
     // should select the first strategy; retries exist only for an unexpected
@@ -3668,7 +3462,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       // The provider refused the connection (rate limit, geo/auth block). No
       // ffmpeg strategy fixes that - stop the fallback cascade and cache the
       // refusal so the client's retries do not keep hitting the line.
-      if (seekableVod && providerRefusalPattern.test(job.error || '')) {
+      if (seekableVod && isProviderRefusal(job.error)) {
         markProviderUnavailable(`${source._id}:${req.params.kind}:${req.params.id}:${String(req.query.ext || '').toLowerCase()}`, job.error);
         await mediaJobs.remove(job.key, 'provider-refused');
         break;
@@ -3690,11 +3484,11 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying checked ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
       await mediaJobs.remove(job.key, 'compatibility-fallback');
       job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, playbackProviderURL);
-      playlistProfile = hlsPlaylistProfile({ preview: fastPreview, client: target.client });
+      playlistProfile = hlsPlaylistProfile({ preview: identity.preview, client: target.client });
     }
     if (!manifestReady) {
       const detail = job.error.trim().slice(-240);
-      if (providerRefusalPattern.test(job.error || '')) {
+      if (isProviderRefusal(job.error)) {
         console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} provider refused: ${detail || 'none'}`);
         return res.status(502).json({ error: 'The playlist provider is refusing this stream right now (rate limit or block). Try again shortly.' });
       }
@@ -3777,7 +3571,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       let bitrate = measured || DEFAULT_ROKU_FALLBACK_BITRATE;
       if (req.params.kind === 'channel') {
         bitrate = measured
-          ? storeLiveBitrateMeasurement(req.params.sourceId, req.params.id, {
+          ? liveBitrateCache.store(req.params.sourceId, req.params.id, {
               playlistType: HlsPlaylistType.MEDIA,
               provider: { bandwidth: null, averageBandwidth: null },
               ...measured,
@@ -3792,7 +3586,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
                 safetyFactor: measured.safetyFactor,
               },
             })
-          : fallbackLiveBitrate(req.params.sourceId, req.params.id, HlsPlaylistType.MEDIA, 'insufficient_local_segment_samples');
+          : liveBitrateCache.fallback(req.params.sourceId, req.params.id, HlsPlaylistType.MEDIA, 'insufficient_local_segment_samples');
       }
       return res.send(rokuSingleVariantMaster(`${mediaPlaylistUrl.pathname}${mediaPlaylistUrl.search}`, bitrate));
     }
@@ -3868,7 +3662,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
       if (playlistType === HlsPlaylistType.MEDIA) rememberMediaSegmentMetadata(session, normalizedManifest, upstream.finalUrl);
       const manifest = playlistType === HlsPlaylistType.MEDIA
         ? await selectStableAndroidLiveStart(normalizedManifest, upstream.finalUrl, session, controller.signal)
-        : normalizeHlsMasterForRoku(normalizedManifest, liveBitrateMeasurement(req.params.sourceId, req.params.id) || DEFAULT_ROKU_FALLBACK_BITRATE);
+        : normalizeHlsMasterForRoku(normalizedManifest, liveBitrateCache.get(req.params.sourceId, req.params.id) || DEFAULT_ROKU_FALLBACK_BITRATE);
       const rewritten = rewriteHlsManifest(manifest, upstream.finalUrl, url => nativeHlsResourcePath(req, session, url));
       session.manifests.set(upstreamUrl, rewritten);
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
@@ -3877,7 +3671,7 @@ app.get('/api/xtream/hls/:sourceId/channel/:id/resource/:resourceId', async (req
     }
     if (!req.headers.range && upstream.status === 200) {
       const segment = session.segmentMetadata.get(upstreamUrl);
-      if (segment) recordLiveSegmentMeasurement(req.params.sourceId, req.params.id, session, segment, upstream.body);
+      if (segment) liveBitrateCache.recordSegment(req.params.sourceId, req.params.id, session, segment, upstream.body);
     }
     for (const name of ['content-length', 'content-range', 'content-type', 'etag', 'last-modified', 'accept-ranges']) {
       const value = upstream.headers.get(name);

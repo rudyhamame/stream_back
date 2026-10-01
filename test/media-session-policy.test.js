@@ -45,6 +45,8 @@ test('HLS child requests preserve explicit diagnostic modes and reject unknown i
   assert.equal(hlsChildRequestQuery({ hlsFallback: 'remux' }).get('hlsFallback'), 'remux');
   assert.equal(hlsChildRequestQuery({ hlsFallback: 'audio' }).get('hlsFallback'), 'audio');
   assert.equal(hlsChildRequestQuery({ hlsFallback: 'video' }).get('hlsFallback'), 'video');
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'decoder-video' }).get('hlsFallback'), 'decoder-video');
+  assert.equal(hlsChildRequestQuery({ hlsFallback: 'decoder-audio' }).get('hlsFallback'), 'decoder-audio');
   assert.equal(hlsChildRequestQuery({ hlsFallback: 'mystery' }).has('hlsFallback'), false);
 });
 
