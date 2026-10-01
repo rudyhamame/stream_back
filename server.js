@@ -358,12 +358,15 @@ function releaseCodecProbeSlot() {
 async function inspectProviderCodecs(inputUrl, deepProbe = false) {
   return new Promise((resolve, reject) => {
     const child = spawn(ffprobeBin, [
-      '-v', 'error', '-rw_timeout', deepProbe ? '30000000' : '12000000',
+      '-v', 'error', '-rw_timeout', deepProbe ? '60000000' : '12000000',
       // Provider files sometimes expose format metadata before ffprobe has
       // reached the audio/video stream headers. Retry those with a larger
-      // bounded scan so Roku receives actual codec names instead of Unknown.
-      '-probesize', deepProbe ? '16777216' : '1048576',
-      '-analyzeduration', deepProbe ? '12000000' : '3000000',
+      // bounded scan so clients receive codec, level, and timing facts instead
+      // of partial metadata. The deep limits allow a dispersed SPS/header to
+      // be found while keeping provider reads and startup delay bounded.
+      '-probesize', deepProbe ? '104857600' : '1048576',
+      '-max_probe_packets', deepProbe ? '10000' : '2500',
+      '-analyzeduration', deepProbe ? '30000000' : '3000000',
       '-show_entries', 'stream=codec_type,codec_name,profile,level,pix_fmt,bits_per_raw_sample,width,height,avg_frame_rate,r_frame_rate,sample_rate,channels,channel_layout:stream_disposition=attached_pic:format=format_name,duration,bit_rate',
       '-of', 'json', inputUrl,
     ], { stdio: ['ignore', 'pipe', 'pipe'] });
@@ -379,7 +382,7 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
     const timeout = setTimeout(() => {
       child.kill('SIGKILL');
       finish(new Error('Codec probe timed out'));
-    }, deepProbe ? 30_000 : 15_000);
+    }, deepProbe ? 65_000 : 15_000);
     timeout.unref?.();
     child.stdout.on('data', chunk => { output = appendTail(output, chunk, 64 * 1024); });
     child.stderr.on('data', chunk => { errorOutput = appendTail(errorOutput, chunk); });
@@ -411,7 +414,7 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
           videoBitDepth: Number(video.bits_per_raw_sample) || 0,
           width: Number(video.width) || 0,
           height: Number(video.height) || 0,
-          frameRate: String(normalizeFrameRate(video.avg_frame_rate) || normalizeFrameRate(video.r_frame_rate) || video.avg_frame_rate || video.r_frame_rate || ''),
+          frameRate: String(normalizeFrameRate(video.avg_frame_rate) || normalizeFrameRate(video.r_frame_rate) || ''),
           audioCodec: String(audio.codec_name || ''),
           audioProfile: String(audio.profile || ''),
           audioSampleRate: Number(audio.sample_rate) || 0,
@@ -423,10 +426,23 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
             channelLayout: String(stream.channel_layout || ''),
           })),
         };
-        if (deepProbe && (!metadata.videoCodec || (audioStreams.length > 0 && !metadata.audioCodec))) {
-          console.warn(`[Media probe] cache=${cacheKey} incomplete video=${metadata.videoCodec || 'unknown'} audio=${metadata.audioCodec || 'unknown'} videoStreams=${videoStreams.length} audioStreams=${audioStreams.length}`);
+        const requiredFactsMissing = [
+          !metadata.videoCodec,
+          !metadata.videoProfile || /^unknown$/i.test(metadata.videoProfile),
+          !metadata.videoLevel,
+          !metadata.pixelFormat || /^unknown$/i.test(metadata.pixelFormat),
+          !metadata.width,
+          !metadata.height,
+          !metadata.frameRate,
+          audioStreams.length > 0 && !metadata.audioCodec,
+          audioStreams.length > 0 && !metadata.audioSampleRate,
+          audioStreams.length > 0 && !metadata.audioChannels,
+        ];
+        const missingRequiredFacts = requiredFactsMissing.filter(Boolean).length;
+        if (deepProbe && missingRequiredFacts) {
+          console.warn(`[Media probe] cache=${cacheKey} incomplete missingFacts=${missingRequiredFacts} videoStreams=${videoStreams.length} audioStreams=${audioStreams.length}`);
         }
-        if (!deepProbe && (!metadata.videoCodec || !metadata.audioCodec)) {
+        if (!deepProbe && missingRequiredFacts) {
           inspectProviderCodecs(inputUrl, true)
           .then(deep => finish(null, {
               ...metadata,
