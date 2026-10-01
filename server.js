@@ -37,6 +37,7 @@ import { isProviderRefusal } from './provider-refusal.js';
 import { arabicText, freshDashboardTimes, rokuPage, rokuPagePayload, detectXtreamLanguage, titleLanguageCode, displayDuration } from './roku-catalog-format.js';
 import { createLiveBitrateCache } from './live-bitrate-cache.js';
 import { createNativeHlsSessionCache } from './native-hls-session-cache.js';
+import { createRokuMediaFormatter } from './roku-media-format.js';
 
 const app = express();
 // This deployment is a media data plane. Deny every route that is not needed
@@ -50,6 +51,7 @@ const ffprobeBin = process.env.FFPROBE_BIN || 'ffprobe';
 const dashboardCache = new Map();
 const previewCache = new Map();
 const rokuText = (value) => arabicText.test(String(value || '')) ? shapeArabicForRoku(value) : String(value || '');
+const { directXtreamItem, rokuXtreamStreamFormat, rokuXtreamPlaybackPath, buildXtreamChannelsPayload } = createRokuMediaFormatter(rokuText);
 // Roku cannot reliably receive a JSON document containing a provider's entire
 // catalog (this source alone has 44,995 series). Keep the initial screen fast;
 // additional catalog pages are loaded separately by the Roku client.
@@ -771,36 +773,6 @@ async function getRokuSelectedItems(kind, ownerId = null, accountOwner = ownerId
       .map(item => selectedXtreamItem(source, item))
   );
   return groups.flat();
-}
-
-function directXtreamItem(item) {
-  const extension = String(item.extension || '').toLowerCase();
-  const playbackUrl = rokuXtreamPlaybackPath(item.sourceId, item.kind, item.id, extension);
-  return {
-    ...item,
-    source: 'xtream',
-    favoriteId: `xtream:${item.sourceId}:${item.kind}:${item.id}`,
-    url: playbackUrl,
-    playbackUrl,
-    rokuTitle: rokuText(item.title),
-    rokuTextKind: /[A-Za-z]/.test(item.title) ? 'latin' : 'arabic',
-    originalFormat: extension || 'mp4',
-    streamFormat: rokuXtreamStreamFormat(extension),
-  };
-}
-
-function rokuXtreamStreamFormat(extension = '') {
-  const ext = String(extension).replace(/^\./, '').toLowerCase();
-  if (['mkv', 'mka', 'mks'].includes(ext)) return ext;
-  return ['mp4', 'mov', 'm4v'].includes(ext) ? 'mp4' : 'hls';
-}
-
-function rokuXtreamPlaybackPath(sourceId, kind, id, extension = '') {
-  const ext = String(extension || '').replace(/[^a-z0-9]/gi, '').toLowerCase();
-  if (rokuXtreamStreamFormat(ext) !== 'hls' && kind !== 'channel') {
-    return `/api/xtream/play/${encodeURIComponent(sourceId)}/${kind}/${encodeURIComponent(id)}${ext ? `?ext=${encodeURIComponent(ext)}` : ''}`;
-  }
-  return `/api/xtream/hls/${encodeURIComponent(sourceId)}/${kind}/${encodeURIComponent(id)}/master.m3u8${ext ? `?ext=${encodeURIComponent(ext)}` : ''}`;
 }
 
 // Custom response headers are invisible to browser fetch() across origins
@@ -1812,15 +1784,6 @@ async function buildXtreamMoviesPayload({ limit, selected, accountOwner } = {}) 
     ...directXtreamItem(item),
     duration: displayDuration(item.duration),
     kind: 'movie', contentKind: 'movie', rokuEnabled: true,
-  }));
-}
-
-function buildXtreamChannelsPayload(items) {
-  return items.map(item => ({
-    ...directXtreamItem(item),
-    kind: 'channel', contentKind: 'channel',
-    group: item.category || item.sourceName,
-    rokuGroup: item.rokuCategory || rokuText(item.sourceName),
   }));
 }
 
