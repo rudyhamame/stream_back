@@ -869,8 +869,11 @@ async function playbackDecision(req, source) {
   const hlsDecision = selectEnabledHlsForMedia(metadata, target.capabilities, enabled);
   const selectedEnabled = Boolean(hlsDecision && enabled[hlsDecision.strategy]);
   const hlsRecoveryStrategies = [];
-  if (hlsDecision && selectedEnabled && target.client === PlaybackClient.ROKU) {
-    const excluded = [];
+  if (hlsDecision && selectedEnabled && [PlaybackClient.ROKU, PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
+    // Clients may advance only to strategies selected here from the saved
+    // device policy and this item's probed media facts. The active strategy
+    // is excluded because it already failed or is the primary choice.
+    const excluded = [hlsDecision.strategy];
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const candidate = selectEnabledHlsForMedia(metadata, target.capabilities, enabled, { excluded });
       if (!candidate) break;
