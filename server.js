@@ -1,5 +1,5 @@
 import 'dotenv/config';
-import { inspectProviderCodecs, probeCacheTtl, missingProbeFacts, mergeProbeFacts } from './codec-probe.js';
+import { inspectProviderCodecs, probeCacheTtl, missingProbeFacts, mergeProbeFacts, runCodecScan } from './codec-probe.js';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
 import { waitForHlsManifest } from './hls-startup.js';
 import { measuredHlsPreparedRange } from './hls-prepared-range.js';
@@ -2924,7 +2924,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     error.statusCode = 409;
     throw error;
   }
-  let decision = { ...choice, maxHeight: ceiling, reason: choice.reason || 'Checked live HLS strategy' };
+  let decision = { ...choice, frameRate: metadata.frameRate, maxHeight: ceiling, reason: choice.reason || 'Checked live HLS strategy' };
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
@@ -3306,6 +3306,19 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         generatedSeconds: () => job.generatedSeconds,
         requiredSegments: playlistProfile.startupSegments,
       });
+      // Validate bytes already produced, without another provider connection.
+      // A codec-compatible source can still carry broken presentation timing.
+      if (manifestReady && seekableVod && target.client === PlaybackClient.ROKU
+          && job.hlsVideoMode === 'copy' && job.videoTimingChecked !== true) {
+        const facts = await runCodecScan(path.join(job.directory, 'segment-000000.ts'), { ffprobe: ffprobeBin, timeoutMs: 3000 }).catch(() => ({}));
+        job.videoTimingChecked = true;
+        if (facts.videoTimingReliable === false) {
+          job.hlsDecision.requiredVideo = true;
+          job.hlsDecision.videoKnown = Boolean(facts.videoCodec);
+          manifestReady = false;
+          console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} copied video has invalid presentation timestamps; requesting checked normalization`);
+        }
+      }
       if (manifestReady || pinnedGeneration || job.hlsStrategy === HlsStrategy.FULL_TRANSCODE || attempt === 2) break;
       // The provider refused the connection (rate limit, geo/auth block). No
       // ffmpeg strategy fixes that - stop the fallback cascade and cache the

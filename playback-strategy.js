@@ -92,6 +92,7 @@ function codecLevel(value, codec) {
 export function videoCompatibility(metadata, capabilities) {
   const codec = normalizedCodec(metadata.videoCodec || metadata.codecVideo || metadata.codec);
   if (!codec) return { compatible: false, reason: 'video codec unavailable' };
+  if (metadata.videoTimingReliable === false) return { compatible: false, reason: 'video presentation timestamps require normalization' };
   const profile = normalizedCodec(metadata.videoProfile || metadata.profile);
   const pixelFormat = String(metadata.pixelFormat || metadata.pixFmt || '').toLowerCase();
   const bitDepth = streamBitDepth(metadata);
@@ -268,6 +269,14 @@ export function hlsCodecArgs(decision, { fastStart = false, hardware = false, en
   args.push(...(decision.audioMode === 'copy'
     ? ['-c:a', 'copy']
     : ['-c:a', 'aac', '-b:a', '160k', '-ar', '48000', '-ac', '2']));
+  if (decision.videoMode === 'transcode') {
+    const fps = frameRate(decision.frameRate);
+    // Rebuild ordered output timestamps from decoded frames. Never change
+    // the video bitstream under an Audio/Remux strategy.
+    args.push('-fps_mode:v', 'cfr');
+    if (fps > 0 && fps <= 120) args.push('-r:v', String(fps));
+    if (decision.audioMode === 'transcode') args.push('-af', 'aresample=async=1:first_pts=0');
+  }
   return args;
 }
 
