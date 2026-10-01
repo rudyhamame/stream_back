@@ -803,9 +803,9 @@ async function playbackDecision(req, source) {
     ? '/api/xtream/direct-session/[redacted]'
     : finalTransport === PlaybackStrategy.DIRECT ? '[provider-direct]'
       : playbackUrl;
-  console.info(`[RH-TRACE-5] traceId=${traceId} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision?.strategy || 'UNSUPPORTED'} finalTransport=${finalTransport} timingProbeCompleted=${metadata.timing?.checked === true} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'}`);
-  console.info(`[RH-TRACE-6] traceId=${traceId} serverPlaybackUrl=${playbackRoute} sourceHash=${sourceHash}`);
-  console.info(`[transport-final] client=${target.client} codec=${metadata.videoCodec || 'unknown'} container=${metadata.container || 'unknown'} nativeCompatible=${nativeCandidate.compatible} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision?.strategy || 'UNSUPPORTED'} timingProbeCompleted=${metadata.timing?.checked === true} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} timingRegressionCount=${metadata.timing?.regressionCount || 0} finalTransport=${finalTransport} playbackRoute=${playbackRoute}`);
+  console.info(`[RH-TRACE-5] traceId=${traceId} candidateTransport=${nativeCandidate.compatible ? 'DIRECT' : hlsDecision?.strategy || 'UNSUPPORTED'} finalTransport=${finalTransport}`);
+  console.info(`[RH-TRACE-6] traceId=${traceId} serverPlaybackUrl=${playbackRoute}`);
+  console.info(`[transport-final] client=${target.client} codec=${metadata.videoCodec || 'unknown'} container=${metadata.container || 'unknown'} nativeCompatible=${nativeCandidate.compatible} finalTransport=${finalTransport} playbackRoute=${playbackRoute}`);
   return {
     ok: true,
     traceId,
@@ -3173,7 +3173,7 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       const actualSourceHash = playbackSourceHash(playbackProviderURL);
       if (actualSourceHash !== expectedSourceHash) {
         console.error(`[RH-TRACE-6] traceId=${playbackTraceId(req)} sourceHashMismatch expected=${expectedSourceHash} actual=${actualSourceHash}`);
-        return res.status(409).json({ error: 'The provider media URL changed after timing validation. Retry playback to probe the current source.' });
+        return res.status(409).json({ error: 'The provider media URL changed after the playback decision. Retry playback to probe the current source.' });
       }
     }
     const seekableVod = req.params.kind === 'movie' || req.params.kind === 'series';
