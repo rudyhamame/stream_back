@@ -1,6 +1,5 @@
 import 'dotenv/config';
 import { inputDurationSeconds } from './ffmpeg-input-duration.js';
-import { inspectDecodedPts, normalizeFrameRate } from './decoded-frame-timing.js';
 import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
 import express from 'express';
 import cors from 'cors';
@@ -20,7 +19,7 @@ import { MediaCapacityError, MediaJobManager, defaultMediaLimits, memoryPressure
 import { DirectStreamLimiter } from './direct-stream-limiter.js';
 import { DEFAULT_ROKU_FALLBACK_BITRATE, HlsBitrateSource, HlsPlaylistType, classifyHlsPlaylist, createHlsSegmentBitrateSample, hasHlsVariants, hlsResourceId, isHlsManifest, measuredHlsBitrateMetadata, normalizeHlsMasterForRoku, parseHlsMediaSegments, providerMasterBitrateMetadata, rewriteHlsManifest, rokuSingleVariantMaster } from './hls-native-proxy.js';
 import { isPlaybackSupersededForViewer, isSnapshotSupersededForViewer, KeyedSerialExecutor, hlsChildRequestQuery, hlsSessionKey as rokuHlsKey, samePlaybackViewer, scopedPlaybackViewerId } from './media-session-policy.js';
-import { applyQualityCeiling, audioCompatibility, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding, timingRepairDecision, videoCompatibility } from './playback-strategy.js';
+import { applyQualityCeiling, audioCompatibility, codecCompatibility, confidentDirectPlayback, containerCompatibility, HlsStrategy, PlaybackClient, PlaybackStrategy, QUALITY_RUNGS, choosePlaybackStrategy, determineHlsStrategy, fallbackHlsStrategy, getPlaybackCapabilities, hlsCodecArgs, hlsHwDeviceArgs, hlsInputArgs, hlsManifestStartupTimeoutMs, hlsMuxerFlags, hlsPlaylistProfile, strategyUsesEncoding, videoCompatibility } from './playback-strategy.js';
 import { HLS_MODE, selectEnabledHlsForMedia, selectEnabledHlsStrategy } from './stream-strategy-selection.js';
 import { previewFrameSize, previewInputArgs } from './preview-capture-policy.js';
 import { getPlayback, getPlaybackHistory, savePlayback } from './playback-store.js';
@@ -89,11 +88,6 @@ const maxDirectStreamsPerSource = Math.max(1, Number.parseInt(process.env.MAX_DI
 const streamTicketSecret = process.env.DEVICE_AUTH_SECRET || 'local-development-secret-change-before-production';
 const codecProbeCache = new Map();
 const codecProbesInFlight = new Map();
-const timingProbesInFlight = new Map();
-const decodedTimingCache = new Map();
-// Version timing cache keys so a prior decision without decoded-frame
-// validation cannot be reused as proof that DIRECT is safe.
-const decodedTimingSchema = 'decoded-pts-v3-source-bound';
 const playbackTraceId = req => String(req.query.traceId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 36) || randomUUID().slice(0, 12);
 const playbackSourceHash = url => createHash('sha256').update(String(url)).digest('hex').slice(0, 16);
 // VOD runtime (seconds) learned while a title is streaming - from the codec
@@ -402,90 +396,6 @@ async function inspectProviderCodecs(inputUrl, deepProbe = false) {
       } catch { finish(new Error('Codec probe returned invalid metadata')); }
     });
   });
-}
-
-async function inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, stableKey = cacheKey, signal = null, traceId = '') {
-  const sourceHash = playbackSourceHash(inputUrl);
-  const stableCached = decodedTimingCache.get(stableKey);
-  if (stableCached?.expiresAt > Date.now() && stableCached.timing?.checked === true && typeof stableCached.timing.decodedPtsMonotonic === 'boolean') {
-    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=decoded-timing sourceHash=${sourceHash}`);
-    return stableCached.timing;
-  }
-  const cached = codecProbeCache.get(cacheKey);
-  if (cached?.expiresAt > Date.now() && cached.metadata?.timing?.checked && typeof cached.metadata.timing.decodedPtsMonotonic === 'boolean') {
-    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=codec-probe sourceHash=${sourceHash}`);
-    return cached.metadata.timing;
-  }
-  if (timingProbesInFlight.has(stableKey)) {
-    if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false cache=in-flight sourceHash=${sourceHash}`);
-    return timingProbesInFlight.get(stableKey);
-  }
-  if (timingProbesInFlight.size >= maxCodecProbes) {
-    if (traceId) console.warn(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=false reason=capacity sourceHash=${sourceHash}`);
-    return { checked: false, decodedPtsMonotonic: null, timingMalformed: false, framesChecked: 0, regressionCount: 0, largestRegressionSeconds: 0 };
-  }
-  if (traceId) console.info(`[RH-TRACE-3] traceId=${traceId} timingProbeStarted=true cache=miss sourceHash=${sourceHash}`);
-  const pending = new Promise(resolve => {
-    const child = spawn(ffprobeBin, [
-      '-v', 'error', '-rw_timeout', '12000000', '-read_intervals', '%+3',
-      '-select_streams', 'v:0', '-show_frames',
-      '-show_entries', 'frame=pts_time,best_effort_timestamp_time,pict_type', '-of', 'json', inputUrl,
-    ], { stdio: ['ignore', 'pipe', 'pipe'] });
-    let output = '';
-    let errorOutput = '';
-    let settled = false;
-    const cleanup = () => {
-      clearTimeout(timeout);
-      req?.off?.('aborted', abort);
-      req?.res?.off?.('close', abort);
-      signal?.removeEventListener?.('abort', abort);
-    };
-    const finish = (timing, cacheResult = true) => {
-      if (settled) return;
-      settled = true;
-      cleanup();
-      const current = codecProbeCache.get(cacheKey);
-      if (cacheResult && current && current.expiresAt > Date.now()) {
-        current.metadata = { ...current.metadata, timing };
-        codecProbeCache.set(cacheKey, current);
-      }
-      if (cacheResult && timing.checked === true && typeof timing.decodedPtsMonotonic === 'boolean') {
-        decodedTimingCache.set(stableKey, { timing, expiresAt: Date.now() + codecProbeTtlMs });
-        while (decodedTimingCache.size > codecProbeMaxEntries) decodedTimingCache.delete(decodedTimingCache.keys().next().value);
-      }
-      resolve(timing);
-    };
-    const abort = () => { child.kill('SIGKILL'); };
-    const unknown = { checked: false, decodedPtsMonotonic: null, timingMalformed: false, framesChecked: 0, regressionCount: 0, largestRegressionSeconds: 0 };
-    const timeout = setTimeout(() => { child.kill('SIGKILL'); finish(unknown, false); }, 15_000);
-    timeout.unref?.();
-    req?.once?.('aborted', abort);
-    req?.res?.once?.('close', abort);
-    signal?.addEventListener?.('abort', abort, { once: true });
-    if (signal?.aborted) abort();
-    child.stdout.on('data', chunk => { output = appendTail(output, chunk, 256 * 1024); });
-    child.stderr.on('data', chunk => { errorOutput = appendTail(errorOutput, chunk, 2_000); });
-    child.once('error', () => finish(unknown, false));
-    child.once('close', code => {
-      if (settled) return;
-      try {
-        if (code !== 0) return finish(unknown, false);
-        const frames = JSON.parse(output).frames || [];
-        const timing = inspectDecodedPts(frames);
-        if (traceId) {
-          const pts = frames.map(frame => Number(frame?.pts_time ?? frame?.best_effort_timestamp_time)).filter(Number.isFinite);
-          console.info(`[RH-TRACE-4-PTS] traceId=${traceId} sourceHash=${sourceHash} decodedPtsSample=${JSON.stringify(pts.slice(0, 100))}`);
-        }
-        finish(timing);
-      } catch { finish(unknown, false); }
-    });
-  }).then(timing => {
-    const current = codecProbeCache.get(cacheKey);
-    if (current?.expiresAt > Date.now()) current.metadata = { ...current.metadata, timing };
-    return timing;
-  }).finally(() => timingProbesInFlight.delete(stableKey));
-  timingProbesInFlight.set(stableKey, pending);
-  return pending;
 }
 
 function playbackTarget(req) {
@@ -849,43 +759,12 @@ async function playbackDecision(req, source) {
   const target = playbackTarget(req);
   const nativeCandidate = confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
   console.info(`[RH-TRACE-2] traceId=${traceId} itemId=${kind}:${id} client=${target.client} probeCandidate=${nativeCandidate.compatible ? 'DIRECT' : 'HLS'} sourceHash=${sourceHash} container=${metadata.container || 'unknown'} codec=${metadata.videoCodec || 'unknown'}`);
-  if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(req.query.ext || '').toLowerCase()}:${sourceHash}`;
-    metadata.timing = await inspectProviderDecodedTiming(cacheKey, inputUrl, metadata, req, timingKey, null, traceId);
-    if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false) {
-      metadata.timing = { ...metadata.timing, timingMalformed: true };
-    }
-    console.info(`[RH-TRACE-4] traceId=${traceId} sourceHash=${sourceHash} timingProbeCompleted=${metadata.timing?.checked === true} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0}`);
-  }
   const strategyPolicy = await getStreamStrategyPolicy();
   const enabled = strategyPolicy.devices[target.client];
   const direct = confidentDirectPlayback(metadata, target.capabilities, req.query.ext);
-  const timingClient = [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client);
-  // Timing must be validated before returning DIRECT. Unknown probes follow
-  // the existing Browser/Android HLS attempt behavior instead of bypassing
-  // timing analysis with the original provider URL.
-  if (timingClient && direct.compatible && !(metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === true)) {
-    direct.compatible = false;
-    direct.reason = 'Decoded frame timing was not validated; attempting HLS';
-  }
-  if (timingClient && metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === false) {
-    direct.compatible = false;
-    direct.reason = 'Decoded frame timestamps regress; timing repair is required';
-  }
   if (!enabled.DIRECT) direct.compatible = false;
-  let hlsDecision = selectEnabledHlsForMedia(metadata, target.capabilities, enabled);
-  if (enabled.HLS_VIDEO_TRANSCODE && hlsDecision) {
-    hlsDecision = timingRepairDecision(metadata, target.capabilities, hlsDecision) || hlsDecision;
-  }
-  const timingRepair = hlsDecision?.strategy === HlsStrategy.TIMING_REPAIR;
-  if (timingClient && metadata.timing?.checked === true && metadata.timing?.decodedPtsMonotonic === false && !timingRepair) {
-    hlsDecision = null;
-  }
-  if ([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const fps = normalizeFrameRate(metadata.frameRate) || 'unknown';
-    console.info(`[vod-timing-probe] client=${target.client} fps=${fps} framesChecked=${metadata.timing?.framesChecked || 0} decodedPtsMonotonic=${metadata.timing?.decodedPtsMonotonic ?? 'unknown'} regressionCount=${metadata.timing?.regressionCount || 0} largestRegressionMs=${Math.round((metadata.timing?.largestRegressionSeconds || 0) * 1000)} decision=${timingRepair ? HlsStrategy.TIMING_REPAIR : direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision?.strategy || 'UNSUPPORTED'}`);
-  }
-  const selectedEnabled = Boolean(hlsDecision && (timingRepair ? enabled.HLS_VIDEO_TRANSCODE : enabled[hlsDecision.strategy]));
+  const hlsDecision = selectEnabledHlsForMedia(metadata, target.capabilities, enabled);
+  const selectedEnabled = Boolean(hlsDecision && enabled[hlsDecision.strategy]);
   const hlsRecoveryStrategies = [];
   if (hlsDecision && selectedEnabled && target.client === PlaybackClient.ROKU) {
     const excluded = [];
@@ -909,20 +788,15 @@ async function playbackDecision(req, source) {
   const playable = Boolean(direct.compatible || selectedEnabled);
   let browserDirectProxyUrl = '';
   const sourceProtocol = new URL(inputUrl).protocol;
-  if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible && !timingRepair) {
+  if (target.client === PlaybackClient.BROWSER && sourceProtocol === 'http:' && direct.compatible) {
     browserDirectProxyUrl = createBrowserDirectSession(req, source, kind, id, req.query.ext, inputUrl, metadata);
   }
-  const finalTransport = timingRepair ? HlsStrategy.TIMING_REPAIR
-    : direct.compatible ? sourceProtocol === 'http:' && target.client === PlaybackClient.BROWSER ? 'DIRECT_PROXY' : PlaybackStrategy.DIRECT
+  const finalTransport = direct.compatible ? sourceProtocol === 'http:' && target.client === PlaybackClient.BROWSER ? 'DIRECT_PROXY' : PlaybackStrategy.DIRECT
       : hlsDecision?.strategy || 'UNSUPPORTED';
-  if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false && playable && finalTransport !== HlsStrategy.TIMING_REPAIR) {
-    throw new Error('Fatal transport decision: malformed decoded timing requires HLS_TIMING_REPAIR');
-  }
   const hlsRoute = `/api/xtream/hls/${encodeURIComponent(source._id)}/${kind}/${encodeURIComponent(id)}/master.m3u8`;
   const hlsQuery = new URLSearchParams({ client: target.client, sourceHash, traceId });
   if (req.query.ext) hlsQuery.set('ext', String(req.query.ext));
-  if (timingRepair) hlsQuery.set('timingRepair', '1');
-  const playbackUrl = timingRepair || !direct.compatible
+  const playbackUrl = !direct.compatible
     ? `${hlsRoute}?${hlsQuery}`
     : finalTransport === 'DIRECT_PROXY' ? browserDirectProxyUrl : inputUrl;
   const playbackRoute = finalTransport === 'DIRECT_PROXY'
@@ -973,10 +847,9 @@ async function playbackDecision(req, source) {
     // native route ineligible even when container and codecs are supported.
     directCompatible: direct.compatible,
     nativeCompatible: nativeCandidate.compatible,
-    directEligible: direct.compatible && !timingRepair,
-    playbackStrategy: timingRepair ? HlsStrategy.TIMING_REPAIR : direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision?.strategy || 'UNSUPPORTED',
-    timingRepair: Boolean(timingRepair),
-    videoMode: direct.compatible && !timingRepair ? 'copy' : hlsDecision?.videoMode || 'copy',
+    directEligible: direct.compatible,
+    playbackStrategy: direct.compatible ? PlaybackStrategy.DIRECT : hlsDecision?.strategy || 'UNSUPPORTED',
+    videoMode: direct.compatible ? 'copy' : hlsDecision?.videoMode || 'copy',
     audioMode: direct.compatible ? 'copy' : hlsDecision?.audioMode || 'copy',
     durationSeconds,
     ...((target.client !== PlaybackClient.BROWSER || sourceProtocol === 'https:') ? { providerURL: inputUrl } : {}),
@@ -985,7 +858,7 @@ async function playbackDecision(req, source) {
     // Browser performs its own environment-specific feature detection; return
     // the normalized ffprobe facts so it can distinguish container from codecs.
     ...([PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client) ? { media: metadata } : {}),
-    reason: timingRepair ? hlsDecision.reason : direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision?.reason || 'No checked compatible HLS strategy'}`,
+    reason: direct.compatible ? direct.reason : `${direct.reason}; ${hlsDecision?.reason || 'No checked compatible HLS strategy'}`,
   };
 }
 
@@ -2526,11 +2399,9 @@ function hlsPlaybackJobKey(sourceId, kind, id, extension, startSeconds, identity
       : (target.maxHeight ? `live:h${target.maxHeight}` : '');
   const recoveryKey = typeof strategyOverride === 'string' && strategyOverride
     ? `:hls-fallback-${strategyOverride}` : '';
-  const timingKey = identity.timingRepairRequested && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)
-    ? ':hls-timing-repair' : '';
   return rokuHlsKey(sourceId, kind, id, extension,
     identity.wwpSessionId && seekableVod ? 0 : startSeconds,
-    `${capabilityKey}${recoveryKey}${timingKey}`);
+    `${capabilityKey}${recoveryKey}`);
 }
 
 function providerProbeCacheKey(sourceId, kind, mediaId, extension, inputUrl) {
@@ -2953,8 +2824,7 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   const currentPolicy = (await getStreamStrategyPolicy()).devices[target.client];
   const cachedJob = mediaJobs.get(key);
   if (cachedJob) {
-    const cachedMode = cachedJob.hlsStrategy === HlsStrategy.TIMING_REPAIR
-      ? HLS_MODE.VIDEO : cachedJob.hlsStrategy;
+    const cachedMode = cachedJob.hlsStrategy;
     if (!currentPolicy[cachedMode]) {
       await mediaJobs.releaseViewer(key, identity.viewerId, 'strategy-unchecked');
       const error = new Error(`${cachedMode} is no longer checked for ${target.client}.`);
@@ -3064,15 +2934,6 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     throw error;
   }
   const sourceHash = playbackSourceHash(inputUrl);
-  const timingKnownBeforeHls = decodedTimingCache.get(`${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${sourceHash}`)?.expiresAt > Date.now();
-  if (seekableVod && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client)) {
-    const timingKey = `${decodedTimingSchema}:${source._id}:${kind}:${id}:${String(extension || '').toLowerCase()}:${sourceHash}`;
-    metadata.timing = await inspectProviderDecodedTiming(providerCacheKey, inputUrl, metadata, null, timingKey, identity.timingProbeSignal, identity.traceId);
-    if (metadata.timing?.checked === true && metadata.timing.decodedPtsMonotonic === false) {
-      metadata.timing = { ...metadata.timing, timingMalformed: true };
-    }
-    if (identity.timingProbeSignal?.aborted) throw identity.timingProbeSignal.reason || new Error('Manifest request cancelled');
-  }
   if (seekableVod && Number(metadata.containerSeconds) > 0) rememberVodDuration(String(source._id), kind, String(id), metadata.containerSeconds);
   const capabilities = target.capabilities || getPlaybackCapabilities(target.client);
   const enabledStrategies = (await getStreamStrategyPolicy()).devices[target.client];
@@ -3099,31 +2960,11 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     throw error;
   }
   let decision = { ...choice, maxHeight: ceiling, reason: choice.reason || 'Checked live HLS strategy' };
-  const requestedTimingRepair = identity.timingRepairRequested
-    && [PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(target.client);
-  const timingMalformed = requestedTimingRepair || seekableVod && metadata.timing?.checked === true
-    && metadata.timing.decodedPtsMonotonic === false;
-  if (timingMalformed) {
-    if (!enabledStrategies.HLS_VIDEO_TRANSCODE || decision.audioMode !== 'copy') {
-      const error = new Error('Timing repair requires the checked HLS Video Transcode strategy.');
-      error.statusCode = 409;
-      throw error;
-    }
-    decision = timingRepairDecision({ ...metadata, timing: { ...metadata.timing,
-      checked: true, timingMalformed: true } }, capabilities, decision);
-    if (decision.strategy !== HlsStrategy.TIMING_REPAIR) {
-      const error = new Error('The detected frame rate cannot be repaired.');
-      error.statusCode = 415;
-      throw error;
-    }
-  }
   const probeSummary = seekableVod
     ? `client=${capabilities.client} container=${String(extension || 'unknown').toLowerCase()} video=${metadata.videoCodec || 'unknown'} videoProfile=${metadata.videoProfile || 'unknown'} pixelFormat=${metadata.pixelFormat || 'unknown'} bitDepth=${metadata.videoBitDepth || 'unknown'} size=${metadata.width || 0}x${metadata.height || 0} fps=${metadata.frameRate || 'unknown'} audio=${metadata.audioCodec || 'unknown'} audioChannels=${metadata.audioChannels || 0}`
     : `client=${target.client || 'live'} container=${String(extension || 'unknown').toLowerCase()}`;
   console.log(`[Media HLS strategy] ${kind}:${id} ${probeSummary} videoMode=${decision.videoMode} audioMode=${decision.audioMode} strategy=${decision.strategy} reason="${decision.reason}"`);
-  const strategyEnabled = decision.strategy === HlsStrategy.TIMING_REPAIR
-    ? Boolean(enabledStrategies.HLS_VIDEO_TRANSCODE)
-    : Boolean(enabledStrategies[decision.strategy]);
+  const strategyEnabled = Boolean(enabledStrategies[decision.strategy]);
   if (!strategyEnabled) {
     const error = new Error(`${decision.strategy} is not checked for ${target.client}.`);
     error.statusCode = 409;
@@ -3184,9 +3025,6 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
     const child = spawn(ffmpegBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
     const safeCommand = [ffmpegBin, ...args].map(value => value === inputUrl ? '[provider URL]' : String(value)).join(' ');
     console.log(`[Media HLS ffmpeg] sessionId=${identity.sessionId || 'none'} generationId=${generationId} playbackAttemptId=${identity.playbackAttemptId || 'unknown'} resume=${startSeconds}s command=${safeCommand}`);
-    if (decision.strategy === HlsStrategy.TIMING_REPAIR) {
-      console.info(`[timing-repair] client=${target.client} mode=${decision.strategy} sourceVideoCodec=${metadata.videoCodec || 'unknown'} sourceFps=${decision.frameRate} encoder=libx264 audioMode=copy`);
-    }
     // Learn runtime from this process's input header, without a second
     // provider connection. Never retain an unbounded FFmpeg log.
     let inputHeader = '';
@@ -3288,7 +3126,6 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/startup-status', async (req, res) =
     const source = await getXtreamSource(req.params.sourceId, ticket?.accountOwnerId || requestAccountOwner(req));
     if (!source) return res.sendStatus(404);
     const identity = mediaIdentity(req);
-    identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
     const target = playbackTarget(req);
     if (target.client !== PlaybackClient.BROWSER) return res.sendStatus(404);
     const startSeconds = hlsStartSeconds(req.query.start);
@@ -3346,8 +3183,6 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
     const nativeHlsDisabled = String(req.query.native || '') === '0';
     const identity = mediaIdentity(req);
     identity.preview = fastPreview || vodPreview;
-    identity.timingRepairRequested = String(req.query.timingRepair || '') === '1';
-    identity.timingProbeSignal = requestAbort.signal;
     identity.traceId = playbackTraceId(req);
     console.log(`[Media HLS] ${req.params.kind}:${req.params.id} manifest requested start=${startSeconds}s ext=${String(req.query.ext || '') || 'unknown'} client=${target.client} preview=${identity.preview} wwp=${identity.wwpSessionId ? identity.wwpSessionId.slice(0, 8) : 'none'}`);
     if (req.params.kind === 'channel') {
@@ -3434,7 +3269,6 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
         await mediaJobs.remove(job.key, 'provider-refused');
         break;
       }
-      if (job.hlsStrategy === HlsStrategy.TIMING_REPAIR) break;
       attemptedStrategies.add(job.hlsStrategy);
       const excluded = [...attemptedStrategies];
       if (attemptedStrategies.has(HLS_MODE.VIDEO)) excluded.push(HLS_MODE.AUDIO);

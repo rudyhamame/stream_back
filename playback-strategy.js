@@ -1,10 +1,8 @@
 import { hlsExtensionAllowlistArgs } from './ffmpeg-capabilities.js';
-import { normalizeFrameRate, setptsForFrameRate } from './decoded-frame-timing.js';
 
 export const HlsStrategy = Object.freeze({
   REMUX: 'HLS_REMUX',
   AUDIO_TRANSCODE: 'HLS_AUDIO_TRANSCODE',
-  TIMING_REPAIR: 'HLS_TIMING_REPAIR',
   VIDEO_TRANSCODE: 'HLS_VIDEO_TRANSCODE',
   FULL_TRANSCODE: 'HLS_FULL_TRANSCODE',
 });
@@ -211,15 +209,6 @@ export function determineHlsStrategy(sourceMetadata = {}, capabilities = getPlay
   };
 }
 
-export function timingRepairDecision(metadata = {}, capabilities = getPlaybackCapabilities(), currentDecision = null) {
-  if (![PlaybackClient.BROWSER, PlaybackClient.ANDROID].includes(capabilities.client)
-      || metadata.timing?.timingMalformed !== true
-      || !codecCompatibility(metadata, capabilities).compatible) return currentDecision;
-  const frameRate = normalizeFrameRate(metadata.frameRate || metadata.avgFrameRate || metadata.rFrameRate);
-  if (!frameRate || !setptsForFrameRate(frameRate)) return currentDecision;
-  return { ...currentDecision, videoMode: 'transcode', audioMode: 'copy', strategy: HlsStrategy.TIMING_REPAIR, frameRate, reason: 'Decoded presentation timestamps regress' };
-}
-
 // Approximate H.264 ceilings per rung — capped VBR (CRF floor + -maxrate) so a
 // clean scene stays sharp but a busy one cannot blow past the viewer's pipe.
 export const QUALITY_RUNGS = Object.freeze({ 1080: 5000, 720: 2800, 480: 1400, 360: 800 });
@@ -231,16 +220,6 @@ export function hlsHwDeviceArgs({ enabled = false } = {}) {
 }
 
 export function hlsCodecArgs(decision, { fastStart = false, hardware = false, enabledStrategies = null } = {}) {
-  if (decision?.strategy === HlsStrategy.TIMING_REPAIR) {
-    return [
-      // OVH has two CPU cores and no render node. Keep simultaneous timing
-      // repair jobs light enough to maintain real-time segment production.
-      '-c:v', 'libx264', '-preset', 'ultrafast', '-threads:v', '1', '-crf', '20', '-pix_fmt', 'yuv420p',
-      '-profile:v', 'high', '-flags', '+cgop', '-force_key_frames', 'expr:gte(t,n_forced*2)',
-      '-vf', setptsForFrameRate(decision.frameRate), '-fps_mode', 'cfr', '-r', String(decision.frameRate),
-      '-c:a', 'copy',
-    ];
-  }
   const encodingRequested = decision.videoMode === 'transcode' || decision.audioMode === 'transcode';
   if (encodingRequested && enabledStrategies !== null && !enabledStrategies[decision.strategy]) {
     throw new Error(`${decision.strategy} is not enabled for this device`);
@@ -307,7 +286,7 @@ export function fallbackHlsStrategy(decision) {
 }
 
 export function strategyUsesEncoding(decision) {
-  return decision?.strategy === HlsStrategy.TIMING_REPAIR || decision?.videoMode === 'transcode' || decision?.audioMode === 'transcode';
+  return decision?.videoMode === 'transcode' || decision?.audioMode === 'transcode';
 }
 
 export function hlsPlaylistProfile({ fastStart = false, preview = false, client = '' } = {}) {
