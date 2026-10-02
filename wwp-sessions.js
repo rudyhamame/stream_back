@@ -134,7 +134,10 @@ export function setWwpCallRing(wwpSessionId, ownerId, ringing) {
   session.callRing = ringing ? String(ownerId || '') : '';
   session.callRevision += 1;
   session.updatedAt = Date.now();
-  if (!ringing) { session.callSignals = []; session.callSeq = 0; }
+  // Starting a new call discards the previous call's messages. Answering only
+  // dismisses the ring: its offer and ICE must remain available to the callee.
+  // Keep sequence numbers monotonic so an outstanding poll can see the new call.
+  if (ringing) session.callSignals = [];
   wakeWaiters(session);
   if (!ringing) wakeCallWaiters(session);
   return session;

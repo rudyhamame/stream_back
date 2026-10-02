@@ -32,6 +32,7 @@ import { authorizeDeviceSession, changeAccountPassword, claimAutomaticPairing, c
 import { enforceStreamingOnly } from './streaming-route-policy.js';
 import { applyWwpControl, appendWwpCallSignal, endWwpSession, getWwpSession, noteWwpPresence, reconcileWwpSession, setWwpCallRing, waitForWwpCallSignals, waitForWwpSession, wwpSyncToken } from './wwp-sessions.js';
 import { wwpCallPageHtml } from './wwp-call-page.js';
+import { wwpCallParticipantId } from './wwp-call-identity.js';
 import { accountOwnerId } from './account-library-owner.js';
 import { checkInternetConnection } from './internet-health.js';
 import { getStreamStrategyPolicy, saveStreamStrategyPolicy } from './stream-strategy-policy.js';
@@ -1387,9 +1388,9 @@ app.get('/api/xtream/wwp-sync/:sessionId', async (req, res) => {
 // the same session stream-ticket / device-token as wwp-sync, checked here;
 // all are whitelisted in streaming-route-policy.js (POST /signal included).
 function wwpCallOwner(req, wwpSession) {
-  return requestOwner(req)
-    || resolveStreamTicket(requestStreamTicket(req), wwpSession.sourceId, wwpSession.kind, wwpSession.id)?.ownerId
-    || null;
+  const token = requestStreamTicket(req);
+  const ticket = resolveStreamTicket(token, wwpSession.sourceId, wwpSession.kind, wwpSession.id);
+  return wwpCallParticipantId(requestOwner(req), ticket, token);
 }
 
 app.get('/api/xtream/wwp-call/:sessionId/ring', (req, res) => {
@@ -1433,7 +1434,7 @@ app.get('/api/xtream/wwp-call/:sessionId/page', async (req, res) => {
     res.set('Content-Type', 'text/html; charset=utf-8');
     res.set('Cache-Control', 'no-store');
     // Allow the browser player to embed this as a same-origin <iframe>.
-    res.set('Content-Security-Policy', "frame-ancestors 'self'");
+    res.set('Content-Security-Policy', "frame-ancestors 'self' https://iptv.mctoshs.ca");
     res.send(html);
   } catch (error) {
     console.warn(`[WWP call] page render failed: ${error.message}`);

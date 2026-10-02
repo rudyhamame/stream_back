@@ -266,6 +266,7 @@ export async function wwpCallPageHtml() {
     while (polling) {
       try {
         var r = await fetch(base + "/poll?since=" + since + "&" + auth, { cache: "no-store" });
+        if (r.status === 401 || r.status === 404) { endCall("Call session expired. Rejoin Watch with Partner."); return; }
         if (!r.ok) { await wait(1500); continue; }
         var j = await r.json();
         if (typeof j.seq === "number") since = Math.max(since, j.seq);
@@ -289,10 +290,13 @@ export async function wwpCallPageHtml() {
     }
     newPeer();
     localStream.getTracks().forEach(function (t) { pc.addTrack(t, localStream); });
-    pollLoop();
     // Ring state: the caller sets it (so the partner's wwp-sync prompt appears);
     // the callee clears it on answering so the prompt goes away everywhere.
-    fetch(base + "/ring?ringing=" + (role === "caller" ? "1" : "0") + "&" + auth).catch(function () {});
+    try {
+      var ring = await fetch(base + "/ring?ringing=" + (role === "caller" ? "1" : "0") + "&" + auth);
+      if (!ring.ok) throw new Error("Call authorization failed (" + ring.status + ")");
+    } catch (e) { endCall(e.message || "Could not start call"); return; }
+    pollLoop();
     if (role === "caller") {
       setStatus("Calling…", "warn");
       try {
