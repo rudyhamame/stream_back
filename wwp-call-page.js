@@ -134,6 +134,8 @@ export async function wwpCallPageHtml() {
   button:active { transform: scale(.92); }
   button.muted { background: #f2c14e; color: #1a1a12; }
   button.hangup { background: #ef4444; color: #fff; }
+  #retrymic { width: auto; padding: 0 12px; font-size: 12px; }
+  #retrymic[hidden] { display: none; }
   .tapaudio {
     position: absolute; inset: 0; display: none; align-items: center; justify-content: center;
     background: rgba(0,0,0,.7); font-weight: 700; cursor: pointer;
@@ -147,6 +149,7 @@ export async function wwpCallPageHtml() {
     <div class="who" id="who">Partner</div>
     <div class="st" id="st">Starting…</div>
   </div>
+  <button id="retrymic" hidden>Retry microphone</button>
   <button id="mute" title="Mute microphone (voice activated)" aria-label="Mute microphone">🎤</button>
   <button id="hangup" class="hangup" title="End call" aria-label="End call">✕</button>
   <div class="tapaudio" id="tapaudio">Tap to enable call audio</div>
@@ -161,6 +164,13 @@ export async function wwpCallPageHtml() {
   var token = q.get("t") || "";
   var role = q.get("role") === "caller" ? "caller" : "callee";
   var partnerName = q.get("name") || "Partner";
+  var iosAudioOutput = /iPad|iPhone|iPod/.test(navigator.userAgent || "")
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
+  function restorePlaybackAudioSession() {
+    // Capture may leave Safari in its lower-volume call session after hangup.
+    try { if (iosAudioOutput && navigator.audioSession) navigator.audioSession.type = "playback"; } catch (e) {}
+  }
 
   var $ = function (id) { return document.getElementById(id); };
   $("who").textContent = partnerName;
@@ -168,6 +178,7 @@ export async function wwpCallPageHtml() {
   var auth = "streamTicket=" + encodeURIComponent(token) + "&deviceToken=" + encodeURIComponent(token);
 
   var pc = null, localStream = null, since = 0, polling = true, ended = false;
+  var capturePending = false;
   var pendingIce = [], haveRemote = false, muted = false;
   var outgoingStream = null, microphoneContext = null, microphoneSource = null;
   var microphoneAnalyser = null, microphoneDestination = null, microphoneTimer = null;
@@ -224,6 +235,7 @@ export async function wwpCallPageHtml() {
 
   function setStatus(text, cls) {
     $("st").textContent = text;
+    $("st").title = text;
     $("dot").className = "dot" + (cls ? " " + cls : "");
   }
   function host(msg, speaking) {
@@ -247,6 +259,7 @@ export async function wwpCallPageHtml() {
     fetch(base + "/ring?ringing=0&" + auth).catch(function () {});
     try { if (localStream) localStream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
     try { if (pc) pc.close(); } catch (e) {}
+    restorePlaybackAudioSession();
     host("ended");
   }
 
@@ -332,19 +345,46 @@ export async function wwpCallPageHtml() {
   }
   function wait(ms) { return new Promise(function (res) { setTimeout(res, ms); }); }
 
+  function microphoneFailure(error) {
+    var name = error && error.name || "UnknownError";
+    if (name === "NotAllowedError" || name === "PermissionDeniedError" || name === "SecurityError") {
+      return "Microphone permission denied. Allow microphone in Safari Website Settings, then retry.";
+    }
+    if (name === "NotFoundError" || name === "DevicesNotFoundError") return "No microphone found. Check your microphone or headset, then retry.";
+    if (name === "NotReadableError" || name === "TrackStartError" || name === "AbortError") return "Microphone could not start. Close other calls or recording apps, then retry.";
+    if (name === "OverconstrainedError") return "Microphone settings unsupported on this device.";
+    return "Microphone could not start (" + name + "). Retry microphone.";
+  }
+
+  $("retrymic").onclick = function () { start(); };
+
   async function start() {
+    if (ended || capturePending || localStream) return;
     if (!sessionId || !token) { setStatus("Missing session", "dead"); return; }
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus("Microphone access unavailable. Open this page in Safari over HTTPS.", "dead");
+      return;
+    }
+    capturePending = true;
+    $("retrymic").hidden = true;
     setStatus("Requesting microphone…", "warn");
     try {
       localStream = await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+        // Avoid requesting Safari's voice-processing path, which can attenuate
+        // the movie audio. Other platforms retain their normal call processing.
+        audio: { echoCancellation: !iosAudioOutput, noiseSuppression: !iosAudioOutput, autoGainControl: !iosAudioOutput },
         video: false,
       });
     } catch (e) {
-      setStatus("Microphone blocked", "dead");
+      restorePlaybackAudioSession();
+      if (ended) return;
+      setStatus(microphoneFailure(e), "dead");
+      $("retrymic").hidden = false;
       return;
+    } finally {
+      capturePending = false;
     }
-    if (ended) { localStream.getTracks().forEach(function (t) { t.stop(); }); return; }
+    if (ended) { localStream.getTracks().forEach(function (t) { t.stop(); }); restorePlaybackAudioSession(); return; }
     outgoingStream = localStream;
     startMicrophoneActivity();
     newPeer();
