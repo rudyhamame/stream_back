@@ -1,3 +1,4 @@
+import { createVoiceActivityDetector } from './voice-activity.js';
 // The Watch-with-Partner voice call runs entirely in this one self-contained
 // page: an <iframe> inside the browser player, and a WebView in the Android
 // app. It reads the session id + auth token + role from its own query string,
@@ -146,7 +147,7 @@ export async function wwpCallPageHtml() {
     <div class="who" id="who">Partner</div>
     <div class="st" id="st">Starting…</div>
   </div>
-  <button id="mute" title="Mute" aria-label="Mute">🎤</button>
+  <button id="mute" title="Mute microphone (voice activated)" aria-label="Mute microphone">🎤</button>
   <button id="hangup" class="hangup" title="End call" aria-label="End call">✕</button>
   <div class="tapaudio" id="tapaudio">Tap to enable call audio</div>
   <audio id="remote" autoplay playsinline></audio>
@@ -168,13 +169,65 @@ export async function wwpCallPageHtml() {
 
   var pc = null, localStream = null, since = 0, polling = true, ended = false;
   var pendingIce = [], haveRemote = false, muted = false;
+  var outgoingStream = null, microphoneContext = null, microphoneSource = null;
+  var microphoneAnalyser = null, microphoneDestination = null, microphoneTimer = null;
+  var voiceSpeaking = false;
+  var createVoiceActivityDetector = ${createVoiceActivityDetector.toString()};
+  var voiceDetector = createVoiceActivityDetector(function (speaking) {
+    voiceSpeaking = speaking;
+    updateMicrophoneGate();
+    if (pc && pc.connectionState === "connected") host("speaking", speaking);
+  });
+  function updateMicrophoneGate() {
+    if (!outgoingStream) return;
+    $("mute").title = muted ? "Unmute microphone" : microphoneAnalyser
+      ? (voiceSpeaking ? "Microphone transmitting" : "Microphone waiting for speech") : "Mute microphone";
+    outgoingStream.getAudioTracks().forEach(function (track) {
+      track.enabled = !muted && (!microphoneAnalyser || voiceSpeaking);
+    });
+  }
+  function startMicrophoneActivity() {
+    // Analyze the original mic, and send a separate gated track to the call.
+    // Disabling the analyzed track would prevent detection of the next word.
+    if (window.parent === window) return;
+    var AudioContext = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContext) return;
+    try {
+      microphoneContext = new AudioContext();
+      microphoneSource = microphoneContext.createMediaStreamSource(localStream);
+      microphoneAnalyser = microphoneContext.createAnalyser();
+      microphoneAnalyser.fftSize = 1024;
+      microphoneDestination = microphoneContext.createMediaStreamDestination();
+      microphoneSource.connect(microphoneAnalyser);
+      microphoneSource.connect(microphoneDestination);
+      outgoingStream = microphoneDestination.stream;
+      updateMicrophoneGate();
+      var samples = new Float32Array(microphoneAnalyser.fftSize);
+      microphoneTimer = setInterval(function () {
+        if (ended) return;
+        microphoneAnalyser.getFloatTimeDomainData(samples);
+        voiceDetector.update(samples, performance.now(), muted || microphoneContext.state !== "running");
+      }, 25);
+      microphoneContext.resume().catch(function () {});
+    } catch (e) { stopMicrophoneActivity(); outgoingStream = localStream; }
+  }
+  function stopMicrophoneActivity() {
+    if (microphoneTimer !== null) clearInterval(microphoneTimer);
+    microphoneTimer = null;
+    voiceDetector.reset();
+    try { if (microphoneSource) microphoneSource.disconnect(); } catch (e) {}
+    try { if (microphoneAnalyser) microphoneAnalyser.disconnect(); } catch (e) {}
+    try { if (microphoneDestination) microphoneDestination.stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
+    try { if (microphoneContext) microphoneContext.close().catch(function () {}); } catch (e) {}
+    microphoneAnalyser = null; microphoneContext = null;
+  }
 
   function setStatus(text, cls) {
     $("st").textContent = text;
     $("dot").className = "dot" + (cls ? " " + cls : "");
   }
-  function host(msg) {
-    try { if (window.parent && window.parent !== window) window.parent.postMessage({ wwpCall: msg }, "*"); } catch (e) {}
+  function host(msg, speaking) {
+    try { if (window.parent && window.parent !== window) window.parent.postMessage({ wwpCall: msg, sessionId: sessionId, speaking: speaking === true }, "*"); } catch (e) {}
     try { if (window.AndroidCall) { if (msg === "ended" && window.AndroidCall.onEnded) window.AndroidCall.onEnded(); if (msg === "connected" && window.AndroidCall.onConnected) window.AndroidCall.onConnected(); } } catch (e) {}
   }
 
@@ -188,6 +241,7 @@ export async function wwpCallPageHtml() {
   function endCall(reason) {
     if (ended) return;
     ended = true; polling = false;
+    stopMicrophoneActivity();
     setStatus(reason || "Call ended", "dead");
     post("bye", null);
     fetch(base + "/ring?ringing=0&" + auth).catch(function () {});
@@ -200,7 +254,9 @@ export async function wwpCallPageHtml() {
   $("mute").onclick = function () {
     if (!localStream) return;
     muted = !muted;
-    localStream.getAudioTracks().forEach(function (t) { t.enabled = !muted; });
+    if (muted) voiceDetector.reset();
+    updateMicrophoneGate();
+    if (microphoneContext && !muted) microphoneContext.resume().catch(function () {});
     $("mute").textContent = muted ? "🔇" : "🎤";
     $("mute").classList.toggle("muted", muted);
   };
@@ -226,9 +282,9 @@ export async function wwpCallPageHtml() {
     };
     pc.onconnectionstatechange = function () {
       var s = pc.connectionState;
-      if (s === "connected") { setStatus("Connected", "live"); host("connected"); }
+      if (s === "connected") { setStatus("Connected", "live"); host("connected"); host("speaking", voiceSpeaking && !muted); }
       else if (s === "connecting") setStatus("Connecting…", "warn");
-      else if (s === "disconnected") setStatus("Reconnecting…", "warn");
+      else if (s === "disconnected") { setStatus("Reconnecting…", "warn"); host("speaking", false); }
       else if (s === "failed") endCall("Call failed");
       else if (s === "closed" && !ended) endCall("Call ended");
     };
@@ -288,8 +344,11 @@ export async function wwpCallPageHtml() {
       setStatus("Microphone blocked", "dead");
       return;
     }
+    if (ended) { localStream.getTracks().forEach(function (t) { t.stop(); }); return; }
+    outgoingStream = localStream;
+    startMicrophoneActivity();
     newPeer();
-    localStream.getTracks().forEach(function (t) { pc.addTrack(t, localStream); });
+    outgoingStream.getTracks().forEach(function (t) { pc.addTrack(t, outgoingStream); });
     // Ring state: the caller sets it (so the partner's wwp-sync prompt appears);
     // the callee clears it on answering so the prompt goes away everywhere.
     try {
