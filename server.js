@@ -2759,11 +2759,11 @@ async function completedHlsManifestAvailable(filename) {
   }
 }
 
-async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '') {
-  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, target, strategyOverride, suppliedProviderURL));
+async function getOrStartRokuHls(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '', requestJobKey = '') {
+  return mediaSourceLocks.run(source._id, () => getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart, identity, target, strategyOverride, suppliedProviderURL, requestJobKey));
 }
 
-async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '') {
+async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedStart = 0, identity = {}, target = {}, strategyOverride = null, suppliedProviderURL = '', requestJobKey = '') {
   const seekableVod = kind === 'movie' || kind === 'series';
   let startSeconds = seekableVod ? hlsStartSeconds(requestedStart) : 0;
   // A manual quality rung forks its own job even for a live channel (folding
@@ -2788,7 +2788,10 @@ async function getOrStartRokuHlsUnlocked(source, kind, id, extension, requestedS
   // so a flaky provider's endless error-recovery reloads do NOT keep forking
   // and tearing down the shared job.
   const wwpJobKey = identity.wwpSessionId && seekableVod;
-  const key = hlsPlaybackJobKey(source._id, kind, id, extension, startSeconds, identity, target, strategyOverride);
+  // A checked runtime fallback changes encoding, not the client's request lane.
+  // Keep it under the original key so playlist refreshes, prepared-range reads,
+  // and seeks reuse the replacement instead of tearing it down for the old mode.
+  const key = requestJobKey || hlsPlaybackJobKey(source._id, kind, id, extension, startSeconds, identity, target, strategyOverride);
   const currentPolicy = (await getStreamStrategyPolicy()).devices[target.client];
   const cachedJob = mediaJobs.get(key);
   if (cachedJob) {
@@ -3343,8 +3346,9 @@ app.get('/api/xtream/hls/:sourceId/:kind/:id/master.m3u8', async (req, res) => {
       });
       if (!fallback) break;
       console.warn(`[Media HLS] ${req.params.kind}:${req.params.id} ${job.hlsStrategy} produced no playable segment; retrying checked ${fallback.strategy} videoMode=${fallback.videoMode} audioMode=${fallback.audioMode}`);
-      await mediaJobs.remove(job.key, 'compatibility-fallback');
-      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, playbackProviderURL);
+      const requestJobKey = job.key;
+      await mediaJobs.remove(requestJobKey, 'compatibility-fallback');
+      job = await getOrStartRokuHls(source, req.params.kind, req.params.id, req.query.ext, startSeconds, identity, target, fallback, playbackProviderURL, requestJobKey);
       playlistProfile = hlsPlaylistProfile({ preview: identity.preview, client: target.client });
     }
     if (!manifestReady) {
