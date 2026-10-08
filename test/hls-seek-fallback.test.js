@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import path from 'node:path';
 import { KeyedSerialExecutor, hlsSessionKey, hlsChildRequestQuery, isPlaybackSupersededForViewer, samePlaybackViewer } from '../media-session-policy.js';
-import { HLS_MODE, selectEnabledHlsForMedia, selectEnabledHlsStrategy } from '../stream-strategy-selection.js';
+import { HLS_MODE, selectEnabledHlsForMedia, selectEnabledHlsRecovery, normalizeHlsStrategy } from '../stream-strategy-selection.js';
 import { PlaybackClient, HlsStrategy, getPlaybackCapabilities, hlsPlaylistProfile, hlsManifestStartupTimeoutMs, strategyUsesEncoding } from '../playback-strategy.js';
 
 // Execute the real creation and manifest handlers without provider/database I/O.
@@ -43,7 +43,7 @@ function harness(fullEnabled = true) {
     },
     fs: { access: async () => { throw new Error('no VAAPI'); },
       readFile: async () => '#EXTM3U\n#EXT-X-TARGETDURATION:2\n#EXTINF:2,\nsegment-000000.ts\n#EXTINF:2,\nsegment-000001.ts\n#EXTINF:2,\nsegment-000002.ts\n' },
-    PlaybackClient, HlsStrategy, HLS_MODE, getPlaybackCapabilities, selectEnabledHlsForMedia, selectEnabledHlsStrategy,
+    PlaybackClient, HlsStrategy, HLS_MODE, getPlaybackCapabilities, selectEnabledHlsForMedia, selectEnabledHlsRecovery, normalizeHlsStrategy,
     hlsPlaylistProfile, hlsManifestStartupTimeoutMs, strategyUsesEncoding,
     rokuHlsKey: hlsSessionKey, hlsChildRequestQuery, samePlaybackViewer, isPlaybackSupersededForViewer,
     hlsGenerationJobs: new Map(), codecProbeCache: new Map(),
@@ -99,7 +99,7 @@ test('fallback reuse still rejects a strategy unchecked after startup', async ()
   await h.manifest();
   h.enabled.HLS_FULL_TRANSCODE = false;
   const res = await h.manifest();
-  assert.equal(res.code, 502);
+  assert.equal(res.code, 409);
   assert.match(res.body.error, /no longer checked/);
   assert.equal(h.created.length, 2);
 });
@@ -110,4 +110,21 @@ test('unsafe post-seek audio never starts an unchecked full transcode', async ()
   assert.equal(res.code, 504);
   assert.equal(h.created.length, 1);
   assert.equal(h.created[0].hlsStrategy, 'HLS_AUDIO_TRANSCODE');
+});
+
+test('real manifest creation and runtime fallback obey all 16 HLS checkbox policies', async () => {
+  const modes = Object.values(HLS_MODE);
+  for (let mask = 0; mask < 16; mask++) {
+    for (const requested of ['remux', 'video', 'audio', 'full']) {
+      const h = harness();
+      Object.assign(h.enabled, Object.fromEntries(modes.map((mode, index) => [mode, Boolean(mask & (1 << index))])));
+      const res = await h.manifest(242.7, '1', requested);
+      for (const created of h.created) assert.equal(h.enabled[created.hlsStrategy], true);
+      assert.ok(h.created.length <= 3);
+      if (!h.enabled[normalizeHlsStrategy(requested)]) {
+        assert.equal(res.code, 409);
+        assert.equal(h.created.length, 0);
+      }
+    }
+  }
 });
